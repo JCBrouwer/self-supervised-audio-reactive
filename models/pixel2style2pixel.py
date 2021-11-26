@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Linear, MaxPool2d, Module, PReLU, ReLU, Sequential, Sigmoid
 
-from stylegan2 import EqualLinear, Generator
+from models.stylegan2 import EqualLinear, Generator
 
 
 class Bottleneck(namedtuple("Block", ["in_channel", "depth", "stride"])):
@@ -133,7 +133,7 @@ class GradualStyleBlock(Module):
 
 
 class GradualStyleEncoder(Module):
-    def __init__(self, num_layers, mode="ir", opts=None):
+    def __init__(self, num_layers, input_nc, n_styles, mode="ir"):
         super(GradualStyleEncoder, self).__init__()
         assert num_layers in [50, 100, 152], "num_layers should be 50,100, or 152"
         assert mode in ["ir", "ir_se"], "mode should be ir or ir_se"
@@ -142,7 +142,7 @@ class GradualStyleEncoder(Module):
             unit_module = bottleneck_IR
         elif mode == "ir_se":
             unit_module = bottleneck_IR_SE
-        self.input_layer = Sequential(Conv2d(opts.input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
+        self.input_layer = Sequential(Conv2d(input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
         modules = []
         for block in blocks:
             for bottleneck in block:
@@ -150,7 +150,7 @@ class GradualStyleEncoder(Module):
         self.body = Sequential(*modules)
 
         self.styles = nn.ModuleList()
-        self.style_count = opts.n_styles
+        self.style_count = n_styles
         self.coarse_ind = 3
         self.middle_ind = 7
         for i in range(self.style_count):
@@ -213,9 +213,8 @@ class GradualStyleEncoder(Module):
 
 
 class BackboneEncoderUsingLastLayerIntoW(Module):
-    def __init__(self, num_layers, mode="ir", opts=None):
+    def __init__(self, num_layers, input_nc, mode="ir"):
         super(BackboneEncoderUsingLastLayerIntoW, self).__init__()
-        print("Using BackboneEncoderUsingLastLayerIntoW")
         assert num_layers in [50, 100, 152], "num_layers should be 50,100, or 152"
         assert mode in ["ir", "ir_se"], "mode should be ir or ir_se"
         blocks = get_blocks(num_layers)
@@ -223,7 +222,7 @@ class BackboneEncoderUsingLastLayerIntoW(Module):
             unit_module = bottleneck_IR
         elif mode == "ir_se":
             unit_module = bottleneck_IR_SE
-        self.input_layer = Sequential(Conv2d(opts.input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
+        self.input_layer = Sequential(Conv2d(input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
         self.output_pool = torch.nn.AdaptiveAvgPool2d((1, 1))
         self.linear = EqualLinear(512, 512, lr_mul=1)
         modules = []
@@ -242,9 +241,8 @@ class BackboneEncoderUsingLastLayerIntoW(Module):
 
 
 class BackboneEncoderUsingLastLayerIntoWPlus(Module):
-    def __init__(self, num_layers, mode="ir", opts=None):
+    def __init__(self, num_layers, input_nc, n_styles, mode="ir"):
         super(BackboneEncoderUsingLastLayerIntoWPlus, self).__init__()
-        print("Using BackboneEncoderUsingLastLayerIntoWPlus")
         assert num_layers in [50, 100, 152], "num_layers should be 50,100, or 152"
         assert mode in ["ir", "ir_se"], "mode should be ir or ir_se"
         blocks = get_blocks(num_layers)
@@ -252,8 +250,8 @@ class BackboneEncoderUsingLastLayerIntoWPlus(Module):
             unit_module = bottleneck_IR
         elif mode == "ir_se":
             unit_module = bottleneck_IR_SE
-        self.n_styles = opts.n_styles
-        self.input_layer = Sequential(Conv2d(opts.input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
+        self.n_styles = n_styles
+        self.input_layer = Sequential(Conv2d(input_nc, 64, (3, 3), 1, 1, bias=False), BatchNorm2d(64), PReLU(64))
         self.output_layer_2 = Sequential(
             BatchNorm2d(512), torch.nn.AdaptiveAvgPool2d((7, 7)), Flatten(), Linear(512 * 7 * 7, 512)
         )
@@ -281,50 +279,42 @@ def get_keys(d, name):
 
 
 class pSp(nn.Module):
-    def __init__(self, opts):
+    def __init__(
+        self,
+        input_nc=3,
+        output_size=1024,
+        encoder_type="GradualStyleEncoder",
+        checkpoint_path=None,
+        start_from_latent_avg=True,
+        learn_in_w=False,
+    ):
         super(pSp, self).__init__()
-        self.set_opts(opts)
+        self.start_from_latent_avg, self.learn_in_w = start_from_latent_avg, learn_in_w
         # compute number of style inputs based on the output resolution
-        self.opts.n_styles = int(math.log(self.opts.output_size, 2)) * 2 - 2
         # Define architecture
-        self.encoder = self.set_encoder()
-        self.decoder = Generator(self.opts.output_size, 512, 8)
+        self.encoder = self.set_encoder(encoder_type, input_nc, n_styles=int(math.log(output_size, 2)) * 2 - 2)
+        self.decoder = Generator(output_size, 512, 8)
         self.face_pool = torch.nn.AdaptiveAvgPool2d((256, 256))
         # Load weights if needed
-        self.load_weights()
+        if checkpoint_path is not None:
+            self.load_weights(checkpoint_path)
 
-    def set_encoder(self):
-        if self.opts.encoder_type == "GradualStyleEncoder":
-            encoder = GradualStyleEncoder(50, "ir_se", self.opts)
-        elif self.opts.encoder_type == "BackboneEncoderUsingLastLayerIntoW":
-            encoder = BackboneEncoderUsingLastLayerIntoW(50, "ir_se", self.opts)
-        elif self.opts.encoder_type == "BackboneEncoderUsingLastLayerIntoWPlus":
-            encoder = BackboneEncoderUsingLastLayerIntoWPlus(50, "ir_se", self.opts)
+    def set_encoder(self, encoder_type, input_nc, n_styles):
+        if encoder_type == "GradualStyleEncoder":
+            encoder = GradualStyleEncoder(50, input_nc, n_styles, "ir_se")
+        elif encoder_type == "BackboneEncoderUsingLastLayerIntoW":
+            encoder = BackboneEncoderUsingLastLayerIntoW(50, input_nc, "ir_se")
+        elif encoder_type == "BackboneEncoderUsingLastLayerIntoWPlus":
+            encoder = BackboneEncoderUsingLastLayerIntoWPlus(50, input_nc, n_styles, "ir_se")
         else:
-            raise Exception("{} is not a valid encoders".format(self.opts.encoder_type))
+            raise Exception("{} is not a valid encoders".format(encoder_type))
         return encoder
 
-    def load_weights(self):
-        if self.opts.checkpoint_path is not None:
-            print("Loading pSp from checkpoint: {}".format(self.opts.checkpoint_path))
-            ckpt = torch.load(self.opts.checkpoint_path, map_location="cpu")
-            self.encoder.load_state_dict(get_keys(ckpt, "encoder"), strict=True)
-            self.decoder.load_state_dict(get_keys(ckpt, "decoder"), strict=True)
-            self.__load_latent_avg(ckpt)
-        else:
-            print("Loading encoders weights from irse50!")
-            encoder_ckpt = torch.load(model_paths["ir_se50"])
-            # if input to encoder is not an RGB image, do not load the input layer weights
-            if self.opts.label_nc != 0:
-                encoder_ckpt = {k: v for k, v in encoder_ckpt.items() if "input_layer" not in k}
-            self.encoder.load_state_dict(encoder_ckpt, strict=False)
-            print("Loading decoder weights from pretrained!")
-            ckpt = torch.load(self.opts.stylegan_weights)
-            self.decoder.load_state_dict(ckpt["g_ema"], strict=False)
-            if self.opts.learn_in_w:
-                self.__load_latent_avg(ckpt, repeat=1)
-            else:
-                self.__load_latent_avg(ckpt, repeat=self.opts.n_styles)
+    def load_weights(self, checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        self.encoder.load_state_dict(get_keys(ckpt, "encoder"), strict=True)
+        self.decoder.load_state_dict(get_keys(ckpt, "decoder"), strict=True)
+        self.__load_latent_avg(ckpt)
 
     def forward(
         self,
@@ -342,8 +332,8 @@ class pSp(nn.Module):
         else:
             codes = self.encoder(x)
             # normalize with respect to the center of an average face
-            if self.opts.start_from_latent_avg:
-                if self.opts.learn_in_w:
+            if self.start_from_latent_avg:
+                if self.learn_in_w:
                     codes = codes + self.latent_avg.repeat(codes.shape[0], 1)
                 else:
                     codes = codes + self.latent_avg.repeat(codes.shape[0], 1, 1)
@@ -359,6 +349,7 @@ class pSp(nn.Module):
                     codes[:, i] = 0
 
         input_is_latent = not input_code
+        print(codes.shape)
         images, result_latent = self.decoder(
             [codes], input_is_latent=input_is_latent, randomize_noise=randomize_noise, return_latents=return_latents
         )
@@ -371,12 +362,9 @@ class pSp(nn.Module):
         else:
             return images
 
-    def set_opts(self, opts):
-        self.opts = opts
-
     def __load_latent_avg(self, ckpt, repeat=None):
         if "latent_avg" in ckpt:
-            self.latent_avg = ckpt["latent_avg"].to(self.opts.device)
+            self.latent_avg = ckpt["latent_avg"].cuda()
             if repeat is not None:
                 self.latent_avg = self.latent_avg.repeat(repeat, 1)
         else:

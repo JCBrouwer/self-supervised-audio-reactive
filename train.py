@@ -13,7 +13,7 @@ SR = 44100
 DUR = 4
 
 
-class PreprocessDataset(Dataset):
+class PreprocessAudioDataset(Dataset):
     def __init__(self, directory):
         super().__init__()
         extensions = [".wav", ".mp3", ".flac"]
@@ -38,7 +38,8 @@ def collate_fn(batch):
 def preprocess_audio(in_dir, out_file):
     if not os.path.exists(out_file):
         snippets = [
-            batch for batch in DataLoader(PreprocessDataset(in_dir), batch_size=4, num_workers=4, collate_fn=collate_fn)
+            batch
+            for batch in DataLoader(PreprocessAudioDataset(in_dir), batch_size=4, num_workers=4, collate_fn=collate_fn)
         ]
         snippets = torch.cat(snippets).numpy()
         np.save(out_file, snippets)
