@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from models.stylegan2 import PixelNorm
+from torch_ema import ExponentialMovingAverage
 
 
 class GRU(nn.Module):
@@ -48,7 +49,7 @@ class StyleVideoGenerator(torch.jit.ScriptModule):
             nn.LeakyReLU(),
             nn.BatchNorm1d(512),
         )
-        self.Ts = nn.ModuleList(
+        self.As = nn.ModuleList(
             [
                 nn.Sequential(
                     nn.Linear(512, 512),
@@ -59,12 +60,8 @@ class StyleVideoGenerator(torch.jit.ScriptModule):
             ]
         )
 
-        self.register_buffer(
-            "l_mu",
-        )
-        self.register_buffer(
-            "l_sig",
-        )
+        self.register_buffer("l_mu", ExponentialMovingAverage([torch.zeros(latent_dim)], 0.995))
+        self.register_buffer("l_sig", ExponentialMovingAverage([torch.ones(latent_dim)], 0.995))
 
     @torch.jit.script_method
     def forward(self, s: torch.Tensor):
@@ -83,8 +80,8 @@ class StyleVideoGenerator(torch.jit.ScriptModule):
         l = self.T(l)
 
         l_w = []
-        for layer in self.Ts:
-            l_w.append(layer(l))
+        for A in self.As:
+            l_w.append(A(l))
         l_w = torch.stack(l_w)  # n_styles, L * N, 512
 
         l_w = l_w.permute(1, 0, 2)  # L * N, n_styles, 512

@@ -8,6 +8,7 @@ import pytorchvideo.data
 import torch
 from pytorchvideo.transforms import ApplyTransformToKey, Normalize, ShortSideScale, UniformTemporalSubsample
 from torch.utils.data import DataLoader, Dataset
+from torch_ema import ExponentialMovingAverage
 from torchvision.transforms import CenterCrop, Compose, Lambda, Resize
 from tqdm import tqdm
 
@@ -97,6 +98,7 @@ if __name__ == "__main__":
     preprocess_video(in_dir, cache_file, duration, fps)
 
     G = StyleVideoGenerator(n_styles=n_styles, latent_dim=latent_dim).to(device)
+    G_ema = ExponentialMovingAverage(G.parameters(), decay=0.995)
     D = StyleVideoDiscriminator(seq_len=seq_len, n_styles=n_styles, latent_dim=latent_dim).to(device)
 
     d_optimizer = torch.optim.Adam(D.parameters(), lr=learning_rate, betas=(b1, b2))
@@ -117,6 +119,7 @@ if __name__ == "__main__":
 
         for d_iter in range(critic_iter):
             D.zero_grad()
+
             real = next(dataloader).to(device)
             d_loss_real = D(real).mean()
             d_loss_real.backward(is_real)
@@ -139,6 +142,7 @@ if __name__ == "__main__":
             )[0]
             gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda_gp
             gradient_penalty.backward()
+
             d_optimizer.step()
 
         for p in D.parameters():
@@ -153,14 +157,26 @@ if __name__ == "__main__":
         g_loss.backward(is_real)
 
         timestep_diff = G.l[-1] - G.l[0]
-        G.update_ema(timestep_diff)
-        timestep_dist = (timestep_diff - G.l_mu) / G.l_sig
+        G.l_mu.update(timestep_diff)
+        G.l_sq.update(timestep_diff.pow(2))
+
+        l_var = G.l_sq - G.l_mu.pow(2)
+        timestep_dist = (timestep_diff - G.l_mu) / l_var
+        d = torch.sqrt(torch.sum(timestep_dist.pow(2)))
 
         gradients = torch.autograd.grad(
-            outputs=timestep_dist,
+            outputs=d,
             inputs=z,
             create_graph=True,
             retain_graph=True,
         )[0]
+        gradients = gradients.permute(1, 0, 2)  # N, L, latent_dim
+
+        phi = torch.arctan(torch.norm(gradients[:, 1:], dim=(1, 2)) / torch.norm(gradients[:, [0]], dim=(1, 2)))
+        assert tuple(phi.shape) == (batch_size,)
+
+        loss_gap = torch.minimum(torch.zeros_like(phi), phi - torch.pi / 4).pow(2) * lambda_gap
+        loss_gap.backward()
 
         g_optimizer.step()
+        G_ema.update()
