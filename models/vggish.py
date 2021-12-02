@@ -1,11 +1,11 @@
-import torch
+from argparse import Namespace
+from pathlib import Path
+
 import numpy as np
 import resampy
 import torch
-from torch import nn
 from einops import rearrange
-from pathlib import Path
-from argparse import Namespace
+from torch import nn
 
 
 class VggishExtractor(nn.Module):
@@ -37,7 +37,7 @@ class Vggish(nn.Module):
         super().__init__()
 
         torch.hub.set_dir(str(args.data.cache_dir))
-        self.model = torch.hub.load("harritaylor/torchvggish", "vggish")
+        self.model = torch.hub.load("harritaylor/torchvggish", "vggish", verbose=False)
         self.model.postprocess = args.postprocess
         self.model.preprocess = False
 
@@ -227,8 +227,6 @@ def _preprocess(data, sample_rate):
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-import numpy as np
 
 
 def frame(data, window_length, hop_length):
