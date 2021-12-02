@@ -2,7 +2,6 @@ import torch
 from torch import nn
 
 from models.stylegan2 import PixelNorm
-from torch_ema import ExponentialMovingAverage
 
 
 class GRU(nn.Module):
@@ -60,8 +59,18 @@ class StyleVideoGenerator(torch.jit.ScriptModule):
             ]
         )
 
-        self.register_buffer("l_mu", ExponentialMovingAverage([torch.zeros(latent_dim)], 0.995))
-        self.register_buffer("l_sig", ExponentialMovingAverage([torch.ones(latent_dim)], 0.995))
+        self.l = torch.empty([])
+        self.register_buffer("l_mu", torch.zeros((1, latent_dim)))
+        self.register_buffer("l_sq", torch.ones((1, latent_dim)))
+        self.register_buffer("n_upd8s", torch.zeros([]))
+
+    @torch.no_grad()
+    def update_gap_buffers(self, distance, decay=0.9):
+        self.n_upd8s += 1
+        decay = min(decay, (1 + self.n_upd8s) / (10 + self.n_upd8s))
+        one_minus_decay = 1.0 - decay
+        self.l_mu -= one_minus_decay * (self.l_mu - distance.mean(0))
+        self.l_sq -= one_minus_decay * (self.l_sq - (distance ** 2).mean(0))
 
     @torch.jit.script_method
     def forward(self, s: torch.Tensor):
@@ -75,7 +84,7 @@ class StyleVideoGenerator(torch.jit.ScriptModule):
 
         l, _ = self.P(s, h)
         self.l = torch.cat((i, l))
-        L, N, H = l.shape
+        L, N, H = self.l.shape
         l = self.l.reshape(L * N, H)
         l = self.T(l)
 
@@ -120,6 +129,7 @@ class StyleVideoDiscriminator(torch.jit.ScriptModule):
             nn.LeakyReLU(),
             nn.Flatten(),
             nn.Linear(int(128 * seq_len / 4), 1),
+            nn.Tanh(),
         )
 
     @torch.jit.script_method

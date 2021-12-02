@@ -83,14 +83,14 @@ if __name__ == "__main__":
     duration = 1
     fps = 24
     seq_len = duration * fps
-    batch_size = 64
+    batch_size = 16
     n_styles = 18
     latent_dim = 32
     nsteps = 100_000
     learning_rate = 1e-4
     b1 = 0.5
     b2 = 0.999
-    critic_iter = 5
+    critic_iter = 1
     lambda_gp = 50
     lambda_gap = 100
 
@@ -98,85 +98,110 @@ if __name__ == "__main__":
     preprocess_video(in_dir, cache_file, duration, fps)
 
     G = StyleVideoGenerator(n_styles=n_styles, latent_dim=latent_dim).to(device)
-    G_ema = ExponentialMovingAverage(G.parameters(), decay=0.995)
     D = StyleVideoDiscriminator(seq_len=seq_len, n_styles=n_styles, latent_dim=latent_dim).to(device)
+
+    def weights_init(m):
+        classname = m.__class__.__name__
+        if classname.find("Conv") != -1:
+            torch.nn.init.normal_(m.weight, 0.0, 0.02)
+        elif classname.find("BatchNorm") != -1:
+            torch.nn.init.normal_(m.weight, 1.0, 0.02)
+            torch.nn.init.zeros_(m.bias)
+
+    G.apply(weights_init)
+    D.apply(weights_init)
+
+    G_ema = ExponentialMovingAverage(G.parameters(), decay=0.995)
 
     d_optimizer = torch.optim.Adam(D.parameters(), lr=learning_rate, betas=(b1, b2))
     g_optimizer = torch.optim.Adam(G.parameters(), lr=learning_rate, betas=(b1, b2))
 
     dataloader = infiniter(
-        DataLoader(LatentSequenceDataset(cache_file), batch_size=batch_size, num_workers=4, shuffle=True)
+        DataLoader(
+            LatentSequenceDataset(cache_file), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True
+        )
     )
 
-    is_fake = torch.tensor(1.0, device=device)
-    is_real = torch.tensor(-1.0, device=device)
+    is_real = torch.tensor(1.0, device=device)
+    is_fake = torch.tensor(-1.0, device=device)
 
-    for step in tqdm(range(nsteps)):
-        for p in D.parameters():
-            p.requires_grad = True
-        for p in G.parameters():
-            p.requires_grad = False
+    with tqdm(range(nsteps)) as pbar:
+        for step in pbar:
+            for p in D.parameters():
+                p.requires_grad = True
+            for p in G.parameters():
+                p.requires_grad = False
 
-        for d_iter in range(critic_iter):
-            D.zero_grad()
+            for d_iter in range(critic_iter):
+                D.zero_grad()
 
-            real = next(dataloader).to(device)
-            d_loss_real = D(real).mean()
-            d_loss_real.backward(is_real)
+                real = next(dataloader).to(device)
+                d_loss_real = D(real).mean()
+                d_loss_real.backward(is_real)
 
+                z = torch.randn((batch_size, seq_len, latent_dim), device=device)
+                fake = G(z)
+                d_loss_fake = D(fake).mean()
+                d_loss_fake.backward(is_fake)
+
+                eta = torch.FloatTensor(batch_size, 1, 1, 1).to(device).uniform_(0, 1)
+                interpolated = eta * real + ((1 - eta) * fake)
+                interpolated.requires_grad_(True)
+                prob_interpolated = D(interpolated)
+                gradients = torch.autograd.grad(
+                    outputs=prob_interpolated,
+                    inputs=interpolated,
+                    grad_outputs=torch.ones(prob_interpolated.size()).to(device),
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda_gp
+                gradient_penalty.backward()
+
+                d_optimizer.step()
+
+            for p in D.parameters():
+                p.requires_grad = False
+            for p in G.parameters():
+                p.requires_grad = True
+
+            G.zero_grad()
             z = torch.randn((batch_size, seq_len, latent_dim), device=device)
-            fake = G(z)
-            d_loss_fake = D(fake).mean()
-            d_loss_fake.backward(is_fake)
+            z.requires_grad_()
+            with torch.backends.cudnn.flags(enabled=False):  # Double backwards is not supported for CuDNN RNNs
+                fake = G(z)
+            g_loss = D(fake).mean()
+            g_loss.backward(is_real, retain_graph=True)
 
-            eta = torch.FloatTensor(batch_size, 1, 1, 1).to(device).uniform_(0, 1)
-            interpolated = eta * real + ((1 - eta) * fake)
-            interpolated.requires_grad_(True)
-            prob_interpolated = D(interpolated)
+            timestep_diff = G.l[-1] - G.l[0]
+            G.update_gap_buffers(timestep_diff)
+            l_var = G.l_sq - G.l_mu ** 2
+            timestep_dist = (timestep_diff - G.l_mu) / l_var
+            d = torch.sqrt(torch.sum(timestep_dist ** 2))
+
             gradients = torch.autograd.grad(
-                outputs=prob_interpolated,
-                inputs=interpolated,
-                grad_outputs=torch.ones(prob_interpolated.size()).to(device),
+                outputs=d,
+                inputs=z,
                 create_graph=True,
                 retain_graph=True,
             )[0]
-            gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda_gp
-            gradient_penalty.backward()
+            gradients = gradients.permute(1, 0, 2)  # N, L, latent_dim
 
-            d_optimizer.step()
+            phi = torch.arctan(torch.norm(gradients[:, 1:], dim=(1, 2)) / torch.norm(gradients[:, [0]], dim=(1, 2)))
 
-        for p in D.parameters():
-            p.requires_grad = False
-        for p in G.parameters():
-            p.requires_grad = True
+            loss_gap = (torch.minimum(torch.zeros_like(phi), phi - torch.pi / 4) ** 2).mean() * lambda_gap
+            loss_gap.backward()
 
-        G.zero_grad()
-        z = torch.randn((batch_size, seq_len, latent_dim), device=device)
-        fake = G(z)
-        g_loss = D(fake).mean()
-        g_loss.backward(is_real)
+            g_optimizer.step()
+            G_ema.update()
 
-        timestep_diff = G.l[-1] - G.l[0]
-        G.l_mu.update(timestep_diff)
-        G.l_sq.update(timestep_diff.pow(2))
-
-        l_var = G.l_sq - G.l_mu.pow(2)
-        timestep_dist = (timestep_diff - G.l_mu) / l_var
-        d = torch.sqrt(torch.sum(timestep_dist.pow(2)))
-
-        gradients = torch.autograd.grad(
-            outputs=d,
-            inputs=z,
-            create_graph=True,
-            retain_graph=True,
-        )[0]
-        gradients = gradients.permute(1, 0, 2)  # N, L, latent_dim
-
-        phi = torch.arctan(torch.norm(gradients[:, 1:], dim=(1, 2)) / torch.norm(gradients[:, [0]], dim=(1, 2)))
-        assert tuple(phi.shape) == (batch_size,)
-
-        loss_gap = torch.minimum(torch.zeros_like(phi), phi - torch.pi / 4).pow(2) * lambda_gap
-        loss_gap.backward()
-
-        g_optimizer.step()
-        G_ema.update()
+            pbar.write(
+                f"d_loss_fake: {d_loss_fake.item():.4f}".ljust(30)
+                + f"d_loss_real: {d_loss_real.item():.4f}".ljust(30)
+                + f"gradient_penalty: {gradient_penalty.item():.4f}".ljust(30)
+                + f"g_loss: {g_loss.item():.4f}".ljust(20)
+                # + f"dist: {d.mean().item():.4f}".ljust(20)
+                # + f"G.l_mu: {G.l_mu.mean().item():.4f}".ljust(20)
+                # + f"G.l_var: {l_var.mean().item():.4f}".ljust(20)
+                # + f"loss_gap: {loss_gap.item():.4f}".ljust(20)
+            )
