@@ -65,7 +65,7 @@ class AudioFeatureDataset(Dataset):
 
 if __name__ == "__main__":
     in_dir = "/home/hans/datasets/wavefunk/"
-    out_file = f"{Path(in_dir).stem}_snippets_preprocessed.npy"
+    out_file = f"cache/{Path(in_dir).stem}_snippets_preprocessed.npy"
     preprocess_audio(in_dir, out_file)
 
     dataloader = DataLoader(AudioFeatureDataset(out_file), batch_size=8, num_workers=4, shuffle=True)

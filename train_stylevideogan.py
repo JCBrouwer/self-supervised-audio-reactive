@@ -94,7 +94,7 @@ if __name__ == "__main__":
     lambda_gp = 50
     lambda_gap = 100
 
-    cache_file = f"{Path(in_dir).stem}_latents_preprocessed_{duration}sec_{fps}fps.npy"
+    cache_file = f"cache/{Path(in_dir).stem}_latents_preprocessed_{duration}sec_{fps}fps.npy"
     preprocess_video(in_dir, cache_file, duration, fps)
 
     G = StyleVideoGenerator(n_styles=n_styles, latent_dim=latent_dim).to(device)
@@ -200,8 +200,8 @@ if __name__ == "__main__":
                 + f"d_loss_real: {d_loss_real.item():.4f}".ljust(30)
                 + f"gradient_penalty: {gradient_penalty.item():.4f}".ljust(30)
                 + f"g_loss: {g_loss.item():.4f}".ljust(20)
-                # + f"dist: {d.mean().item():.4f}".ljust(20)
-                # + f"G.l_mu: {G.l_mu.mean().item():.4f}".ljust(20)
-                # + f"G.l_var: {l_var.mean().item():.4f}".ljust(20)
-                # + f"loss_gap: {loss_gap.item():.4f}".ljust(20)
+                + f"dist: {d.mean().item():.4f}".ljust(20)
+                + f"G.l_mu: {G.l_mu.mean().item():.4f}".ljust(20)
+                + f"G.l_var: {l_var.mean().item():.4f}".ljust(20)
+                + f"loss_gap: {loss_gap.item():.4f}".ljust(20)
             )
