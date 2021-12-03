@@ -514,6 +514,7 @@ class Generator(nn.Module):
         input_is_latent=False,
         noise=None,
         randomize_noise=True,
+        stop_early=20,  # default ==> no stopping
     ):
         if not input_is_latent:
             styles = [self.style(s) for s in styles]
@@ -563,6 +564,9 @@ class Generator(nn.Module):
             skip = to_rgb(out, latent[:, i + 2], skip)
 
             i += 2
+
+            if i > stop_early:
+                return skip, None
 
         image = skip
 

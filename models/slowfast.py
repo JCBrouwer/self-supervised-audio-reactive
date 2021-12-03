@@ -83,7 +83,6 @@ class SlowFast(nn.Module):
 
     def __init__(self, args):
         super().__init__()
-        args.data.cache_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
         self.cache_dir = args.data.cache_dir
         self.model_choices = load_with_cache(self.cache_dir / "choices.json", get_model_zoo)
         self.model, self.cfg = load_model(
@@ -92,7 +91,6 @@ class SlowFast(nn.Module):
 
     @classmethod
     def download(cls, args):
-        args.data.cache_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
         model_choices = load_with_cache(args.data.cache_dir / "choices.json", get_model_zoo)
         model, cfg = load_model(args.slowfast_config, model_choices, args.data.cache_dir, args.computation.device)
         return model
