@@ -49,7 +49,7 @@ class LSTMReactor(nn.Module):
         )
 
     def forward(self, x, m):
-        batch_size, seq_len, _ = x.shape
+        B, S, _ = x.shape
 
         l = x
         state = (m[None, :, None], m[None, :, None])
@@ -59,13 +59,11 @@ class LSTMReactor(nn.Module):
             inter_l.append(l)
             inter_h.append(state[1])
 
-        l = l.reshape(batch_size * seq_len, self.hidden_size)
+        l = l.reshape(B * S, self.hidden_size)
         l = self.T(l)
         l_w = []
         for A in self.As:
             l_w.append(A(l))
-        l_w = torch.stack(l_w)  # n_styles, batch_size * seq_len, 512
-        l_w = l_w.reshape(self.n_styles, batch_size, seq_len, 512).permute(
-            1, 2, 0, 3
-        )  # batch_size, seq_len, n_styles, 512
+        l_w = torch.stack(l_w)  # N, B * S, 512
+        l_w = l_w.reshape(self.n_styles, B, S, 512).permute(1, 2, 0, 3)  # B, S, N, 512
         return l_w, torch.stack(inter_l), torch.cat(inter_h)
