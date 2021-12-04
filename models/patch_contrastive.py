@@ -1,52 +1,60 @@
+from typing import List, Tuple
+
 import numpy as np
 import torch
-from torch import nn
-from torch.nn.functional import cross_entropy
+from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn.functional import cross_entropy
 
 
-class PatchSampler1d(nn.Module):
+class PatchSampler1d(torch.jit.ScriptModule):
     def __init__(self, n_patches: int, patch_len: int):
         super().__init__()
         self.n_patches, self.patch_len = n_patches, patch_len
 
-    def forward(self, x, y):
-        x_batch_patches, y_batch_patches = [], []
-        for b in range(x.shape[0]):
-            x_patches, y_patches = [], []
+    @torch.jit.script_method
+    def forward(self, sequences: List[Tensor], target: Tensor) -> Tuple[List[Tensor], Tensor]:
+        seq_batch_patches = torch.jit.annotate(List[List[Tensor]], [[] for _ in sequences])
+        tar_batch_patches = torch.jit.annotate(List[Tensor], [])
+        for b in range(target.shape[0]):
+            seq_patches = torch.jit.annotate(List[List[Tensor]], [[] for _ in sequences])
+            tar_patches = torch.jit.annotate(List[Tensor], [])
             for _ in range(self.n_patches):
-                start_idx = torch.randint(0, x.shape[1] - self.patch_len, (1,), device=x.device)
-                x_patches.append(x[b, start_idx : start_idx + self.patch_len])
-                y_patches.append(y[b, start_idx : start_idx + self.patch_len])
-            x_batch_patches.append(torch.stack(x_patches))
-            y_batch_patches.append(torch.stack(y_patches))
-        return torch.stack(x_batch_patches), torch.stack(y_batch_patches)  # B, P, S, F
+                start_idx = torch.randint(0, target.shape[1] - self.patch_len, (1,)).item()
+                for s, seq in enumerate(sequences):
+                    seq_patches[s].append(seq[b, start_idx : start_idx + self.patch_len])
+                tar_patches.append(target[b, start_idx : start_idx + self.patch_len])
+            for s, seq in enumerate(seq_patches):
+                seq_batch_patches[s].append(torch.stack(seq))
+            tar_batch_patches.append(torch.stack(tar_patches))
+        return [torch.stack(seq_batch) for seq_batch in seq_batch_patches], torch.stack(tar_batch_patches)  # B, P, S, F
 
 
-class PatchSampler2d(nn.Module):
+class PatchSampler2d(torch.jit.ScriptModule):
     def __init__(self, patch_size: int, n_channels: int = 32, patch_scaling: float = 0.5):
         super().__init__()
         self.patch_size, self.n_channels, self.patch_scaling = patch_size, n_channels, patch_scaling
 
+    @torch.jit.script_method
     def forward(self, input):
         P, S, C, H, W = input.shape
         max_size = max(W, H)
         min_size = min(W, H, self.patch_size)
-        cutouts = []
+        patches = torch.jit.annotate(List[Tensor], [])
         for p in range(P):
             size = int(torch.rand([1]) ** self.patch_scaling * (max_size - min_size) + min_size)
             pixel = torch.randint(0, (W - size + 1) * (H - size + 1), ())
             offsety, offsetx = torch.div(pixel, (W - size + 1), rounding_mode="floor"), pixel % (W - size + 1)
             channels = torch.randperm(C)[: self.n_channels]
-            cutout = input[p, :, channels, offsety : offsety + size, offsetx : offsetx + size]
-            cutouts.append(F.adaptive_avg_pool2d(cutout, min_size).flatten(1, 3))
-        return torch.stack(cutouts)  # P, S, F
+            patch = input[p, :, channels, offsety : offsety + size, offsetx : offsetx + size]
+            patches.append(F.adaptive_avg_pool2d(patch, min_size).flatten(1, 3))
+        return torch.stack(patches)  # P, S, F
 
 
-def patch_nce_loss(f_q, f_k, tau=0.07):
+def patch_nce_loss(f_q, f_k, tau: float = 0.07):
     """
-    Input: f_q (BxSxC) and sampled features from H(G_enc(x))
-    Input: f_k (BxSxC) are sampled features from H(G_enc(G(x))
+    Input: f_q (B, S, F) sampled feature patches
+    Input: f_k (B, S, F) sampled feature patches
     Input: tau is the temperature used in PatchNCE loss.
     Output: PatchNCE loss
     """
@@ -72,35 +80,44 @@ def patch_nce_loss(f_q, f_k, tau=0.07):
     return cross_entropy(predictions, targets)
 
 
-class PatchContrastor(nn.Module):
-    def __init__(self, latent_dim):
+class LazyPatchContrastor(torch.jit.ScriptModule):
+    def __init__(self, latent_dim, sequences, target):
         super().__init__()
         self.latent_dim = latent_dim
-        self.feature_heads = None
-        self.target_head = None
-
-    def initialize(self, sequences, targets):
-        B, P, S, target_channels = targets.shape
+        B, P, S, target_channels = target.shape
         self.feature_heads = nn.ModuleList(
-            [ContrastiveHead(B, P, np.prod(seq.shape[2:]), self.latent_dim) for seq in sequences]
-        ).to(targets.device)
-        self.target_head = ContrastiveHead(B, P, S * target_channels, self.latent_dim).to(targets.device)
+            [
+                ContrastiveHead(B, P, torch.prod(torch.tensor(seq.shape[2:])).item(), self.latent_dim)
+                for seq in sequences
+            ]
+        ).to(target.device)
+        self.target_head = ContrastiveHead(B, P, S * target_channels, self.latent_dim).to(target.device)
 
-    def forward(self, sequences, targets):
-        if self.feature_heads is None:
-            self.initialize(sequences, targets)
-
-        target_embedding = self.target_head(targets)
+    @torch.jit.script_method
+    def forward(self, sequences: List[Tensor], target: Tensor):
+        target_embedding = self.target_head(target)
 
         loss = 0
-        for s, seq in enumerate(sequences):
-            loss += patch_nce_loss(self.feature_heads[s](seq), target_embedding)
+        for idx, feature_head in enumerate(self.feature_heads):
+            loss += patch_nce_loss(feature_head(sequences[idx]), target_embedding)
 
         return loss
 
 
-class ContrastiveHead(nn.Module):
-    def __init__(self, batch_size, n_patches, in_nc, out_nc):
+class PatchContrastor(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.contrastor = None
+        self.latent_dim = latent_dim
+
+    def forward(self, sequences, target):
+        if self.contrastor is None:
+            self.contrastor = LazyPatchContrastor(self.latent_dim, sequences, target)
+        return self.contrastor(sequences, target)
+
+
+class ContrastiveHead(torch.jit.ScriptModule):
+    def __init__(self, batch_size: int, n_patches: int, in_nc: int, out_nc: int):
         super().__init__()
         self.mlp = nn.Sequential(
             Reshape(batch_size * n_patches, -1),
@@ -110,14 +127,16 @@ class ContrastiveHead(nn.Module):
             Reshape(batch_size, n_patches, -1),
         )
 
+    @torch.jit.script_method
     def forward(self, x):
         return self.mlp(x)
 
 
-class Reshape(nn.Module):
+class Reshape(torch.jit.ScriptModule):
     def __init__(self, *shape):
         super().__init__()
         self.shape = shape
 
+    @torch.jit.script_method
     def forward(self, x):
         return x.reshape(*self.shape)

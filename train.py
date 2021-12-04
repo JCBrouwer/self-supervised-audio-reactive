@@ -3,10 +3,12 @@ from glob import glob
 from itertools import chain
 from pathlib import Path
 
+import joblib
 import librosa
 import numpy as np
 import torch
 import torchaudio
+import torchdatasets as td
 import torchextractor as tx
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
@@ -53,7 +55,7 @@ def preprocess_audio(in_dir, out_file):
         np.save(out_file, snippets)
 
 
-class AudioFeatureDataset(Dataset):
+class AudioFeatureDataset(td.Dataset):
     def __init__(self, file):
         super().__init__()
         self.snippets = np.load(file, mmap_mode="r")
@@ -84,20 +86,23 @@ if __name__ == "__main__":
 
     batch_size = 16
     hidden_size = 32
-    num_layers = 2
-    zoneout = 0  # 0.1
-    dropout = 0  # 0.05
+    num_layers = 4
+    zoneout = 0.1
+    dropout = 0.05
     n_frames = int(DUR * FPS)
     patch_len = 32
     n_patches = 16
-    lambda_video = 1 / 30
+    use_video = False
+    lambda_video = 0.0333
 
     preprocess_audio(in_dir, out_file)
     dataloader = DataLoader(
-        AudioFeatureDataset(out_file), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True
+        AudioFeatureDataset(out_file).cache(td.cachers.Pickle(Path("./cache/audio_features/"))),
+        batch_size=batch_size,
+        num_workers=16,
+        shuffle=True,
+        drop_last=True,
     )
-
-    writer = SummaryWriter()
 
     generator = Generator(size=1024, style_dim=512, n_mlp=2)
     n_styles = generator.num_layers
@@ -120,11 +125,13 @@ if __name__ == "__main__":
 
     sequence_sampler = PatchSampler1d(n_patches=n_patches, patch_len=patch_len).to(device)
     sequence_contrastor = PatchContrastor(latent_dim=32).to(device)
-    # video_sampler = PatchSampler2d(patch_size=16).to(device)
-    # video_contrastor = PatchContrastor(latent_dim=32).to(device)
+    if use_video:
+        video_sampler = PatchSampler2d(patch_size=16).to(device)
+        video_contrastor = PatchContrastor(latent_dim=32).to(device)
 
     optimizer = torch.optim.Adam(chain(reactor.parameters(), sequence_contrastor.parameters()), lr=1e-4)
 
+    writer = SummaryWriter()
     n_iter = 0
     losses = []
     for epoch in tqdm(range(1000)):
@@ -137,40 +144,57 @@ if __name__ == "__main__":
 
             w_seq, inter_l, inter_h = reactor(audio_features, motion_seed)
 
-            w_patches, audio_patches = sequence_sampler(w_seq.flatten(2, 3), audio_features)
+            seq_patches, audio_patches = sequence_sampler(
+                [w_seq.flatten(2, 3)] + [l for l in inter_l] + [h for h in inter_h], audio_features
+            )
 
-            loss = sequence_contrastor([w_patches], audio_patches)
+            loss = sequence_contrastor(seq_patches, audio_patches)
             loss.backward()
             writer.add_scalar("Loss/train", loss.item(), n_iter)
             losses.append(loss.item())
 
-            # grads = torch.empty_like(w_patches)
-            # for p, (w, a) in enumerate(zip(w_patches.split(1), audio_patches.split(1))):
-            #     (rgb, _), feats = generator(
-            #         [w.reshape(n_patches * patch_len, n_styles, 512)],
-            #         input_is_latent=True,
-            #         stop_early=stop_early,
-            #     )
-            #     patches = [
-            #         video_sampler(feat.reshape(n_patches, patch_len, feat.shape[1], feat.shape[2], feat.shape[3]))[None]
-            #         for feat in list(feats.values()) + [rgb]
-            #     ]
-            #     loss = video_contrastor(patches, a) * lambda_video
-            #     loss_value += loss.item()
-            #     (grads[p],) = torch.autograd.grad(loss, w)[0]
+            if use_video:
+                grads, loss_value = torch.empty_like(seq_patches[0]), 0
+                for p, (w_patch, audio_patch) in enumerate(zip(seq_patches[0].split(1), audio_patches.split(1))):
+                    (rgb, _), feats = generator(
+                        [w_patch.reshape(n_patches * patch_len, n_styles, 512)],
+                        input_is_latent=True,
+                        stop_early=stop_early,
+                    )
+                    video_patches = [
+                        video_sampler(feat.reshape(n_patches, patch_len, *feat.shape[1:]))[None]
+                        for feat in list(feats.values()) + [rgb]
+                    ]
+                    loss = video_contrastor(video_patches, audio_patch) * lambda_video
+                    loss_value += loss.item()
+                    (grads[p],) = torch.autograd.grad(loss, w_patch)[0]
+                writer.add_scalar("Loss/video", loss_value, n_iter)
 
-            # w_seq, inter_l, inter_h = reactor(audio_features, motion_seed)
-            # w_patches, audio_patches = sequence_sampler(w_seq.flatten(2, 3), audio_features)
-            # w_patches.backward(grads)
+                w_seq, inter_l, inter_h = reactor(audio_features, motion_seed)
+                w_patches, audio_patches = sequence_sampler(w_seq.flatten(2, 3), audio_features)
+                w_patches.backward(grads)
 
             optimizer.step()
 
             n_iter += len(audio_features)
 
-        if (epoch + 1) % 5 == 0:
-            torch.save(
-                {"reactor": reactor, "contrastor": sequence_contrastor, "optim": optimizer, "n_iter": n_iter},
-                f"{writer.log_dir}/checkpoint_steps{n_iter}_loss{np.mean(losses[:1000]):.4f}.pt",
-            )
+        if (epoch + 1) % 50 == 0:
+            with open("models/reactor.py") as reactor_py, open("models/patch_contrastive.py") as contrastive_py, open(
+                "train.py"
+            ) as train_py:
+                joblib.dump(
+                    {
+                        "reactor": reactor,
+                        "sequence_contrastor": sequence_contrastor,
+                        "video_contrastor": video_contrastor if use_video else None,
+                        "optim": optimizer,
+                        "n_iter": n_iter,
+                        "reactor_file": reactor_py.readlines(),
+                        "contrastive_file": contrastive_py.readlines(),
+                        "train_file": train_py.readlines(),
+                    },
+                    f"{writer.log_dir}/checkpoint_steps{n_iter}_loss{np.mean(losses[:1000]):.4f}.pt",
+                    compress=9,
+                )
 
     writer.close()
