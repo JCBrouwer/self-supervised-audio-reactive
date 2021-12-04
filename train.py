@@ -134,7 +134,7 @@ if __name__ == "__main__":
     writer = SummaryWriter()
     n_iter = 0
     losses = []
-    for epoch in tqdm(range(1000)):
+    for epoch in tqdm(range(10000)):
         for audio_features in dataloader:
             loss_value = 0
             optimizer.zero_grad()
@@ -145,8 +145,8 @@ if __name__ == "__main__":
             w_seq, inter_l, inter_h = reactor(audio_features, motion_seed)
 
             seq_patches, audio_patches = sequence_sampler(
-                [w_seq.flatten(2, 3)] + [l for l in inter_l] + [h for h in inter_h], audio_features
-            )
+                [w_seq.flatten(2, 3)] + [l for l in inter_l], audio_features
+            )  #  + [h for h in inter_h]
 
             loss = sequence_contrastor(seq_patches, audio_patches)
             loss.backward()
@@ -184,9 +184,9 @@ if __name__ == "__main__":
             ) as train_py:
                 joblib.dump(
                     {
-                        "reactor": reactor,
-                        "sequence_contrastor": sequence_contrastor,
-                        "video_contrastor": video_contrastor if use_video else None,
+                        "reactor": reactor.state_dict(),
+                        "sequence_contrastor": sequence_contrastor.state_dict(),
+                        "video_contrastor": video_contrastor.state_dict() if use_video else None,
                         "optim": optimizer,
                         "n_iter": n_iter,
                         "reactor_file": reactor_py.readlines(),
