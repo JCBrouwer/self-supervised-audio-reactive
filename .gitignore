@@ -5,3 +5,5 @@
 cache/*
 !cache/.gitkeep
 runs/
+output/*
+!output/.gitkeep

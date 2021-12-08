@@ -105,7 +105,7 @@ if __name__ == "__main__":
     )
 
     generator = Generator(size=1024, style_dim=512, n_mlp=2)
-    n_styles = generator.num_layers
+    n_styles = generator.num_layers + 1
     generator.load_state_dict(torch.load("cache/RobertAGonzalves-MachineRay2-AbstractArt-188.pt")["g_ema"])
     generator.requires_grad_(False)
     del generator.style
@@ -193,7 +193,7 @@ if __name__ == "__main__":
                         "contrastive_file": contrastive_py.readlines(),
                         "train_file": train_py.readlines(),
                     },
-                    f"{writer.log_dir}/checkpoint_steps{n_iter}_loss{np.mean(losses[:1000]):.4f}.pt",
+                    f"{writer.log_dir}/checkpoint_steps{n_iter}_loss{np.mean(losses[-1000:]):.4f}.pt",
                     compress=9,
                 )
 

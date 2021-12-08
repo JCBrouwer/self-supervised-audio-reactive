@@ -197,15 +197,15 @@ def preprocess(visual, audio, cfg):
 
 
 def _preprocess(cfg, x):
-    print(
-        f"{x.min().item():.4f}",
-        f"{x.mean().item():.4f}",
-        f"{x.max().item():.4f}",
-        "-->",
-        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).min().item():.4f}",
-        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).mean().item():.4f}",
-        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).max().item():.4f}",
-    )
+    # print(
+    #     f"{x.min().item():.4f}",
+    #     f"{x.mean().item():.4f}",
+    #     f"{x.max().item():.4f}",
+    #     "-->",
+    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).min().item():.4f}",
+    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).mean().item():.4f}",
+    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).max().item():.4f}",
+    # )
     x = tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD)
     # T H W C -> C T H W.
     x = x.permute(3, 0, 1, 2)
