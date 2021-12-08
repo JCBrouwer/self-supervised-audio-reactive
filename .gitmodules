@@ -1,0 +1,3 @@
+[submodule "SGW"]
+	path = SGW
+	url = https://github.com/tvayer/SGW.git

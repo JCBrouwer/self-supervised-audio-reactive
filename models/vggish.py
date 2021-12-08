@@ -36,16 +36,18 @@ from torch.nn.functional import interpolate
 
 
 class VggishExtractor(nn.Module):
-    def __init__(self, sr=16000):
+    def __init__(self, sr=16000, fps=24):
         super().__init__()
         self.sr = sr
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_layers = 5
         self.vggish = LayerVggish(
             Namespace(
                 data=Namespace(cache_dir=Path("./cache")),
                 postprocess=False,
-                num_layers=5,
-            )
+                num_layers=self.num_layers,
+            ),
+            fps=fps,
         ).to(self.device)
         self.preprocess = self.vggish.get_preprocessor()
 
@@ -90,41 +92,42 @@ class LayerVggish(Vggish):
     args = {"num_layers": 5, "postprocess": False}
     output_dims = [64, 128, 256, 512, 128]
 
-    def __init__(self, args):
+    def __init__(self, args, fps=24):
         super().__init__(args)
         self.num_layers = args.num_layers
+        self.fps = fps
 
-    def forward(self, data, output_fps=32):
+    def forward(self, data):
         B, N, _, _, _ = data.shape  # BNCHW
         data = rearrange(data, "b t c h w -> (b t) c h w")
-        res = self.model_forward(data, output_fps=output_fps)
+        res = self.model_forward(data)
         res_pooled = []
         for data in res:
             # TODO validate this rearrange
             data = rearrange(data, "(b n) c t -> b (n t) c", b=B)
-            if data.shape[1] != output_fps * N:
-                data = interpolate(data.permute(0, 2, 1), size=output_fps * N).permute(0, 2, 1)
+            if data.shape[1] != self.fps * N:
+                data = interpolate(data.permute(0, 2, 1), size=self.fps * N).permute(0, 2, 1)
             res_pooled.append(data)
         return res_pooled
 
-    def model_forward(self, x, output_fps, fs=None):
+    def model_forward(self, x, fs=None):
         B = x.shape[0]
         model = self.model
         if model.preprocess:
             x = model._preprocess(x, fs)
-        x, res = self.vgg_forward(x, output_fps)
+        x, res = self.vgg_forward(x)
         if model.postprocess:
             x = model._postprocess(x)
             res.append(x.detach().cpu())
         return res
 
-    def vgg_forward(self, inputs, output_fps):
+    def vgg_forward(self, inputs):
         model = self.model
         res = self.run_features(inputs)
 
         res_resized = []
         for feat in res:
-            feat = interpolate(feat.mean(-1), size=output_fps)
+            feat = interpolate(feat.mean(-1), size=self.fps)
             res_resized.append(feat.detach().cpu())
 
         x = res[-1]

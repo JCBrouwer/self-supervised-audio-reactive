@@ -45,16 +45,17 @@ from slowfast.utils.parser import load_config as load_slowfast_config
 
 
 class SlowFastExtractor(nn.Module):
-    def __init__(self, fps=32):
+    def __init__(self, fps=24):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.fps = fps
+        self.num_layers = 5
         self.slowfast = LayerSlowFast(
             Namespace(
                 data=Namespace(cache_dir=Path("./cache")),
                 computation=Namespace(device=self.device),
                 slowfast_config="Kinetics/c2/SLOWFAST_8x8_R50",
-                num_layers=5,
+                num_layers=self.num_layers,
             )
         )
         self.preprocess = self.slowfast.get_preprocessor()
@@ -175,7 +176,7 @@ class LayerSlowFast(SlowFast):
             x = x.permute((0, 2, 1))  # BCT -> BTC
             return x
 
-        xs = [get_pool(x) for x in xs]
+        xs = [get_pool(x).detach().cpu() for x in xs]
         return xs
 
     def forward(self, data, no_grad=True):
@@ -196,6 +197,15 @@ def preprocess(visual, audio, cfg):
 
 
 def _preprocess(cfg, x):
+    print(
+        f"{x.min().item():.4f}",
+        f"{x.mean().item():.4f}",
+        f"{x.max().item():.4f}",
+        "-->",
+        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).min().item():.4f}",
+        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).mean().item():.4f}",
+        f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).max().item():.4f}",
+    )
     x = tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD)
     # T H W C -> C T H W.
     x = x.permute(3, 0, 1, 2)
