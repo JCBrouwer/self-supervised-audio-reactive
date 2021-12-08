@@ -32,10 +32,11 @@ import resampy
 import torch
 from einops import rearrange
 from torch import nn
+from torch.nn.functional import interpolate
 
 
 class VggishExtractor(nn.Module):
-    def __init__(self, sr=44100):
+    def __init__(self, sr=16000):
         super().__init__()
         self.sr = sr
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,36 +94,37 @@ class LayerVggish(Vggish):
         super().__init__(args)
         self.num_layers = args.num_layers
 
-    def forward(self, data):
-        B = data.shape[0]  # BNCHW
-        data = rearrange(data, "b n c h w -> (b n) c h w")
-        res = self.model_forward(data)
+    def forward(self, data, output_fps=32):
+        B, N, _, _, _ = data.shape  # BNCHW
+        data = rearrange(data, "b t c h w -> (b t) c h w")
+        res = self.model_forward(data, output_fps=output_fps)
         res_pooled = []
         for data in res:
-            data = rearrange(data, "(b n) c -> b n c", b=B)
-            data = data.mean(dim=1)  # B 128
+            # TODO validate this rearrange
+            data = rearrange(data, "(b n) c t -> b (n t) c", b=B)
+            if data.shape[1] != output_fps * N:
+                data = interpolate(data.permute(0, 2, 1), size=output_fps * N).permute(0, 2, 1)
             res_pooled.append(data)
         return res_pooled
 
-    def model_forward(self, x, fs=None):
+    def model_forward(self, x, output_fps, fs=None):
+        B = x.shape[0]
         model = self.model
         if model.preprocess:
             x = model._preprocess(x, fs)
-        x, res = self.vgg_forward(x)
+        x, res = self.vgg_forward(x, output_fps)
         if model.postprocess:
             x = model._postprocess(x)
             res.append(x.detach().cpu())
         return res
 
-    def vgg_forward(self, inputs):
+    def vgg_forward(self, inputs, output_fps):
         model = self.model
         res = self.run_features(inputs)
 
-        # Transpose the output from features to
-        # remain compatible with vggish embeddings
         res_resized = []
         for feat in res:
-            feat = feat.mean(-1).mean(-1)  # avgpool image size in mel features
+            feat = interpolate(feat.mean(-1), size=output_fps)
             res_resized.append(feat.detach().cpu())
 
         x = res[-1]
@@ -132,7 +134,7 @@ class LayerVggish(Vggish):
         x = x.view(x.size(0), -1)
         x = model.embeddings(x)
         del res
-        res_resized.append(x.detach().cpu())
+        res_resized.append(x.unsqueeze(2).detach().cpu())
         return x, res_resized
 
     def run_features(self, x):
@@ -167,7 +169,6 @@ def _preprocess(data, sample_rate):
     # Architectural constants.
     NUM_FRAMES = 96  # Frames in input mel-spectrogram patch.
     NUM_BANDS = 64  # Frequency bands in input mel-spectrogram patch.
-    EMBEDDING_SIZE = 128  # Size of embedding layer.
 
     # Hyperparameters used in feature and example generation.
     SAMPLE_RATE = 16000
@@ -179,24 +180,6 @@ def _preprocess(data, sample_rate):
     LOG_OFFSET = 0.01  # Offset used for stabilized log of input mel-spectrogram.
     EXAMPLE_WINDOW_SECONDS = 0.96  # Each example contains 96 10ms frames
     EXAMPLE_HOP_SECONDS = 0.96  # with zero overlap.
-
-    # Parameters used for embedding postprocessing.
-    PCA_EIGEN_VECTORS_NAME = "pca_eigen_vectors"
-    PCA_MEANS_NAME = "pca_means"
-    QUANTIZE_MIN_VAL = -2.0
-    QUANTIZE_MAX_VAL = +2.0
-
-    # Hyperparameters used in training.
-    INIT_STDDEV = 0.01  # Standard deviation used to initialize weights.
-    LEARNING_RATE = 1e-4  # Learning rate for the Adam optimizer.
-    ADAM_EPSILON = 1e-8  # Epsilon for the Adam optimizer.
-
-    # Names of ops, tensors, and features.
-    INPUT_OP_NAME = "vggish/input_features"
-    INPUT_TENSOR_NAME = INPUT_OP_NAME + ":0"
-    OUTPUT_OP_NAME = "vggish/embedding"
-    OUTPUT_TENSOR_NAME = OUTPUT_OP_NAME + ":0"
-    AUDIO_EMBEDDING_FEATURE_NAME = "audio_embedding"
 
     # Convert to mono.
     if len(data.shape) > 1:
@@ -295,24 +278,13 @@ def spectrogram_to_mel_matrix(
         raise ValueError("upper_edge_hertz %.1f is greater than Nyquist %.1f" % (upper_edge_hertz, nyquist_hertz))
     spectrogram_bins_hertz = np.linspace(0.0, nyquist_hertz, num_spectrogram_bins)
     spectrogram_bins_mel = hertz_to_mel(spectrogram_bins_hertz)
-    # The i'th mel band (starting from i=1) has center frequency
-    # band_edges_mel[i], lower edge band_edges_mel[i-1], and higher edge
-    # band_edges_mel[i+1].  Thus, we need num_mel_bins + 2 values in
-    # the band_edges_mel arrays.
     band_edges_mel = np.linspace(hertz_to_mel(lower_edge_hertz), hertz_to_mel(upper_edge_hertz), num_mel_bins + 2)
-    # Matrix to post-multiply feature arrays whose rows are num_spectrogram_bins
-    # of spectrogram values.
     mel_weights_matrix = np.empty((num_spectrogram_bins, num_mel_bins))
     for i in range(num_mel_bins):
         lower_edge_mel, center_mel, upper_edge_mel = band_edges_mel[i : i + 3]
-        # Calculate lower and upper slopes for every spectrogram bin.
-        # Line segments are linear in the *mel* domain, not hertz.
         lower_slope = (spectrogram_bins_mel - lower_edge_mel) / (center_mel - lower_edge_mel)
         upper_slope = (upper_edge_mel - spectrogram_bins_mel) / (upper_edge_mel - center_mel)
-        # .. then intersect them with each other and zero.
         mel_weights_matrix[:, i] = np.maximum(0.0, np.minimum(lower_slope, upper_slope))
-    # HTK excludes the spectrogram DC bin; make sure it always gets a zero
-    # coefficient.
     mel_weights_matrix[0, :] = 0.0
     return mel_weights_matrix
 

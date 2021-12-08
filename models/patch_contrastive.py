@@ -13,7 +13,9 @@ class PatchSampler1d(torch.jit.ScriptModule):
         self.n_patches, self.patch_len = n_patches, patch_len
 
     @torch.jit.script_method
-    def forward(self, sequences: List[Tensor], target: Tensor) -> Tuple[List[Tensor], Tensor]:
+    def forward(self, sequences: List[Tensor], target: Tensor = None) -> Tuple[List[Tensor], Tensor]:
+        if target is None:
+            target = torch.zeros_like(sequences[0])
         seq_batch_patches = torch.jit.annotate(List[List[Tensor]], [[] for _ in sequences])
         tar_batch_patches = torch.jit.annotate(List[Tensor], [])
         for b in range(target.shape[0]):
@@ -78,6 +80,47 @@ def patch_nce_loss(f_q, f_k, tau: float = 0.07):
     predictions = logits.flatten(0, 1)
     targets = torch.zeros(B * S, device=f_q.device, dtype=torch.long)
     return cross_entropy(predictions, targets)
+
+
+class LazyCombinationsPatchContrastor(torch.jit.ScriptModule):
+    def __init__(self, latent_dim, sequences):
+        super().__init__()
+        self.latent_dim = latent_dim
+        B, P = sequences[0].shape[0], sequences[0].shape[1]
+        self.feature_heads = nn.ModuleList(
+            [
+                ContrastiveHead(B, P, torch.prod(torch.tensor(seq.shape[2:])).item(), self.latent_dim)
+                for seq in sequences
+            ]
+        ).to(sequences[0].device)
+
+    @torch.jit.script_method
+    def forward(self, sequences: List[Tensor]):
+
+        embeddings = torch.jit.annotate(List[Tensor], [])
+        for idx, feature_head in enumerate(self.feature_heads):
+            embeddings.append(feature_head(sequences[idx]))
+
+        loss = 0
+        for e1, embed1 in enumerate(embeddings):
+            for e2, embed2 in enumerate(embeddings):
+                if e1 == e2:
+                    continue
+                loss += patch_nce_loss(embed1, embed2)
+
+        return loss
+
+
+class CombinationsPatchContrastor(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.contrastor = None
+        self.latent_dim = latent_dim
+
+    def forward(self, sequences):
+        if self.contrastor is None:
+            self.contrastor = LazyPatchContrastor(self.latent_dim, sequences)
+        return self.contrastor(sequences)
 
 
 class LazyPatchContrastor(torch.jit.ScriptModule):

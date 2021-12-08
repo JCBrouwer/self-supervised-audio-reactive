@@ -34,6 +34,7 @@ import torch
 import wget
 from munch import Munch
 from torch import nn
+from torch.nn.functional import interpolate
 
 from slowfast.datasets.utils import pack_pathway_output
 from slowfast.datasets.utils import spatial_sampling as _spatial_sampling
@@ -44,7 +45,7 @@ from slowfast.utils.parser import load_config as load_slowfast_config
 
 
 class SlowFastExtractor(nn.Module):
-    def __init__(self, fps=24):
+    def __init__(self, fps=32):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.fps = fps
@@ -166,13 +167,12 @@ class LayerSlowFast(SlowFast):
         assert len(x) == head.num_pathways, "Input tensor does not contain {} pathway".format(head.num_pathways)
 
         def get_pool(x):
-            pool_out = []
-            for pathway in range(head.num_pathways):
-                m = getattr(head, "pathway{}_avgpool".format(pathway))
-                pool_out.append(m(x[pathway]))
-            x = torch.cat(pool_out, 1)
-            # (B, C, T, H, W) -> (B, T, H, W, C).
-            x = x.permute((0, 2, 3, 4, 1))
+            # DIFFERENCE VS ACAV100M, don't pool over time dim
+            fast, slow = x
+            fast, slow = fast.mean((3, 4)), slow.mean((3, 4))  # BCTHW -> BCT
+            fast = interpolate(fast, size=slow.shape[2])
+            x = torch.cat([fast, slow], 1)
+            x = x.permute((0, 2, 1))  # BCT -> BTC
             return x
 
         xs = [get_pool(x) for x in xs]
@@ -185,8 +185,7 @@ class LayerSlowFast(SlowFast):
             for i, _ in enumerate(x):
                 x[i].requires_grad_(False)
         xs = self._forward(x)
-        xs = [x.mean([1, 2, 3]) for x in xs]
-        # BC
+        # BTC
         return xs
 
 
