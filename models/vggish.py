@@ -225,6 +225,8 @@ def _preprocess(data, sample_rate):
     return log_mel_examples_tensor
 
 
+# License for code below. Code has been auto-formatted and comments removed.
+
 # Copyright 2017 The TensorFlow Authors All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

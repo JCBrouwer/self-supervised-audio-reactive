@@ -33,15 +33,14 @@ from pathlib import Path
 import torch
 import wget
 from munch import Munch
-from torch import nn
-from torch.nn.functional import interpolate
-
 from slowfast.datasets.utils import pack_pathway_output
 from slowfast.datasets.utils import spatial_sampling as _spatial_sampling
 from slowfast.datasets.utils import tensor_normalize
 from slowfast.models.build import MODEL_REGISTRY
 from slowfast.utils.checkpoint import load_checkpoint
 from slowfast.utils.parser import load_config as load_slowfast_config
+from torch import nn
+from torch.nn.functional import interpolate
 
 
 class SlowFastExtractor(nn.Module):
@@ -197,15 +196,6 @@ def preprocess(visual, audio, cfg):
 
 
 def _preprocess(cfg, x):
-    # print(
-    #     f"{x.min().item():.4f}",
-    #     f"{x.mean().item():.4f}",
-    #     f"{x.max().item():.4f}",
-    #     "-->",
-    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).min().item():.4f}",
-    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).mean().item():.4f}",
-    #     f"{tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD).max().item():.4f}",
-    # )
     x = tensor_normalize(x, cfg.DATA.MEAN, cfg.DATA.STD)
     # T H W C -> C T H W.
     x = x.permute(3, 0, 1, 2)
