@@ -62,11 +62,13 @@ def preprocess_video(in_dir, out_file, duration, fps):
             desc="Encoding videos to audio/visual features...",
         ):
             video = batch["video"].permute(0, 2, 1, 3, 4)
-            video_features = slowfast(video)
+            video_features = {f"slowfast_layer{f}": feat for f, feat in enumerate(slowfast(video))}
+            video_features["onsets"] = video_onsets(video)
 
             audio = batch["audio"]
             audio = torchaudio.transforms.Resample(round(audio.shape[1] / duration), 16_000)(audio)
-            audio_features = vggish(audio)
+            audio_features = {f"vggish_layer{f}": feat for f, feat in enumerate(vggish(audio))}
+            video_features["onsets"] = audio_onsets(audio)
 
             for f, feat in enumerate(video_features + audio_features):
                 npaas[f].append(np.ascontiguousarray(feat.numpy()))

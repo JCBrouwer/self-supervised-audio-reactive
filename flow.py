@@ -1,16 +1,154 @@
-"""
-Implementation of Gunnar Farneback's optical flow algorithm
-ported from https://github.com/ericPrince/optical-flow
-"""
-
 from typing import List
 
 import numpy as np
 import scipy.ndimage
 import torch
+from kornia.filters import gaussian_blur2d
 from torch.nn.functional import conv1d, pad
+from torchvision.transforms.functional import resize
 
-from visual_beats import cart2pol, normalize, pyramid_expand, pyramid_reduce, to_grayscale
+
+@torch.jit.script
+def cart2pol(x, y):
+    rho = torch.sqrt(x ** 2 + y ** 2)
+    phi = torch.atan2(y, x)
+    return rho, phi
+
+
+@torch.jit.script
+def pyramid_expand(image, upscale: int = 2):
+    dim = image.dim()
+    if dim == 3:
+        h, w, _ = image.shape
+        image = image.permute(2, 0, 1).unsqueeze(0)
+    elif dim == 2:
+        h, w = image.shape
+        image = image[None, None]
+    else:
+        raise Exception("Only 2 and 3 dimensional images are supported: [H,W] or [H,W,C]")
+
+    out_shape = [int(torch.ceil(h * upscale)), int(torch.ceil(w * upscale))]
+    resized = resize(image, out_shape, antialias=True)
+
+    sigma = 2 * upscale / 6.0
+    ks = int(sigma * 4 + 1)
+    out = gaussian_blur2d(resized, kernel_size=(ks, ks), sigma=(sigma, sigma)).squeeze()
+
+    if dim == 3:
+        out = out.permute(1, 2, 0)
+    return out
+
+
+@torch.jit.script
+def pyramid_reduce(image, downscale: int = 2):
+    dim = image.dim()
+    if dim == 3:
+        h, w, _ = image.shape
+        image = image.permute(2, 0, 1).unsqueeze(0)
+    elif dim == 2:
+        h, w = image.shape
+        image = image[None, None]
+    else:
+        raise Exception("Only 2 and 3 dimensional images are supported: [H,W] or [H,W,C]")
+
+    sigma = 2 * downscale / 6.0
+    ks = int(sigma * 4 + 1)
+    blurred = gaussian_blur2d(image, kernel_size=(ks, ks), sigma=(sigma, sigma))
+
+    out_shape = [int(torch.ceil(h / downscale)), int(torch.ceil(w / downscale))]
+    out = resize(blurred, out_shape, antialias=True).squeeze()
+
+    if dim == 3:
+        out = out.permute(1, 2, 0)
+    return out
+
+
+@torch.jit.script
+def to_grayscale(im):
+    # magic numbers from https://en.wikipedia.org/wiki/Grayscale
+    return 0.2126 * im[..., 0] + 0.7152 * im[..., 1] + 0.0722 * im[..., 2]
+
+
+@torch.jit.script
+def lucas_kanade(im1, im2):
+    """Implementation of the Lucas-Kanade optical flow algorithm
+    ported from https://stackoverflow.com/a/14325821
+
+    Args:
+        im1 : First image
+        im2 : Second image
+
+    Returns:
+        flow : Optical flow between the two images
+    """
+    win = 2
+
+    im1, im2 = to_grayscale(im1), to_grayscale(im2)
+
+    I_x, I_y, I_t = torch.zeros_like(im1), torch.zeros_like(im1), torch.zeros_like(im1)
+    I_x[1:-1, 1:-1] = (im1[1:-1, 2:] - im1[1:-1, :-2]) / 2
+    I_y[1:-1, 1:-1] = (im1[2:, 1:-1] - im1[:-2, 1:-1]) / 2
+    I_t[1:-1, 1:-1] = im1[1:-1, 1:-1] - im2[1:-1, 1:-1]
+    params = torch.stack(
+        (
+            gaussian_blur2d((I_x * I_x)[None, None], (5, 5), (3.0, 3.0)).squeeze(),
+            gaussian_blur2d((I_y * I_y)[None, None], (5, 5), (3.0, 3.0)).squeeze(),
+            gaussian_blur2d((I_x * I_y)[None, None], (5, 5), (3.0, 3.0)).squeeze(),
+            gaussian_blur2d((I_x * I_t)[None, None], (5, 5), (3.0, 3.0)).squeeze(),
+            gaussian_blur2d((I_y * I_t)[None, None], (5, 5), (3.0, 3.0)).squeeze(),
+        ),
+        dim=-1,
+    )
+    del I_x, I_y, I_t
+    cum_params = torch.cumsum(torch.cumsum(params, dim=0), dim=1)
+    del params
+    win_params = (
+        cum_params[2 * win + 1 :, 2 * win + 1 :]
+        - cum_params[2 * win + 1 :, : -1 - 2 * win]
+        - cum_params[: -1 - 2 * win, 2 * win + 1 :]
+        + cum_params[: -1 - 2 * win, : -1 - 2 * win]
+    )
+    del cum_params
+    det = win_params[..., 0] * win_params[..., 1] - win_params[..., 2] ** 2
+    flow_x = torch.where(
+        det != 0,
+        (win_params[..., 1] * win_params[..., 3] - win_params[..., 2] * win_params[..., 4]) / det,
+        torch.zeros_like(det),
+    )
+    flow_y = torch.where(
+        det != 0,
+        (win_params[..., 0] * win_params[..., 4] - win_params[..., 2] * win_params[..., 3]) / det,
+        torch.zeros_like(det),
+    )
+    flow = torch.zeros(im1.shape + (2,), device=im1.device, dtype=im1.dtype)
+    flow[win + 1 : -1 - win, win + 1 : -1 - win, 0] = flow_x[:-1, :-1]
+    flow[win + 1 : -1 - win, win + 1 : -1 - win, 1] = flow_y[:-1, :-1]
+    return flow
+
+
+@torch.jit.script
+def lucas_kanade_gaussian_pyramid(im1, im2, levels: int = 4):
+
+    pyramid = torch.jit.annotate(List[List[torch.Tensor]], [])
+    cur = [im1, im2]
+    for _ in range(levels):
+        cur = [pyramid_reduce(a) for a in cur]
+        pyramid.append(cur)
+
+    flow = lucas_kanade(cur[0], cur[1])
+
+    for pyr1, pyr2 in pyramid[-2::-1]:
+        flow = 2 * pyramid_expand(flow)
+        flow = flow[: pyr1.shape[0], : pyr1.shape[1]]  # account for shapes not quite matching
+        flow += lucas_kanade(pyr1, pyr2)
+
+    return flow
+
+
+"""
+Implementation of Gunnar Farneback's optical flow algorithm
+ported from https://github.com/ericPrince/optical-flow
+"""
 
 
 @torch.jit.script
@@ -627,8 +765,7 @@ if __name__ == "__main__":
     import skimage
     import torch
     import torchvision as tv
-
-    from farneback import to_grayscale
+    from visual_beats import normalize
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
