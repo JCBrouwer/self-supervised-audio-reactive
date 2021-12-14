@@ -2,6 +2,10 @@ import os
 from copy import deepcopy
 from glob import glob
 from pathlib import Path
+import warnings
+
+warnings.catch_warnings()
+warnings.simplefilter(action="ignore", category=UserWarning)
 
 import matplotlib
 
@@ -16,13 +20,17 @@ import torchaudio
 import torchvision as tv
 from npy_append_array import NpyAppendArray
 from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
+from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import CenterCrop, Compose, Lambda
+from torchvision.transforms.functional import resize
 from tqdm import tqdm
 
+from audio_features import chroma, fourier_tempogram, hpcp, mfcc, onsets, rms, tempogram, tonnetz
 from models.slowfast import SlowFastExtractor
 from models.vggish import VggishExtractor
 from SGW.lib.sgw_pytorch import sgw_gpu as sliced_gromov_wasserstein
+from visual_beats import video_onsets
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -32,18 +40,18 @@ def transpose(l):
 
 
 @torch.inference_mode()
-def preprocess_video(in_dir, out_file, duration, fps):
-    if not os.path.exists(out_file + "_0.npy"):
+def preprocess_video(in_dir, out_stem, dur, fps):
+    if not os.path.exists(out_stem + "_files.npy"):
 
         videos = sum([glob(in_dir + "/*" + ext) for ext in [".mp4", ".avi", ".mkv", ".webm"]], [])
         dataset = pytorchvideo.data.LabeledVideoDataset(
             list(zip(videos, [{} for _ in range(len(videos))])),
-            pytorchvideo.data.UniformClipSampler(clip_duration=duration),
+            pytorchvideo.data.UniformClipSampler(clip_duration=dur),
             transform=ApplyTransformToKey(
                 key="video",
                 transform=Compose(
                     [
-                        UniformTemporalSubsample(duration * fps),
+                        UniformTemporalSubsample(dur * fps),
                         ShortSideScale(size=256),
                         CenterCrop(256),
                         Lambda(lambda x: x / 255.0),
@@ -56,56 +64,91 @@ def preprocess_video(in_dir, out_file, duration, fps):
         slowfast = SlowFastExtractor()  # TODO input normalization correct?
         vggish = VggishExtractor()
 
-        npaas = [NpyAppendArray(f"{out_file}_{i}.npy") for i in range(slowfast.num_layers + vggish.num_layers)]
+        feature_cache_files = None
         for batch in tqdm(
             DataLoader(dataset, batch_size=1, num_workers=min(len(videos), 16)),
             desc="Encoding videos to audio/visual features...",
         ):
             video = batch["video"].permute(0, 2, 1, 3, 4)
-            video_features = {f"slowfast_layer{f}": feat for f, feat in enumerate(slowfast(video))}
-            video_features["onsets"] = video_onsets(video)
+            video_feats = {f"slowfast_layer{f}": feat for f, feat in enumerate(slowfast(video))}
+            video_feats["onsets"] = video_onsets(video.squeeze().permute(0, 2, 3, 1))
+            video_feats["tempogram"] = tempogram(onsets=video_feats["onsets"])
+            video_feats["fourier_tempogram"] = fourier_tempogram(onsets=video_feats["onsets"])[:-1]
 
             audio = batch["audio"]
-            audio = torchaudio.transforms.Resample(round(audio.shape[1] / duration), 16_000)(audio)
-            audio_features = {f"vggish_layer{f}": feat for f, feat in enumerate(vggish(audio))}
-            video_features["onsets"] = audio_onsets(audio)
+            audio = torchaudio.transforms.Resample(round(audio.shape[1] / dur), 16_000)(audio)
+            audio_feats = {f"vggish_layer{f}": feat for f, feat in enumerate(vggish(audio))}
+            audio = audio.mean(0).numpy()
+            audio_feats["onsets"] = interpolate(onsets(audio)[None, None, :, 0], (dur * fps,))
+            audio_feats["tempogram"] = resize(tempogram(audio)[None, None], (dur * fps, 384), antialias=True)
+            audio_feats["fourier_tempogram"] = resize(
+                fourier_tempogram(audio)[None, None], (dur * fps, 193), antialias=True
+            )
+            audio_feats["chroma"] = resize(chroma(audio)[None, None], (dur * fps, 12), antialias=True)
+            audio_feats["hpcp"] = resize(hpcp(audio)[None, None], (dur * fps, 12), antialias=True)
+            audio_feats["tonnetz"] = resize(tonnetz(audio)[None, None], (dur * fps, 6), antialias=True)
+            audio_feats["mfcc"] = resize(mfcc(audio)[None, None], (dur * fps, 20), antialias=True)
+            audio_feats["rms"] = interpolate(rms(audio)[None, None, :, 0], (dur * fps,))
 
-            for f, feat in enumerate(video_features + audio_features):
-                npaas[f].append(np.ascontiguousarray(feat.numpy()))
-        del npaas
+            if feature_cache_files is None:
+                feature_cache_files = {
+                    **{f"video_{k}": NpyAppendArray(f"{out_stem}_video_{k}.npy") for k in video_feats.keys()},
+                    **{f"audio_{k}": NpyAppendArray(f"{out_stem}_audio_{k}.npy") for k in audio_feats.keys()},
+                    **{"files": NpyAppendArray(f"{out_stem}_files.npy")},
+                }
+            for k, feat in video_feats.items():
+                feature_cache_files[f"video_{k}"].append(np.ascontiguousarray(feat.squeeze().unsqueeze(0).numpy()))
+            for k, feat in audio_feats.items():
+                feature_cache_files[f"audio_{k}"].append(np.ascontiguousarray(feat.squeeze().unsqueeze(0).numpy()))
+            feature_cache_files["files"].append(np.ascontiguousarray([batch["video_name"][0].ljust(50)[:50]]))
+        del feature_cache_files
 
 
 class AudioVisualFeatures(Dataset):
     def __init__(self, base):
         super().__init__()
-        self.feature_files = [np.load(file, mmap_mode="r") for file in sorted(glob(base + "_*.npy"))]
+        self.video_files = [np.load(file, mmap_mode="r") for file in sorted(glob(base + "_video*.npy"))]
+        self.audio_files = [np.load(file, mmap_mode="r") for file in sorted(glob(base + "_audio*.npy"))]
 
     def __len__(self):
-        return len(self.feature_files[0])
+        return len(self.video_files[0])
 
     def __getitem__(self, index):
-        features = [torch.from_numpy(ff[index].copy()) for ff in self.feature_files]
-        video_features = features[: len(features) // 2]
-        audio_features = features[len(features) // 2 :]
+        video_features = [torch.from_numpy(ff[index].copy()) for ff in self.video_files]
+        audio_features = [torch.from_numpy(ff[index].copy()) for ff in self.audio_files]
         return video_features, audio_features
 
 
-duration = 4
+dur = 4
 fps = 24
 
 
 benny_dir = "/home/hans/datasets/audiovisual/trashbenny"
-benny_cache = f"cache/{Path(benny_dir).stem}_features_{duration}sec_{fps}fps"
-preprocess_video(benny_dir, benny_cache, duration, fps)
+benny_cache = f"cache/{Path(benny_dir).stem}_features_{dur}sec_{fps}fps"
+preprocess_video(benny_dir, benny_cache, dur, fps)
+benny_features = AudioVisualFeatures(benny_cache)
 
 maua_dir = "/home/hans/datasets/audiovisual/maua-short"
-maua_cache = f"cache/{Path(maua_dir).stem}_features_{duration}sec_{fps}fps"
-preprocess_video(maua_dir, maua_cache, duration, fps)
-
-benny_features = AudioVisualFeatures(benny_cache)
+maua_cache = f"cache/{Path(maua_dir).stem}_features_{dur}sec_{fps}fps"
+preprocess_video(maua_dir, maua_cache, dur, fps)
 maua_features = AudioVisualFeatures(maua_cache)
 
-for name, features in [["trashbenny", benny_features], ["maua", maua_features]]:
+phony_dir = "/home/hans/datasets/audiovisual/phony"
+phony_cache = f"cache/{Path(phony_dir).stem}_features_{dur}sec_{fps}fps"
+preprocess_video(phony_dir, phony_cache, dur, fps)
+phony_features = AudioVisualFeatures(phony_cache)
+
+trapnation_dir = "/home/hans/datasets/audiovisual/trapnation"
+trapnation_cache = f"cache/{Path(trapnation_dir).stem}_features_{dur}sec_{fps}fps"
+preprocess_video(trapnation_dir, trapnation_cache, dur, fps)
+trapnation_features = AudioVisualFeatures(trapnation_cache)
+
+for name, features in [
+    ["trashbenny", benny_features],
+    ["maua", maua_features],
+    ["phony", phony_features],
+    ["trapnation", trapnation_features],
+]:
     all_vfs, all_afs = [], []
     for vfs, afs in DataLoader(features, shuffle=True):
         all_vfs.append(vfs)
@@ -117,20 +160,22 @@ for name, features in [["trashbenny", benny_features], ["maua", maua_features]]:
     sgw = 0
     for vf in all_vfs:
         for af in all_afs:
+            # print(vf.shape, af.shape)
             sgw += sliced_gromov_wasserstein(af.to(device), vf.to(device), device)
 
-    print(name, sgw.item())
+    print(name, sgw.item() * 1e-9)
+    print(name, sgw.item() / len(features) * 1e-9)
 
 # in_dir = "/home/hans/datasets/audiovisual/256/"
 # videos = sum([glob(in_dir + "/*" + ext) for ext in [".mp4", ".avi", ".mkv"]], [])
 # dataset = pytorchvideo.data.LabeledVideoDataset(
 #     list(zip(videos, [{} for _ in range(len(videos))])),
-#     pytorchvideo.data.UniformClipSampler(clip_duration=duration),
+#     pytorchvideo.data.UniformClipSampler(clip_duration=dur),
 #     transform=ApplyTransformToKey(
 #         key="video",
 #         transform=Compose(
 #             [
-#                 UniformTemporalSubsample(duration * fps),
+#                 UniformTemporalSubsample(dur * fps),
 #                 ShortSideScale(size=256),
 #                 CenterCrop(256),
 #                 Lambda(lambda x: x / 255.0),
@@ -159,7 +204,7 @@ for name, features in [["trashbenny", benny_features], ["maua", maua_features]]:
 #         video_features = slowfast(video)
 
 #         audio = batch["audio"]
-#         audio = torchaudio.transforms.Resample(round(audio.shape[1] / duration), 16_000)(audio)
+#         audio = torchaudio.transforms.Resample(round(audio.shape[1] / dur), 16_000)(audio)
 #         audio_features = vggish(audio)
 
 #         sgw = 0

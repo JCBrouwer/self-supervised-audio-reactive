@@ -6,7 +6,7 @@ from scipy.signal import convolve2d, spectrogram
 from scipy.sparse import coo_matrix
 from skimage.transform import resize
 
-from visual_beats import standardize, video_onsets
+from visual_beats import video_onsets
 
 SR = 16_000
 
@@ -135,7 +135,7 @@ def raw_hpcp(
     y,
     sr,
     win_size=4096,
-    hop_size=1024,
+    hop_size=512,
     window="blackman",
     precision="float32",
     f_min=100,
