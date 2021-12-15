@@ -1,5 +1,6 @@
 """
 PyTorch implementation of video rhythm features introduced in "Visual Rhythm and Beat"
+
 @article{davisVisualRhythmBeat2018a,
   title = {Visual Rhythm and Beat},
   author = {Davis, Abe and Agrawala, Maneesh},
