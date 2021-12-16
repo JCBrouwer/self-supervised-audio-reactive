@@ -43,6 +43,10 @@ from torch import nn
 from torch.nn.functional import interpolate
 
 
+def transpose(l):
+    return list(map(list, zip(*l)))
+
+
 class SlowFastExtractor(nn.Module):
     def __init__(self, fps=24):
         super().__init__()
@@ -61,16 +65,19 @@ class SlowFastExtractor(nn.Module):
 
     def forward(self, x):
         """
-        [B T C H W] Video Tensor -> [[B, F1], [B, F2], ..., [B, F5]] Feature Tensors
+        [T H W C] Video Tensor -> [[B, F1], [B, F2], ..., [B, F5]] Feature Tensors
         """
-        x = x.permute(0, 1, 3, 4, 2)  # slowfast expects channels last
-        slow, fast = [], []
+        if x.shape[0] > 960:
+            x = x.split(960)
+        else:
+            x = x.unsqueeze(0)
+        output = []
         for sample in x:
             sample = self.preprocess((sample, self.fps), None)
-            fast.append(sample["data"][0])
-            slow.append(sample["data"][1])
-        slow, fast = torch.stack(slow).to(self.device), torch.stack(fast).to(self.device)
-        output = self.slowfast([fast, slow])
+            fast = sample["data"][0].unsqueeze(0).to(self.device)
+            slow = sample["data"][1].unsqueeze(0).to(self.device)
+            output.append(self.slowfast([fast, slow]))
+        output = [torch.cat(feats, dim=1).cpu().squeeze() for feats in transpose(output)]
         return output
 
 

@@ -8,10 +8,13 @@ from torch.nn.functional import conv1d, pad
 from torchvision.transforms.functional import resize
 
 
-@torch.jit.script
 def cart2pol(x, y):
-    rho = torch.sqrt(x ** 2 + y ** 2)
-    phi = torch.atan2(y, x)
+    if isinstance(x, np.ndarray):
+        rho = np.sqrt(np.square(x) + np.square(y))
+        phi = np.arctan2(y, x)
+    else:
+        rho = torch.sqrt(torch.square(x) + torch.square(y))
+        phi = torch.atan2(y, x)
     return rho, phi
 
 

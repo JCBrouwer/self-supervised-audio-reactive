@@ -6,20 +6,24 @@ from scipy.signal import convolve2d, spectrogram
 from scipy.sparse import coo_matrix
 from skimage.transform import resize
 
-from visual_beats import video_onsets
+from visual_beats import normalize, video_onsets
 
-SR = 16_000
+SR = 16384
 
 
 def fourier_tempogram(audio=None, onsets=None):
     if onsets is not None:
-        return torch.abs(torch.from_numpy(rosa.feature.fourier_tempogram(onset_envelope=onsets))).float().permute(1, 0)
+        return (
+            torch.abs(torch.from_numpy(rosa.feature.fourier_tempogram(onset_envelope=onsets, sr=SR)))
+            .float()
+            .permute(1, 0)
+        )
     return torch.abs(torch.from_numpy(rosa.feature.fourier_tempogram(y=audio, sr=SR))).float().permute(1, 0)
 
 
 def tempogram(audio=None, onsets=None):
     if onsets is not None:
-        return torch.from_numpy(rosa.feature.tempogram(onset_envelope=onsets)).float().permute(1, 0)
+        return torch.from_numpy(rosa.feature.tempogram(onset_envelope=onsets, sr=SR)).float().permute(1, 0)
     return torch.from_numpy(rosa.feature.tempogram(y=audio, sr=SR)).float().permute(1, 0)
 
 
@@ -31,7 +35,7 @@ def mfcc(audio):
     return torch.from_numpy(rosa.feature.mfcc(y=audio, sr=SR)).float().permute(1, 0)
 
 
-def onsets(audio, margin=8, fmin=40, fmax=16000, type="mm"):
+def onsets(audio, margin=8, fmin=40, fmax=16384, type="mm"):
     y_perc = rosa.effects.percussive(y=audio, margin=margin)
     if type == "rosa":
         onset = rosa.onset.onset_strength(y=y_perc, sr=SR, fmin=fmin, fmax=fmax)
@@ -43,16 +47,17 @@ def onsets(audio, margin=8, fmin=40, fmax=16000, type="mm"):
         filt_spec = mm.audio.spectrogram.FilteredSpectrogram(spec, num_bands=24, fmin=fmin, fmax=fmax)
         onset = np.sum(
             [
-                mm.features.onsets.spectral_diff(filt_spec),
-                mm.features.onsets.spectral_flux(filt_spec),
-                mm.features.onsets.superflux(filt_spec),
-                mm.features.onsets.complex_flux(filt_spec),
-                mm.features.onsets.modified_kullback_leibler(filt_spec),
+                normalize(mm.features.onsets.spectral_diff(filt_spec)),
+                normalize(mm.features.onsets.spectral_flux(filt_spec)),
+                normalize(mm.features.onsets.superflux(filt_spec)),
+                normalize(mm.features.onsets.complex_flux(filt_spec)),
+                normalize(mm.features.onsets.modified_kullback_leibler(filt_spec)),
             ],
             axis=0,
         )[None]
     onset = torch.from_numpy(onset).float().permute(1, 0)
     onset = torch.clamp(onset, 0, torch.quantile(onset, 0.97))
+    onset = normalize(onset)
     return onset
 
 
@@ -351,7 +356,7 @@ if __name__ == "__main__":
     video, audio, info = tv.io.read_video(sys.argv[1])
     print(video.shape, audio.shape, info)
     video = tv.transforms.functional.resize(video.permute(0, 3, 1, 2), 128).permute(0, 2, 3, 1).float().div(255)
-    audio = torchaudio.transforms.Resample(info["audio_fps"], 16_000)(audio).mean(0).numpy()
+    audio = torchaudio.transforms.Resample(info["audio_fps"], 16384)(audio).mean(0).numpy()
 
     ftempo = fourier_tempogram(audio)
     tempo = tempogram(audio)

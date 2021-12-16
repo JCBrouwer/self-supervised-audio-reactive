@@ -59,23 +59,60 @@ for name, features in [
         )
 all_features = pd.DataFrame(all_features)
 
+
+def normalize(array):
+    array -= array.min()
+    array /= array.max()
+    return array
+
+
+def standardize(array):
+    array = np.clip(array, np.quantile(array, 0.05), np.quantile(array, 0.95))
+    array = normalize(array)
+    return array
+
+
+all_features.video_fourier_tempogram = [arr for arr in standardize(np.stack(all_features.video_fourier_tempogram))]
+all_features.audio_fourier_tempogram = [arr for arr in standardize(np.stack(all_features.audio_fourier_tempogram))]
+all_features.video_tempogram = [arr for arr in standardize(np.stack(all_features.video_tempogram))]
+all_features.audio_tempogram = [arr for arr in standardize(np.stack(all_features.audio_tempogram))]
+all_features.audio_mfcc = [arr for arr in standardize(np.stack(all_features.audio_mfcc))]
+all_features.audio_tonnetz = [arr for arr in standardize(np.stack(all_features.audio_tonnetz))]
+all_features.audio_onsets = [arr for arr in standardize(np.stack(all_features.audio_onsets))]
+
+#%%
+for group, g_df in all_features.groupby(["group"]):
+    print(group)
+    g_df = g_df.drop(columns=["group", "file"])
+    for col in g_df.columns:
+        vals = np.stack(g_df[col])
+        print(col, np.min(vals), np.median(vals), np.mean(vals), np.max(vals))
+    print()
+print("overall")
+g_df = all_features.drop(columns=["group", "file"])
+for col in g_df.columns:
+    vals = np.stack(g_df[col])
+    print(col, np.min(vals), np.median(vals), np.mean(vals), np.max(vals))
+
 #%%
 
-audio_feats = np.stack(all_features["audio_vggish_layer0"])
-np.random.shuffle(audio_feats)
+for idx, feats in all_features.take(np.random.permutation(len(all_features))[:5]).iterrows():
+    plt.figure()
+    plt.plot(feats["audio_onsets"], color="tab:red", label="audio")
+    plt.plot(feats["video_onsets"], color="tab:blue", label="video")
+    plt.title(feats["group"] + " " + feats["file"])
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-video_feats = np.stack(all_features["video_slowfast_layer0"])
-np.random.shuffle(video_feats)
-
-audiovideo_feats = np.concatenate(
-    [np.stack(all_features["audio_vggish_layer0"]), np.stack(all_features["video_slowfast_layer0"])], axis=2
-)
-np.random.shuffle(audiovideo_feats)
-
-audio_tempogram = np.stack(all_features["audio_tempogram"])
-video_tempogram = np.stack(all_features["video_tempogram"])
-video_onsets = np.stack(all_features["video_onsets"])
-audio_onsets = np.stack(all_features["audio_onsets"])
+    fig, ax = plt.subplots(2, 2, figsize=(16, 8))
+    ax = ax.flatten()
+    ax[0].imshow(feats["audio_fourier_tempogram"], cmap="magma")
+    ax[1].imshow(feats["video_fourier_tempogram"], cmap="magma")
+    ax[2].imshow(feats["audio_tempogram"], cmap="magma")
+    ax[3].imshow(feats["video_tempogram"], cmap="magma")
+    plt.suptitle(feats["group"] + " " + feats["file"])
+    plt.show()
 
 #%%
 def symsqrt(matrix):
@@ -165,55 +202,75 @@ def distance_condition(A, B):  # TODO fix ill-conditioned eigvalsh, maybe pinv(s
     return results
 
 
-af = torch.from_numpy(audio_feats).cuda()
-vf = torch.from_numpy(video_feats).cuda()
+def test_dists():
+    audio_feats = np.stack(all_features["audio_vggish_layer0"])
+    np.random.shuffle(audio_feats)
 
-aacf = covariance(af, af)
-vacf = covariance(vf, vf)
+    video_feats = np.stack(all_features["video_slowfast_layer0"])
+    np.random.shuffle(video_feats)
 
-ccf = covariance(PCA_eig(af, 32), PCA_eig(vf, 32))
+    audiovideo_feats = np.concatenate(
+        [np.stack(all_features["audio_vggish_layer0"]), np.stack(all_features["video_slowfast_layer0"])], axis=2
+    )
+    np.random.shuffle(audiovideo_feats)
 
-print(torch.median(distance_correlation(aacf, vacf)))
-print(torch.median(distance_correlation(aacf, ccf)))
-print(torch.median(distance_correlation(vacf, ccf)))
+    audio_tempogram = np.stack(all_features["audio_tempogram"])
+    video_tempogram = np.stack(all_features["video_tempogram"])
+    video_onsets = np.stack(all_features["video_onsets"])
+    audio_onsets = np.stack(all_features["audio_onsets"])
 
-print(torch.median(distance_wasserstein(aacf, vacf)))
-print(torch.median(distance_wasserstein(aacf, ccf)))
-print(torch.median(distance_wasserstein(vacf, ccf)))
+    af = torch.from_numpy(audio_feats).cuda()
+    vf = torch.from_numpy(video_feats).cuda()
 
+    aacf = covariance(af, af)
+    vacf = covariance(vf, vf)
 
-# def make_positive_definite(C):
-#     # ensure positive definite
-#     D, V = torch.linalg.eigh(C)
-#     D = torch.maximum(D, torch.zeros_like(D))
-#     BB = torch.matmul(V, torch.matmul(D[:, None, :], V).squeeze()[..., None]).squeeze()
-#     T = 1 / torch.sqrt(torch.diag_embed(BB, 0, -1, -2))
-#     TT = torch.bmm(T, T.transpose(2, 1))
-#     C = BB[..., None] * TT
-#     return C
-# def symmetric(a, rtol=1e-05, atol=1e-08):
-#     return torch.allclose(a, a.T, rtol=rtol, atol=atol)
-# def positive_definite(a):
-#     return torch.all(torch.linalg.eigvals(a) > 0)
-# for a, v in zip(aacf, vacf):
-#     assert positive_definite(a)
-#     assert positive_definite(v)
-#     assert symmetric(a)
-#     assert symmetric(v)
-# torch.linalg.cholesky(aacf)
-# torch.linalg.cholesky(vacf)
+    ccf = covariance(PCA_eig(af, 32), PCA_eig(vf, 32))
 
-# print(torch.median(distance_kullback(aacf, vacf)))
-# print(torch.median(distance_kullback(aacf, ccf)))
-# print(torch.median(distance_kullback(vacf, ccf)))
+    print(torch.median(distance_correlation(aacf, vacf)))
+    print(torch.median(distance_correlation(aacf, ccf)))
+    print(torch.median(distance_correlation(vacf, ccf)))
 
-# print(torch.median(distance_condition(aacf, vacf)))
-# print(torch.median(distance_condition(aacf, ccf)))
-# print(torch.median(distance_condition(vacf, ccf)))
+    print(torch.median(distance_wasserstein(aacf, vacf)))
+    print(torch.median(distance_wasserstein(aacf, ccf)))
+    print(torch.median(distance_wasserstein(vacf, ccf)))
 
-# print(torch.median(distance_riemann(aacf, vacf)))
-# print(torch.median(distance_riemann(aacf, ccf)))
-# print(torch.median(distance_riemann(vacf, ccf)))
+    def make_positive_definite(C):
+        # ensure positive definite
+        D, V = torch.linalg.eigh(C)
+        D = torch.maximum(D, torch.zeros_like(D))
+        BB = torch.matmul(V, torch.matmul(D[:, None, :], V).squeeze()[..., None]).squeeze()
+        T = 1 / torch.sqrt(torch.diag_embed(BB, 0, -1, -2))
+        TT = torch.bmm(T, T.transpose(2, 1))
+        C = BB[..., None] * TT
+        return C
+
+    def symmetric(a, rtol=1e-05, atol=1e-08):
+        return torch.allclose(a, a.T, rtol=rtol, atol=atol)
+
+    def positive_definite(a):
+        return torch.all(torch.linalg.eigvals(a) > 0)
+
+    for a, v in zip(aacf, vacf):
+        assert positive_definite(a)
+        assert positive_definite(v)
+        assert symmetric(a)
+        assert symmetric(v)
+    torch.linalg.cholesky(aacf)
+    torch.linalg.cholesky(vacf)
+
+    print(torch.median(distance_kullback(aacf, vacf)))
+    print(torch.median(distance_kullback(aacf, ccf)))
+    print(torch.median(distance_kullback(vacf, ccf)))
+
+    print(torch.median(distance_condition(aacf, vacf)))
+    print(torch.median(distance_condition(aacf, ccf)))
+    print(torch.median(distance_condition(vacf, ccf)))
+
+    print(torch.median(distance_riemann(aacf, vacf)))
+    print(torch.median(distance_riemann(aacf, ccf)))
+    print(torch.median(distance_riemann(vacf, ccf)))
+
 
 #%%
 class MutualInformation(nn.Module):
@@ -322,18 +379,18 @@ n_samples = 100
 
 #%%
 aligned = []
-for group, group_df in all_features.groupby("group"):
-    idxs = np.random.permutation(len(group_df))[:n_samples]
-    group_df = group_df.take(idxs)
+for group, g_df in all_features.groupby("group"):
+    idxs = np.random.permutation(len(g_df))[:n_samples]
+    g_df = g_df.take(idxs)
 
-    acav_sgw, acav_pca_corr, acav_pca_wass = compare_av_feats(group_df, slowfast_layers, vggish_layers)
-    chroma_sgw, chroma_pca_corr, chroma_pca_wass = compare_av_feats(group_df, slowfast_layers, ["audio_chroma"])
-    aud_ons_sgw, aud_ons_pca_corr, aud_ons_pca_wass = compare_av_feats(group_df, slowfast_layers, ["audio_onsets"])
-    vid_ons_sgw, vid_ons_pca_corr, vid_ons_pca_wass = compare_av_feats(group_df, ["video_onsets"], vggish_layers)
+    acav_sgw, acav_pca_corr, acav_pca_wass = compare_av_feats(g_df, slowfast_layers, vggish_layers)
+    chroma_sgw, chroma_pca_corr, chroma_pca_wass = compare_av_feats(g_df, slowfast_layers, ["audio_chroma"])
+    aud_ons_sgw, aud_ons_pca_corr, aud_ons_pca_wass = compare_av_feats(g_df, slowfast_layers, ["audio_onsets"])
+    vid_ons_sgw, vid_ons_pca_corr, vid_ons_pca_wass = compare_av_feats(g_df, ["video_onsets"], vggish_layers)
 
     dtw_dists = [
         dtw.distance_fast(vo.astype(np.float64), ao.astype(np.float64))
-        for ao, vo in zip(group_df["video_onsets"], group_df["audio_onsets"])
+        for ao, vo in zip(g_df["video_onsets"], g_df["audio_onsets"])
     ]
     dtw_min, dtw_med, dtw_mean, dtw_max = (
         np.min(dtw_dists),
@@ -342,10 +399,10 @@ for group, group_df in all_features.groupby("group"):
         np.max(dtw_dists),
     )
 
-    vft = torch.from_numpy(np.stack(group_df["video_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
-    vt = torch.from_numpy(np.stack(group_df["video_tempogram"].values)).unsqueeze(1).to(gpu)
-    aft = torch.from_numpy(np.stack(group_df["audio_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
-    at = torch.from_numpy(np.stack(group_df["audio_tempogram"].values)).unsqueeze(1).to(gpu)
+    vft = torch.from_numpy(np.stack(g_df["video_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
+    vt = torch.from_numpy(np.stack(g_df["video_tempogram"].values)).unsqueeze(1).to(gpu)
+    aft = torch.from_numpy(np.stack(g_df["audio_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
+    at = torch.from_numpy(np.stack(g_df["audio_tempogram"].values)).unsqueeze(1).to(gpu)
     avmi = mutual_information(vt, at).sum() + mutual_information(vft, aft).sum()
 
     aligned.append(
@@ -373,29 +430,29 @@ for group, group_df in all_features.groupby("group"):
 
 aligned = pd.DataFrame(aligned)
 aligned.set_index("group")
-aligned
+print(aligned)
 
 #%%
 
 misaligned = []
-for group, group_df in all_features.groupby("group"):
-    idxs = np.random.permutation(len(group_df))[:n_samples]
-    group_df = group_df.take(idxs)
+for group, g_df in all_features.groupby("group"):
+    idxs = np.random.permutation(len(g_df))[:n_samples]
+    g_df = g_df.take(idxs)
 
-    acav_sgw, acav_pca_corr, acav_pca_wass = compare_av_feats(group_df, slowfast_layers, vggish_layers, misaligned=True)
+    acav_sgw, acav_pca_corr, acav_pca_wass = compare_av_feats(g_df, slowfast_layers, vggish_layers, misaligned=True)
     chroma_sgw, chroma_pca_corr, chroma_pca_wass = compare_av_feats(
-        group_df, slowfast_layers, ["audio_chroma"], misaligned=True
+        g_df, slowfast_layers, ["audio_chroma"], misaligned=True
     )
     aud_ons_sgw, aud_ons_pca_corr, aud_ons_pca_wass = compare_av_feats(
-        group_df, slowfast_layers, ["audio_onsets"], misaligned=True
+        g_df, slowfast_layers, ["audio_onsets"], misaligned=True
     )
     vid_ons_sgw, vid_ons_pca_corr, vid_ons_pca_wass = compare_av_feats(
-        group_df, ["video_onsets"], vggish_layers, misaligned=True
+        g_df, ["video_onsets"], vggish_layers, misaligned=True
     )
 
     dtw_dists = [
         dtw.distance_fast(vo.astype(np.float64), ao.astype(np.float64))
-        for ao, vo in zip(group_df["video_onsets"].values[np.random.permutation(n_samples)], group_df["audio_onsets"])
+        for ao, vo in zip(g_df["video_onsets"].values[np.random.permutation(n_samples)], g_df["audio_onsets"])
     ]
     dtw_min, dtw_med, dtw_mean, dtw_max = (
         np.min(dtw_dists),
@@ -405,17 +462,17 @@ for group, group_df in all_features.groupby("group"):
     )
 
     vft = (
-        torch.from_numpy(np.stack(group_df["video_fourier_tempogram"].values[np.random.permutation(n_samples)]))
+        torch.from_numpy(np.stack(g_df["video_fourier_tempogram"].values[np.random.permutation(n_samples)]))
         .unsqueeze(1)
         .to(gpu)
     )
     vt = (
-        torch.from_numpy(np.stack(group_df["video_tempogram"].values[np.random.permutation(n_samples)]))
+        torch.from_numpy(np.stack(g_df["video_tempogram"].values[np.random.permutation(n_samples)]))
         .unsqueeze(1)
         .to(gpu)
     )
-    aft = torch.from_numpy(np.stack(group_df["audio_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
-    at = torch.from_numpy(np.stack(group_df["audio_tempogram"].values)).unsqueeze(1).to(gpu)
+    aft = torch.from_numpy(np.stack(g_df["audio_fourier_tempogram"].values)).unsqueeze(1).to(gpu)
+    at = torch.from_numpy(np.stack(g_df["audio_tempogram"].values)).unsqueeze(1).to(gpu)
 
     avmi = mutual_information(vt, at).sum() + mutual_information(vft, aft).sum()
 
@@ -444,7 +501,7 @@ for group, group_df in all_features.groupby("group"):
 
 misaligned = pd.DataFrame(misaligned)
 misaligned.set_index("group")
-misaligned
+print(misaligned)
 
 
 #%%
@@ -471,6 +528,23 @@ exit(0)
 
 #
 
+
+#%%
+audio_feats = np.stack(all_features["audio_vggish_layer0"])
+np.random.shuffle(audio_feats)
+
+video_feats = np.stack(all_features["video_slowfast_layer0"])
+np.random.shuffle(video_feats)
+
+audiovideo_feats = np.concatenate(
+    [np.stack(all_features["audio_vggish_layer0"]), np.stack(all_features["video_slowfast_layer0"])], axis=2
+)
+np.random.shuffle(audiovideo_feats)
+
+audio_tempogram = np.stack(all_features["audio_tempogram"])
+video_tempogram = np.stack(all_features["video_tempogram"])
+video_onsets = np.stack(all_features["video_onsets"])
+audio_onsets = np.stack(all_features["audio_onsets"])
 
 #%%
 
@@ -671,3 +745,191 @@ def plot_kdes(D):
 plot_kdes(group_data)
 plot_kdes(np.log(data.groupby("group").agg("median")))
 data.groupby("group").agg("count")
+
+#
+
+#
+
+#
+
+#
+
+#
+
+#%%
+
+
+@torch.jit.script
+def calc_sgws(
+    all_vfs: List[torch.Tensor],
+    all_afs: List[torch.Tensor],
+    device: torch.device,
+    n_proj: int = 512,
+    return_individual: bool = False,
+):
+    total = torch.zeros(1, device=device)
+    overalls = torch.jit.annotate(List[torch.Tensor], [])
+    sums = torch.jit.annotate(List[torch.Tensor], [])
+    individuals = torch.jit.annotate(List[List[torch.Tensor]], [[] for _ in range(len(all_vfs[0]))])
+    for vf in all_vfs:
+        for af in all_afs:
+            P = torch.randn([max([vf.shape[1], af.shape[1]]), n_proj], device=device)
+            overall = sliced_gromov_wasserstein(af.to(device), vf.to(device), device=device, P=P)
+            if return_individual:
+                sum = torch.zeros(1, device=device)
+                for i, (a, v) in enumerate(zip(af, vf)):
+                    individual = torch.abs(
+                        sliced_gromov_wasserstein(a[None].to(device), v[None].to(device), device=device, P=P)
+                    )
+                    sum += individual
+                    individuals[i].append(individual)
+                sums.append(sum)
+            overalls.append(overall)
+            total += overall
+    return total, overalls, sums, individuals
+
+
+j = 0
+data, group_data = [], []
+t = time()
+for name, features in [
+    ["trashbenny", AudioVisualFeatures(benny_cache)],
+    ["maua", AudioVisualFeatures(maua_cache)],
+    ["phony", AudioVisualFeatures(phony_cache)],
+    ["trapnation", AudioVisualFeatures(trapnation_cache)],
+    ["invocation", AudioVisualFeatures(invocation_cache)],
+]:
+
+    all_vfs, all_afs, all_fns = [], [], []
+    for vfs, afs, (file,) in DataLoader(features, shuffle=True):
+        all_vfs.append(vfs.values())
+        all_afs.append(afs.values())
+        all_fns.append(file)
+
+    all_vfs = [normalize(torch.cat(vfs).flatten(1)) for vfs in transpose(all_vfs)]
+    all_afs = [normalize(torch.cat(afs).flatten(1)) for afs in transpose(all_afs)]
+    vnames = vfs.keys()
+    anames = afs.keys()
+
+    total, overalls, sums, individuals = calc_sgws(all_vfs, all_afs, device=device, return_individual=True)
+
+    print(name, total.item())
+
+    group_data.append({"group": name})
+    for file in all_fns:
+        data.append({"group": name, "file": file.strip()})
+
+    i = 0
+    for vn in vnames:
+        for an in anames:
+            group_data[-1][f"{vn}_{an}"] = overalls[i].item()
+
+            for k, id in enumerate(individuals):
+                data[j + k][f"{vn}_{an}"] = id[i].item()
+            i += 1
+    j = len(data)
+
+print(time() - t)
+
+data = pd.DataFrame(data)
+print(data)
+data.to_csv("sgws.csv")
+
+group_data = pd.DataFrame(group_data)
+print(group_data)
+group_data.to_csv("group_sgws.csv")
+
+#
+
+#
+
+#
+
+#
+
+#
+
+#%%
+
+in_dir = "/home/hans/datasets/audiovisual/256/"
+videos = sum([glob(in_dir + "/*" + ext) for ext in [".mp4", ".avi", ".mkv"]], [])
+dataset = pytorchvideo.data.LabeledVideoDataset(
+    list(zip(videos, [{} for _ in range(len(videos))])),
+    pytorchvideo.data.UniformClipSampler(clip_duration=dur),
+    transform=ApplyTransformToKey(
+        key="video",
+        transform=Compose(
+            [
+                UniformTemporalSubsample(dur * fps),
+                ShortSideScale(size=256),
+                CenterCrop(256),
+                Lambda(lambda x: x / 255.0),
+            ]
+        ),
+    ),
+    decode_audio=True,
+)
+
+slowfast = SlowFastExtractor()  # TODO input normalization correct?
+vggish = VggishExtractor()
+
+num = 400
+i = 0
+sgws, vids, auds, names = [], [], [], []
+with torch.inference_mode():
+    for shared_batch in tqdm(
+        DataLoader(dataset, batch_size=1, num_workers=min(len(videos), 16)),
+        desc="Encoding videos to audio/visual features...",
+        total=num,
+    ):
+        batch = deepcopy(shared_batch)
+        del shared_batch
+
+        video = batch["video"].permute(0, 2, 1, 3, 4)
+        video_features = slowfast(video)
+
+        audio = batch["audio"]
+        audio = torchaudio.transforms.Resample(round(audio.shape[1] / dur), 16384)(audio)
+        audio_features = vggish(audio)
+
+        sgw = 0
+        for vf in video_features:
+            for af in audio_features:
+                sgw += torch.median(
+                    sliced_gromov_wasserstein(vf.squeeze().to(device), af.squeeze().to(device), device, nproj=500)
+                )
+
+        names.append(batch["video_name"][0].replace(" - ", "_").replace(" ", "_").lower().split(".")[0][:50])
+        vids.append(video.cpu())
+        auds.append(audio.cpu())
+        sgws.append(sgw.cpu().item())
+
+        i += 1
+        if i > num:
+            break
+
+sgws = np.array(sgws)
+
+q1, q3 = np.percentile(sgws, 25), np.percentile(sgws, 75)
+iqr = q3 - q1
+print(np.min(sgws), q1, np.median(sgws), np.mean(sgws), q3, np.max(sgws))
+print("outliers:", np.sort(sgws[(q1 - 1.5 * iqr > sgws) | (sgws > q3 + 1.5 * iqr)]))
+plt.hist(sgws[sgws < 10], bins=100)
+plt.savefig("output/sgw_hist.pdf")
+
+order = np.argsort(sgws)
+
+lower = len(sgws) // 4
+half = len(sgws) // 2
+upper = 3 * len(sgws) // 4
+five = np.arange(5)
+for idx in [*five, *(lower + five), *(half + five), *(upper + five), *np.flip(-five)]:
+    tv.io.write_video(
+        f"output/{sgws[order[idx]]:.4f}_{names[order[idx]]}.mp4",
+        video_array=vids[order[idx]].squeeze().permute(0, 2, 3, 1).mul(255).int(),
+        fps=24,
+        video_codec="h264",
+        audio_array=auds[order[idx]],
+        audio_fps=16384,
+        audio_codec="aac",
+    )

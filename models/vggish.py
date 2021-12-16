@@ -36,7 +36,7 @@ from torch.nn.functional import interpolate
 
 
 class VggishExtractor(nn.Module):
-    def __init__(self, sr=16000, fps=24):
+    def __init__(self, sr=16384, fps=24):
         super().__init__()
         self.sr = sr
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,7 +174,7 @@ def _preprocess(data, sample_rate):
     NUM_BANDS = 64  # Frequency bands in input mel-spectrogram patch.
 
     # Hyperparameters used in feature and example generation.
-    SAMPLE_RATE = 16000
+    SAMPLE_RATE = 16384
     STFT_WINDOW_LENGTH_SECONDS = 0.025
     STFT_HOP_LENGTH_SECONDS = 0.010
     NUM_MEL_BINS = NUM_BANDS
@@ -213,8 +213,7 @@ def _preprocess(data, sample_rate):
 
     num_samples = log_mel.shape[0]
 
-    num_frames = int(np.floor((num_samples - example_window_length) / example_hop_length))
-    num_frames = 1 + num_frames
+    num_frames = int(np.round((num_samples - example_window_length) / example_hop_length))
 
     shape = (num_frames, example_window_length) + log_mel.shape[1:]
     strides = (log_mel.strides[0] * example_hop_length,) + log_mel.strides

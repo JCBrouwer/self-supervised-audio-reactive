@@ -21,6 +21,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import torchvision as tv
 from torch.nn.functional import pad
 
@@ -28,11 +29,10 @@ from efficient_quantile import quantile
 from flow import cart2pol, lucas_kanade_gaussian_pyramid
 
 
-@torch.jit.script
-def normalize(tensor):
-    result = tensor - tensor.min()
-    result = result / result.max()
-    return result
+def normalize(array):
+    array = array - array.min()
+    array = array / array.max()
+    return array
 
 
 # @torch.jit.script
@@ -55,28 +55,33 @@ def optical_flow(video):
     return flow
 
 
+def optical_flow_cpu_worker(prev_next):
+    i, (prev, next) = prev_next
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+    next_gray = cv2.cvtColor(next, cv2.COLOR_RGB2GRAY)
+    flow_frame = cv2.calcOpticalFlowFarneback(
+        prev_gray,
+        next_gray,
+        None,
+        pyr_scale=0.5,
+        levels=6,
+        winsize=25,
+        iterations=10,
+        poly_n=25,
+        poly_sigma=3.0,
+        flags=cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+    )
+    magang = cart2pol(flow_frame[..., 0], flow_frame[..., 1])
+    flow_frame = np.stack(magang)
+    return flow_frame
+
+
 def optical_flow_cpu(video):
     dev = video.device
     video = video.cpu().numpy()
     flow = []
-    for prev, next in zip(video, video[1:]):
-        prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
-        next_gray = cv2.cvtColor(next, cv2.COLOR_RGB2GRAY)
-        flow_frame = torch.from_numpy(
-            cv2.calcOpticalFlowFarneback(
-                prev_gray,
-                next_gray,
-                None,
-                pyr_scale=0.5,
-                levels=6,
-                winsize=25,
-                iterations=10,
-                poly_n=25,
-                poly_sigma=3.0,
-                flags=cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
-            )
-        )
-        flow.append(torch.stack(cart2pol(flow_frame[..., 0], flow_frame[..., 1])))
+    with mp.Pool(mp.cpu_count()) as pool:
+        flow = [torch.from_numpy(f) for f in pool.map(optical_flow_cpu_worker, list(enumerate(zip(video, video[1:]))))]
     flow = torch.stack(flow)
     flow = torch.cat((flow[[0]], flow))
     flow[:, 0] = standardize(flow[:, 0])
@@ -95,17 +100,19 @@ def median_filter_2d(
 
 
 @torch.jit.script
-def directogram(flow, bins: int = 64):
-    bin_width = 1 / bins
-    angle_bins = torch.linspace(0, 1, bins, device=flow.device)[None, None, None, :]
+def directogram(flow, bins: int = 32):
+    bin_width = 256 // bins
+    angle_bins = torch.linspace(0, 255, bins, device=flow.device, dtype=torch.uint8)[None, None, None, :]
+    flow = flow.mul(255).to(torch.uint8)
 
-    bin_idxs = torch.argmax((torch.abs(angle_bins - flow[:, 1, :, :, None]) <= bin_width).int(), dim=-1)
+    # TODO figure out a more memory efficient way of doing this
+    bin_idxs = torch.argmax((torch.abs(angle_bins - flow[:, 1, :, :, None]) <= bin_width).to(torch.uint8), dim=-1)
 
-    dg = torch.zeros((flow.shape[0], bins), device=flow.device)
+    dg = torch.zeros((flow.shape[0], bins), device=flow.device, dtype=torch.int64)
     for t in range(flow.shape[0]):
         for bin in range(bins):
             dg[t, bin] = torch.sum(flow[t, 0][bin_idxs[t] == bin])
-
+    dg = dg.float() / 255.0
     dg = median_filter_2d(dg[None, None]).squeeze()
 
     return dg
