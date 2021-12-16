@@ -200,6 +200,7 @@ if __name__ == "__main__":
         ["maua", AudioVisualFeatures(maua_cache)],
         ["phony", AudioVisualFeatures(phony_cache)],
         ["trapnation", AudioVisualFeatures(trapnation_cache)],
+        ["invocation", AudioVisualFeatures(invocation_cache)],
     ]:
 
         all_vfs, all_afs, all_fns = [], [], []

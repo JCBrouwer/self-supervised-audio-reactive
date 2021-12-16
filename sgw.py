@@ -10,7 +10,7 @@ import torch
 
 
 def sgw_gpu(
-    xs: torch.Tensor, xt: torch.Tensor, device: torch.device, nproj: int = 200, P: torch.Tensor = torch.tensor([])
+    xs: torch.Tensor, xt: torch.Tensor, device: torch.device, nproj: int = 512, P: torch.Tensor = torch.tensor([])
 ):
     """Returns SGW between xs and xt eq (4) in [1]. Only implemented with the 0 padding operator Delta
     Parameters
