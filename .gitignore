@@ -7,3 +7,4 @@ cache/*
 runs/
 output/*
 !output/.gitkeep
+*.code-workspace

@@ -1,25 +1,42 @@
+import matplotlib
+
+matplotlib.use("Agg")
+
 import random
 import sys
+from glob import glob
+from pathlib import Path
 from time import time
+from uuid import uuid4
 
+import joblib
+import librosa as rosa
+import librosa.display as rosa_display
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from npy_append_array import NpyAppendArray as NpArr
 from scipy.signal import resample
+from tqdm import trange
 
-sys.path.append("/home/hans/code/maua/maua/")
-
-from audiovisual.audioreactive.audio import band_pass, harmonic, high_pass, load_audio, low_pass, percussive, unmixed
-from audiovisual.audioreactive.features import chroma, onsets, pitch_track, pulse, spectral_max, tempo, tonnetz, volume
-from audiovisual.audioreactive.postprocess import compress, expand, gaussian_filter, percentile_clip
-from audiovisual.patches.primitives import (
-    ModulatedLatents,
-    ModulatedNoise,
-    PitchTrackLatents,
-    TempoLoopLatents,
-    TempoLoopNoise,
-    TonalLatents,
-    TonalNoise,
-)
+# fmt:off
+sys.path.append("/home/hans/code/maua/maua")
+from audiovisual.audioreactive.audio import (band_pass, harmonic, high_pass,
+                                             load_audio, low_pass, percussive,
+                                             unmixed)
+from audiovisual.audioreactive.features import (chroma, onsets, pitch_track,
+                                                pulse, spectral_max, tempo,
+                                                tonnetz, volume)
+from audiovisual.audioreactive.postprocess import (compress, expand,
+                                                   gaussian_filter,
+                                                   percentile_clip)
+from audiovisual.patches.primitives import (ModulatedLatents, ModulatedNoise,
+                                            ModulationSum, PitchTrackLatents,
+                                            TempoLoopLatents, TempoLoopNoise,
+                                            TonalLatents, TonalNoise)
+from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
+from ops.video import VideoWriter
+# fmt:on
 
 # just randomly select from my other scripts, rather than full combinatorial
 
@@ -154,7 +171,7 @@ class AudioFeature(RandomPatchPartial):
 
 class Onsets(AudioFeature):
     type = ["mm", "rosa"]
-    prepercussive = [1, 2, 4, 8, 16]
+    prepercussive = [1, 2, 4, 8]
     fn = onsets
 
 
@@ -163,15 +180,15 @@ class Volume(AudioFeature):
 
 
 class Pitch(AudioFeature):
-    preharmonic = [1, 2, 4, 8, 16]
+    preharmonic = [1, 2, 4, 8]
     fn = pitch_track
 
 
 class Tempo(AudioFeature):
     prior = ["uniform", "lognormal"]
     type = ["mm", "rosa"]
-    prepercussive = [1, 2, 4, 8, 16]
-    tempo_idx = [0, 1, 2, 3, 4, 5, 6]
+    prepercussive = [1, 2, 4, 8]
+    tempo_idx = [0, 1, 2, 3]
 
     def select_tempo(self, x, **kwargs):
         tempo_idx = kwargs["tempo_idx"]
@@ -184,14 +201,14 @@ class Tempo(AudioFeature):
 class Chroma(AudioFeature):
     type = ["cens", "cqt", "stft", "deep", "clp"]
     nearest_neighbor = [True, False]
-    preharmonic = [1, 2, 4, 8, 16]
+    preharmonic = [1, 2, 4, 8]
     fn = chroma
 
 
 class Tonnetz(AudioFeature):
     type = ["cens", "cqt", "stft", "deep", "clp"]
     nearest_neighbor = [True, False]
-    preharmonic = [1, 2, 4, 8, 16]
+    preharmonic = [1, 2, 4, 8]
     fn = tonnetz
 
 
@@ -200,7 +217,7 @@ class Postprocess(RandomPatchPartial):
 
 
 class Smooth(Postprocess):
-    sigma = [1, 3, 5, 7, 15, 25]
+    sigma = [1, 3, 5, 7, 15]
     causal = [1, 0.75, 0.5, 0.25, 0.1, 0]
     fn = gaussian_filter
 
@@ -295,7 +312,7 @@ class RandomPatch(RandomPatchPartial):
         if which_audio == "bass":
             which_filtering = "none"
         else:
-            which_filtering = random.choice(["none", "low", "low-mid", "mid", "high-mid", "high"])
+            which_filtering = random.choice(["none", "none", "none", "low", "low-mid", "mid", "high-mid", "high"])
 
         which_input = random.choice(["latent", "noise"])
 
@@ -392,33 +409,30 @@ class RandomPatch(RandomPatchPartial):
         #     layer_fn = partial(lambda lats1, lats2: torch.cat((lats1[:, :12], lats2[:, 12:]), dim=1))
         # self.layer_fn = layer_fn
 
-    def forward(self, fps, audio_file, latent_selection, size):
-
-        t = time()
-        audio, sr, dur = load_audio(audio_file)
-        print(f"load {time()-t:.2f} sec")
-
-        t = time()
+    def forward(self, audio, sr, dur, fps, audio_file, latent_selection, size):
         audio_source = self.source(audio.numpy(), sr=sr)
-        print(f"source {time()-t:.2f} sec")
 
-        t = time()
         audio_filtered = self.filter(audio_source, sr=sr)
-        print(f"filter {time()-t:.2f} sec")
 
-        t = time()
         audio_feature = self.feature(audio_filtered, sr=sr)
-        print(f"feature {time()-t:.2f} sec")
+
         if not isinstance(self.feature, Tempo):
             audio_feature = torch.from_numpy(
                 resample(audio_feature, round(dur * fps), axis=np.argmax(audio_feature.shape))
             )
 
-        t = time()
+        if isinstance(self.feature, Pitch):
+            print("PitchTrack", audio_feature.min(), audio_feature.mean(), audio_feature.max(), audio_feature.shape)
         audio_postprocessed = self.postprocess(audio_feature)
-        print(f"process {time()-t:.2f} sec")
+        if isinstance(self.feature, Pitch):
+            print(
+                "PitchTrack",
+                audio_postprocessed.min(),
+                audio_postprocessed.mean(),
+                audio_postprocessed.max(),
+                audio_postprocessed.shape,
+            )
 
-        t = time()
         kwargs = self.target.kwargs
         if isinstance(self.feature, Tempo):
             kwargs["fps"] = fps
@@ -426,28 +440,101 @@ class RandomPatch(RandomPatchPartial):
             module = self.target.primitive(audio_postprocessed, latent_selection, **kwargs)
         else:
             module = self.target.primitive(audio_postprocessed, size=size, **kwargs)
-        print(f"primitive {time()-t:.2f} sec")
-        return module
+        return module, audio_feature, audio_postprocessed
 
 
 if __name__ == "__main__":
-    # for _ in range(10):
-    #     print(RandomPatch.randomize())
+    audio_file = random.choice(glob("/home/hans/datasets/wavefunk/*"))
+    model_file = random.choice(glob("/home/hans/modelzoo/wavefunk/*/*.pt") + glob("/home/hans/modelzoo/wavefunk/*.pt"))
+    checkpoint_name = Path(model_file.replace("/network-snapshot", "")).stem
+    checkpoint_name = "_".join(sorted(checkpoint_name.replace("-", "_").split("_"), key=lambda k: random.random())[:7])
+    output_file = (
+        f"/home/hans/neurout/ssar/random_patch_{Path(audio_file).stem}_{checkpoint_name[:40]}_{str(uuid4())[:8]}.mp4"
+    )
+    fps = 24
+    offset = random.choice([0, 30, 60, 90, 120, 180])
+    full_duration = rosa.get_duration(filename=audio_file)
+    offset = max(0, min(full_duration - 60, offset))
 
-    audio_file = "/home/hans/datasets/wavefunk/naamloos.wav"
-    audio, sr, dur = load_audio(audio_file, duration=180)
-    audio = audio.numpy()
+    audio, sr, dur = load_audio(audio_file, offset=offset, duration=60)
+    print("audio_file: ", audio_file)
+    print("sr:         ", sr)
+    print("model_file: ", model_file)
+    print("offset:     ", offset)
+    print("duration:   ", dur)
+    print("Any NaNs?   ", audio.isnan().any().item())
+    print("No Infs?    ", np.isfinite(audio.numpy()).all())
 
-    MyPatch = RandomPatch.randomize()
-    print(MyPatch)
+    with torch.inference_mode():
+        mapper = StyleGAN2Mapper(model_file)
 
-    patch_module = MyPatch(fps=60, audio_file=audio_file, latent_selection=torch.randn(12, 18, 512), size=128)
+        latents, noises, patches, feats = [], [], [], []
+        for i in range(5):
+            patch = RandomPatch.randomize()
+            print(patch)
+            patches.append(patch)
 
-    print()
-    print(patch_module)
-    print(patch_module.forward().shape)
-    print(patch_module.forward().shape)
-    print(patch_module.forward().shape)
-    print()
-    print()
-    print()
+            patch_module, f, p = patch(
+                audio=audio,
+                sr=sr,
+                dur=dur,
+                fps=fps,
+                audio_file=audio_file,
+                latent_selection=mapper(torch.randn(12, 512)),
+                size=64,
+            )
+            feats.append([f, p])
+
+            if not hasattr(patch_module, "modulation"):
+                patch_module.modulation = torch.ones((1))
+            if "Latent" in patch_module.__class__.__name__:
+                latents.append(patch_module)
+            else:
+                noises.append(patch_module)
+
+        latent = ModulationSum(latents)
+        noise = ModulationSum(noises)
+        synthesizer = StyleGAN2Synthesizer(model_file, (1024, 1024), "stretch", 0).cuda()
+        with VideoWriter(output_file, synthesizer.output_size, fps, audio_file, offset, dur, "slow") as video, NpArr(
+            output_file.replace(".mp4", "_noise.npy")
+        ) as noise_file, NpArr(output_file.replace(".mp4", "_latent.npy")) as latent_file:
+            for _ in trange(round(dur * fps)):
+                lat, noi = latent().cuda(), noise().cuda().unsqueeze(0)
+                frame = synthesizer(latent_w_plus=lat, **synthesizer.make_noise_pyramid(noi)).add(1).div(2)
+                video.write(frame)
+                latent_file.append(np.ascontiguousarray(lat.cpu().numpy()))
+                noise_file.append(np.ascontiguousarray(noi.cpu().numpy()))
+
+        joblib.dump(patches, output_file.replace(".mp4", f"_patches.pkl"), compress=9)
+        with open(output_file.replace(".mp4", f"_patches.txt"), "w") as f:
+            for patch in patches:
+                f.write(f"{patch}")
+
+        fig, ax = plt.subplots(2, len(feats), figsize=(8 * len(feats), 16))
+        for i in range(len(feats)):
+            for j in range(len(feats[i])):
+                af = feats[i][j]
+                if isinstance(af, float):
+                    rosa_display.specshow(
+                        rosa.feature.tempogram(audio.numpy(), sr), sr=sr, x_axis="time", y_axis="tempo", ax=ax[j, i]
+                    )
+                    ax[j, i].axhline(af, color="w", linestyle="--", alpha=1, label="Estimated tempo={:g}".format(af))
+                    ax[j, i].legend(loc="upper right")
+                elif len(af.squeeze().shape) == 1:
+                    ax[j, i].plot(af.squeeze().numpy())
+                elif af.shape[1] == 6:
+                    rosa_display.specshow(
+                        np.rollaxis(af.numpy(), 1, 0), sr=sr, x_axis="time", y_axis="tonnetz", ax=ax[j, i]
+                    )
+                elif af.shape[1] == 12:
+                    rosa_display.specshow(
+                        np.rollaxis(af.numpy(), 1, 0), sr=sr, x_axis="time", y_axis="chroma", ax=ax[j, i]
+                    )
+                else:
+                    raise Exception(f"what? {af.shape} {patches[i].feature.__class__.__name__}")
+                ax[j, i].set(
+                    title=patches[i].target.__class__.__name__
+                    + (" " + patches[i].postprocess.__class__.__name__ if j else "")
+                )
+        plt.tight_layout()
+        plt.savefig(output_file.replace(".mp4", ".pdf"))
