@@ -55,6 +55,7 @@ class RandomPatchPartial(torch.nn.Module):
     def __init__(self, random_kwargs, **kwargs) -> None:
         super().__init__()
         self.kwargs = random_kwargs
+        print(self.__class__.__name__, random_kwargs)
         for name, var in kwargs.items():
             setattr(self, name, var)
 
@@ -62,7 +63,7 @@ class RandomPatchPartial(torch.nn.Module):
     def randomize(cls):
         random_kwargs, regular_kwargs = {}, {}
         for name, var in cls.__dict__.items():
-            if isinstance(var, list):
+            if isinstance(var, list) and len(var) > 0:
                 random_kwargs[name] = random.choice(var)
             else:
                 regular_kwargs[name] = var
@@ -312,7 +313,7 @@ class RandomPatch(RandomPatchPartial):
         if which_audio == "bass":
             which_filtering = "none"
         else:
-            which_filtering = random.choice(["none", "none", "none", "low", "low-mid", "mid", "high-mid", "high"])
+            which_filtering = random.choice(["none", "low", "low-mid", "mid", "high-mid", "high"])
 
         which_input = random.choice(["latent", "noise"])
 
@@ -410,23 +411,43 @@ class RandomPatch(RandomPatchPartial):
         # self.layer_fn = layer_fn
 
     def forward(self, audio, sr, dur, fps, audio_file, latent_selection, size):
+        print("Input", audio.min(), audio.mean(), audio.max(), audio.shape)
         audio_source = self.source(audio.numpy(), sr=sr)
-
+        print(
+            self.source.__class__.__name__,
+            audio_source.min(),
+            audio_source.mean(),
+            audio_source.max(),
+            audio_source.shape,
+        )
         audio_filtered = self.filter(audio_source, sr=sr)
-
+        print(
+            self.filter.__class__.__name__,
+            audio_filtered.min(),
+            audio_filtered.mean(),
+            audio_filtered.max(),
+            audio_filtered.shape,
+        )
         audio_feature = self.feature(audio_filtered, sr=sr)
 
         if not isinstance(self.feature, Tempo):
             audio_feature = torch.from_numpy(
                 resample(audio_feature, round(dur * fps), axis=np.argmax(audio_feature.shape))
             )
-
-        if isinstance(self.feature, Pitch):
-            print("PitchTrack", audio_feature.min(), audio_feature.mean(), audio_feature.max(), audio_feature.shape)
-        audio_postprocessed = self.postprocess(audio_feature)
-        if isinstance(self.feature, Pitch):
             print(
-                "PitchTrack",
+                self.feature.__class__.__name__,
+                audio_feature.min(),
+                audio_feature.mean(),
+                audio_feature.max(),
+                audio_feature.shape,
+            )
+        else:
+            print(self.feature.__class__.__name__, audio_feature)
+
+        audio_postprocessed = self.postprocess(audio_feature)
+        if not isinstance(self.feature, Tempo):
+            print(
+                self.postprocess.__class__.__name__,
                 audio_postprocessed.min(),
                 audio_postprocessed.mean(),
                 audio_postprocessed.max(),
@@ -436,6 +457,7 @@ class RandomPatch(RandomPatchPartial):
         kwargs = self.target.kwargs
         if isinstance(self.feature, Tempo):
             kwargs["fps"] = fps
+        print(self.target.__class__.__name__)
         if self.target.is_latent:
             module = self.target.primitive(audio_postprocessed, latent_selection, **kwargs)
         else:
@@ -444,6 +466,10 @@ class RandomPatch(RandomPatchPartial):
 
 
 if __name__ == "__main__":
+    # for _ in range(10):
+    # print(RandomPatch.randomize())
+    # exit()
+
     audio_file = random.choice(glob("/home/hans/datasets/wavefunk/*"))
     model_file = random.choice(glob("/home/hans/modelzoo/wavefunk/*/*.pt") + glob("/home/hans/modelzoo/wavefunk/*.pt"))
     checkpoint_name = Path(model_file.replace("/network-snapshot", "")).stem
@@ -466,7 +492,7 @@ if __name__ == "__main__":
     print("No Infs?    ", np.isfinite(audio.numpy()).all())
 
     with torch.inference_mode():
-        mapper = StyleGAN2Mapper(model_file)
+        mapper = StyleGAN2Mapper(model_file, False)
 
         latents, noises, patches, feats = [], [], [], []
         for i in range(5):
@@ -494,7 +520,7 @@ if __name__ == "__main__":
 
         latent = ModulationSum(latents)
         noise = ModulationSum(noises)
-        synthesizer = StyleGAN2Synthesizer(model_file, (1024, 1024), "stretch", 0).cuda()
+        synthesizer = StyleGAN2Synthesizer(model_file, False, (512, 512), "stretch", 0).cuda()
         with VideoWriter(output_file, synthesizer.output_size, fps, audio_file, offset, dur, "slow") as video, NpArr(
             output_file.replace(".mp4", "_noise.npy")
         ) as noise_file, NpArr(output_file.replace(".mp4", "_latent.npy")) as latent_file:
@@ -533,7 +559,11 @@ if __name__ == "__main__":
                 else:
                     raise Exception(f"what? {af.shape} {patches[i].feature.__class__.__name__}")
                 ax[j, i].set(
-                    title=patches[i].target.__class__.__name__
+                    title=patches[i].source.__class__.__name__
+                    + " "
+                    + patches[i].filter.__class__.__name__
+                    + " "
+                    + patches[i].target.__class__.__name__
                     + (" " + patches[i].postprocess.__class__.__name__ if j else "")
                 )
         plt.tight_layout()
