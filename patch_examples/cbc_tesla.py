@@ -1,15 +1,16 @@
 # %%
+import json
 import os
 import uuid
-import json
-import render
+
 import generate
-import numpy as np
-import torch as th
-import madmom as mm
 import librosa as rosa
-import scipy.signal as signal
+import madmom as mm
 import matplotlib.pyplot as plt
+import numpy as np
+import render
+import scipy.signal as signal
+import torch as th
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
 
@@ -264,7 +265,9 @@ if __name__ == "__main__":
             high_pitches, high_magnitudes = pitches[high_pitch_cutoff:], magnitudes[high_pitch_cutoff:]
             high_pitches_mean = high_pitches.mean(0)
             high_pitches_mean = np.clip(
-                signal.resample(high_pitches_mean, num_frames), high_pitches_mean.min(), high_pitches_mean.max(),
+                signal.resample(high_pitches_mean, num_frames),
+                high_pitches_mean.min(),
+                high_pitches_mean.max(),
             )
             high_average_pitch = np.average(high_pitches, axis=0, weights=high_magnitudes + 1e-8)
             high_average_pitch = np.clip(
@@ -410,7 +413,8 @@ if __name__ == "__main__":
 
             # info([rms_slice, onsets_slice])
             main_weight = causal_gaussian(
-                normalize(rms_slice) * normalize(onsets_slice), [prms[t]["onset_smooth"] * smf * 86 / t_bpm],
+                normalize(rms_slice) * normalize(onsets_slice),
+                [prms[t]["onset_smooth"] * smf * 86 / t_bpm],
             )
             main_weight = percentile_clip(main_weight, prms[t]["onset_clip"])
             main_weight = th.from_numpy(main_weight)[:, None, None]
@@ -654,4 +658,3 @@ if __name__ == "__main__":
 #     video.stdin.write((noise[4][n] * 255).numpy().astype(np.uint8).tobytes())
 # video.stdin.close()
 # video.wait()
-

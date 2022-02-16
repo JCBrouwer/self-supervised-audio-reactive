@@ -2,7 +2,6 @@ import audioreactive as ar
 import numpy as np
 import torch
 
-
 start = 12 * 60 + 20
 end = 14 * 60 + 50
 dict(title="Intro", start=12 * 60 + 26, end=13 * 60 + 21)

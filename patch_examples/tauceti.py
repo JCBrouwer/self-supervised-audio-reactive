@@ -7,10 +7,9 @@ During the drop, a translation is applied which makes the video seem to scroll e
 
 from functools import partial
 
+import audioreactive as ar
 import numpy as np
 import torch as th
-
-import audioreactive as ar
 
 OVERRIDE = dict(
     audio_file="audioreactive/examples/Wavefunk - Tau Ceti Alpha.mp3",

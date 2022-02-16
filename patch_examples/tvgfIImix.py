@@ -14,7 +14,6 @@ sys.path.append("/home/hans/code/maua-stylegan2/")
 import audioreactive as ar
 from generate_audiovisual import generate
 
-
 track_info = [
     {
         "id": 0,

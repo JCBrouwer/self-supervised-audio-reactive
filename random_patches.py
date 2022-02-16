@@ -36,6 +36,7 @@ from audiovisual.patches.primitives import (ModulatedLatents, ModulatedNoise,
                                             TonalLatents, TonalNoise)
 from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
 from ops.video import VideoWriter
+
 # fmt:on
 
 # just randomly select from my other scripts, rather than full combinatorial

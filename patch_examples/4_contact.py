@@ -1,7 +1,8 @@
+from time import time
+
 import audioreactive as ar
 import numpy as np
 import torch
-from time import time
 
 dict(title="1st Movement", start=6 * 60 + 5, end=7 * 60 + 9)
 # [transition into 2nd movement]

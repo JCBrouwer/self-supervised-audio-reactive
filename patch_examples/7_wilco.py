@@ -1,8 +1,8 @@
+from time import time
+
 import audioreactive as ar
 import numpy as np
 import torch
-from time import time
-
 
 dict(title="A Section", start=15 * 60 + 9, end=16 * 60 + 43)
 dict(title="B Section", start=16 * 60 + 43, end=17 * 60 + 8)

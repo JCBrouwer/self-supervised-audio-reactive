@@ -1,21 +1,22 @@
 # %%
+import glob
+import json
 import os
 import uuid
-import json
-import glob
-import tqdm
-import render
-import generate
-import numpy as np
-import torch as th
-import madmom as mm
-import librosa as rosa
-import scipy.signal as signal
-import matplotlib.pyplot as plt
-import torch.nn.functional as F
 from collections import defaultdict
-from scipy.ndimage import gaussian_filter
+
+import generate
+import librosa as rosa
+import madmom as mm
+import matplotlib.pyplot as plt
+import numpy as np
+import render
+import scipy.signal as signal
+import torch as th
+import torch.nn.functional as F
+import tqdm
 from pathos.multiprocessing import ProcessingPool as Pool
+from scipy.ndimage import gaussian_filter
 
 th.set_grad_enabled(False)
 plt.rcParams["axes.facecolor"] = "black"
@@ -139,7 +140,14 @@ if __name__ == "__main__":
         stop_time -= offset
         fac = 1.0 / duration * num_frames
         tracks.append(
-            [t, int(round(start_time * fac)), int(round(stop_time * fac)), t_bpm, start_time, stop_time,]
+            [
+                t,
+                int(round(start_time * fac)),
+                int(round(stop_time * fac)),
+                t_bpm,
+                start_time,
+                stop_time,
+            ]
         )
         # print(t, int(round(start_time * fac)), int(round(stop_time * fac)), t_bpm, start_time, stop_time)
 
@@ -293,7 +301,8 @@ if __name__ == "__main__":
 
             # %%
             main_weight = gaussian_filter(
-                rms[t_start:t_stop] * onsets[t_start:t_stop], [prms["onset_smooth"][t] * smf * 86 / t_bpm],
+                rms[t_start:t_stop] * onsets[t_start:t_stop],
+                [prms["onset_smooth"][t] * smf * 86 / t_bpm],
             )
             main_weight = percentile_clip(main_weight, prms["onset_clip"][t])
             main_weight = th.from_numpy(main_weight)[:, None, None]
@@ -368,7 +377,9 @@ if __name__ == "__main__":
                     th.cat(
                         [
                             generate.slerp(
-                                val, latents[transin, 0], latents[transout + (1 if t != len(tracks) - 1 else -1), 0],
+                                val,
+                                latents[transin, 0],
+                                latents[transout + (1 if t != len(tracks) - 1 else -1), 0],
                             )[None, :]
                         ]
                         * 18,
@@ -501,4 +512,3 @@ if __name__ == "__main__":
 #     video.stdin.write((noise[4][n] * 255).numpy().astype(np.uint8).tobytes())
 # video.stdin.close()
 # video.wait()
-

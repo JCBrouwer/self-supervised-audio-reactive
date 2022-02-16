@@ -1,18 +1,19 @@
 # %%
-import uuid
-import time
 import glob
-import render
+import time
+import uuid
+
 import generate
-import numpy as np
-import torch as th
 import librosa as rosa
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
+import numpy as np
+import render
 import scipy.interpolate as interp
-from scipy.signal import argrelextrema
-from scipy.ndimage import gaussian_filter
+import torch as th
+import torch.nn.functional as F
 from pathos.multiprocessing import ProcessingPool as Pool
+from scipy.ndimage import gaussian_filter
+from scipy.signal import argrelextrema
 
 th.set_grad_enabled(False)
 VERBOSE = True

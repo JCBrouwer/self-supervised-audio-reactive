@@ -3,10 +3,9 @@ This file shows an example of spatial control of the noise using a simple circul
 The latents are a chromagram weighted sequence, modulated by drum onsets
 """
 
+import audioreactive as ar
 import scipy.ndimage.filters as ndi
 import torch as th
-
-import audioreactive as ar
 
 OVERRIDE = dict(audio_file="audioreactive/examples/Wavefunk - Temper.mp3", out_size=1024)
 

@@ -1,20 +1,21 @@
 # %%
+import glob
+import json
 import os
 import uuid
-import json
-import glob
-import tqdm
-import render
+
 import generate
-import numpy as np
-import torch as th
-import madmom as mm
 import librosa as rosa
-import scipy.signal as signal
+import madmom as mm
 import matplotlib.pyplot as plt
+import numpy as np
+import render
+import scipy.signal as signal
+import torch as th
 import torch.nn.functional as F
-from scipy.ndimage import gaussian_filter
+import tqdm
 from pathos.multiprocessing import ProcessingPool as Pool
+from scipy.ndimage import gaussian_filter
 
 th.set_grad_enabled(False)
 plt.rcParams["axes.facecolor"] = "black"
@@ -484,4 +485,3 @@ if __name__ == "__main__":
 #     video.stdin.write((noise[4][n] * 255).numpy().astype(np.uint8).tobytes())
 # video.stdin.close()
 # video.wait()
-

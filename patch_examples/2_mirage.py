@@ -1,7 +1,8 @@
+import random
+
 import audioreactive as ar
 import numpy as np
 import torch as th
-import random
 
 dict(title="Set intro", start=0 * 60, end=0 * 60 + 40)
 dict(title="Mirage Intro", start=0 * 60 + 40, end=1 * 60 + 54)

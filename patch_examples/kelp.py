@@ -6,10 +6,9 @@ Long term section analysis is done with the RMS to interpolate between latent se
 """
 
 
+import audioreactive as ar
 import librosa as rosa
 import torch as th
-
-import audioreactive as ar
 
 OVERRIDE = dict(audio_file="audioreactive/examples/Wavefunk - Dwelling in the Kelp.mp3", out_size=1920)
 BPM = 130

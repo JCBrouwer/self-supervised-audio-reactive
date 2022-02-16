@@ -1,8 +1,8 @@
+from time import time
+
 import audioreactive as ar
 import numpy as np
 import torch
-from time import time
-
 
 from .base import *
 

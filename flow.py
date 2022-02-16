@@ -768,6 +768,7 @@ if __name__ == "__main__":
     import skimage
     import torch
     import torchvision as tv
+
     from visual_beats import normalize
 
     matplotlib.use("Agg")

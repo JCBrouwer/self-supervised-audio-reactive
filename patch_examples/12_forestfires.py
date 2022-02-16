@@ -1,8 +1,8 @@
+from time import time
+
 import audioreactive as ar
 import numpy as np
 import torch
-from time import time
-
 
 dict(title="Intro", start=28 * 60 + 57, end=29 * 60 + 31)
 dict(title="1st Movement", start=29 * 60 + 31, end=30 * 60 + 37)

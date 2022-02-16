@@ -2,13 +2,12 @@ import random
 import sys
 import uuid
 
+import audioreactive as ar
 import librosa as rosa
 import numpy as np
 import torch as th
-from render_ddp import render_ddp
-
-import audioreactive as ar
 from audioreactive import gaussian_filter, spline_loops
+from render_ddp import render_ddp
 
 sys.path.append("nvsg2a")
 from nvsg2a import dnnlib, legacy

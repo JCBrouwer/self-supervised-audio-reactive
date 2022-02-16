@@ -1,8 +1,7 @@
-import librosa as rosa
-import torch as th
-import numpy as np
-
 import audioreactive as ar
+import librosa as rosa
+import numpy as np
+import torch as th
 
 
 def initialize(args):
