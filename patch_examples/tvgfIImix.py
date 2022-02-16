@@ -1,15 +1,19 @@
-import os
 import math
-import uuid
+import os
 import random
+import sys
+import uuid
 import warnings
 
 import librosa as rosa
 import numpy as np
-import matplotlib.pyplot as plt
-import torch as th
+import torch
+from scipy.io.wavfile import write as write_wav
 
+sys.path.append("/home/hans/code/maua-stylegan2/")
 import audioreactive as ar
+from generate_audiovisual import generate
+
 
 track_info = [
     {
@@ -78,7 +82,7 @@ track_info = [
     {
         "id": 7,
         "title": "Halogenix - Independent",
-        "start": 13 * 60 + 03.554,
+        "start": 13 * 60 + 3.554,
         "end": 14 * 60 + 55.182,
         "latent": "workspace/independent-latents.npy",
         "vibe": "tech",
@@ -96,7 +100,7 @@ track_info = [
     {
         "id": 9,
         "title": "QZB & Amoss - Tigra",
-        "start": 17 * 60 + 09.135,
+        "start": 17 * 60 + 9.135,
         "end": 18 * 60 + 38.437,
         "latent": "workspace/alaeset-GPU1-files-1024-013000____darkblu2_latents.npy",
         "vibe": "liquid",
@@ -267,7 +271,7 @@ track_info = [
     {
         "id": 28,
         "title": "Disprove - Damage",
-        "start": 51 * 60 + 03.554,
+        "start": 51 * 60 + 3.554,
         "end": 52 * 60 + 55.182,
         "latent": "workspace/alaeset-GPU1-files-1024-013000____neuro-dc_latents.npy",
         "vibe": "neuro",
@@ -338,8 +342,8 @@ tech_start = 22 * 60 + 34.321
 tech_end = 35 * 60 + 56.577
 neuro_start = 36 * 60 + 18.903
 
-interstitial = ar.load_latents("workspace/alaeset-GPU1-files-1024-013000____donker_latents.npy")
-interstitial = th.cat([interstitial[:-6], interstitial[-3:]])
+# interstitial = ar.load_latents("workspace/alaeset-GPU1-files-1024-013000____donker_latents.npy")
+# interstitial = torch.cat([interstitial[:-6], interstitial[-3:]])
 
 
 def get_latents(selection, args):
@@ -364,6 +368,11 @@ def get_latents(selection, args):
 
         print(
             f"{title.ljust(40)}   frames: {start_frame} -> {end_frame}   duration: {end_time - start_time:.2f} sec   bars: {num_bars:.1f} in {num_phrases} phrases   transition: {trans} frames"
+        )
+        write_wav(
+            f"/home/hans/datasets/audio2latent/Wavefunk @ Donderslag II - {title}.wav",
+            args.sr,
+            args.audio[int(start_time * args.sr) : int(end * args.sr)],
         )
 
         if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_ba_onsets.npy"):
@@ -394,7 +403,7 @@ def get_latents(selection, args):
                 drum_onsets = 2 * ar.onsets(drums, args.sr, track_frames, fmin=150, clip=90, smooth=3, power=1)
             else:
                 bas_onsets = ar.rms(bass, args.sr, track_frames, smooth=2, clip=95, power=1)
-                bas_onsets = th.cat([bas_onsets[int(FPS / 2) :], bas_onsets[: int(FPS / 2)]])
+                bas_onsets = torch.cat([bas_onsets[int(FPS / 2) :], bas_onsets[: int(FPS / 2)]])
                 drum_onsets = 2 * ar.onsets(drums, args.sr, track_frames, fmin=150, clip=90, smooth=3, power=1)
             if "Amnesia" in track["title"]:
                 bas_onsets *= 0.666
@@ -436,41 +445,33 @@ def get_latents(selection, args):
             np.save(f"workspace/{title.replace(' ','').lower()}_ba_onsets.npy", bas_onsets.numpy())
             np.save(f"workspace/{title.replace(' ','').lower()}_dr_onsets.npy", drum_onsets.numpy())
         else:
-            bas_onsets = th.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_ba_onsets.npy")).float()
-            drum_onsets = th.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_dr_onsets.npy")).float()
+            bas_onsets = torch.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_ba_onsets.npy")).float()
+            drum_onsets = torch.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_dr_onsets.npy")).float()
 
         track_info[track["id"]]["ba_onsets"] = bas_onsets.clone()
         track_info[track["id"]]["dr_onsets"] = drum_onsets.clone()
 
         if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_latents.npy"):
-            if track["uuid"] is None:
-                track_selection = ar.load_latents(latent)
-                if args.shuffle_latents:
-                    random_indices = random.sample(range(len(track_selection)), len(track_selection))
-                    track_selection = track_selection[random_indices]
-                np.save(
-                    f"workspace/{title.replace(' ','').lower()}_chroma_latents_{uuid}.npy", track_selection[:12],
-                )
-            else:
-                track_selection = ar.load_latents(
-                    f"workspace/{title.replace(' ','').lower()}_chroma_latents_{track['uuid']}.npy"
-                )
+            # if track["uuid"] is None:
+            #     track_selection = ar.load_latents(latent)
+            #     if args.shuffle_latents:
+            #         random_indices = random.sample(range(len(track_selection)), len(track_selection))
+            #         track_selection = track_selection[random_indices]
+            #     np.save(
+            #         f"workspace/{title.replace(' ','').lower()}_chroma_latents_{uuid}.npy",
+            #         track_selection[:12],
+            #     )
+            # else:
+            #     track_selection = ar.load_latents(
+            #         f"workspace/{title.replace(' ','').lower()}_chroma_latents_{track['uuid']}.npy"
+            #     )
+            track_selection = ar.generate_latents(n_latents=12, ckpt=args.ckpt, G_res=1024, noconst=True)
 
-            retry = 10
-            while 1:
-                try:
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore")
-                        chroma = ar.chroma(args.audio[start_frame : end_frame - trans], args.sr, track_frames - trans)
-                        chroma_latents = ar.chroma_weight_latents(chroma, track_selection[:12])
-                        latents = ar.gaussian_filter(chroma_latents, 4)
-                        break
-                except rosa.util.exceptions.ParameterError:
-                    print("rosa.util.exceptions.ParameterError: Audio buffer is not finite everywhere")
-                    print("trying again...")
-                    retry -= 1
-                    if retry == 0:
-                        raise Exception("ERROR: creating chroma latents failed 5 times.")
+            chroma = ar.chroma(
+                args.audio[int(start_time * args.sr) : int(end * args.sr)], args.sr, track_frames - trans
+            )
+            chroma_latents = ar.chroma_weight_latents(chroma, track_selection[:12])
+            latents = ar.gaussian_filter(chroma_latents, 4)
 
             # lo_onsets = low_onsets[: len(latents), None, None]
             # hi_onsets = high_onsets[: len(latents), None, None]
@@ -480,7 +481,7 @@ def get_latents(selection, args):
             for ons in ["dr", "ba"]:
                 # select random latent per 16 bars
                 phrase = []
-                if track["uuid"] is None:
+                if True:  # track["uuid"] is None:
                     indices = random.sample(range(len(track_selection)), num_phrases)
                     phrase_selection = track_selection[indices]
                     np.save(f"workspace/{title.replace(' ','').lower()}_{ons}_ons_latents_{uuid}.npy", phrase_selection)
@@ -492,38 +493,40 @@ def get_latents(selection, args):
                     )
                 for i in range(num_phrases):
                     phrase += [phrase_selection[[i]]] * phrase_frames
-                phrase = th.cat(phrase[: len(latents)])
+                phrase = torch.cat(phrase[: len(latents)])
                 phrase = ar.gaussian_filter(phrase, 8)
                 latents = eval(f"{ons}_onsets") * phrase + (1 - eval(f"{ons}_onsets")) * latents
 
-            np.save(f"workspace/{title.replace(' ','').lower()}_latents.npy", latents.numpy())
+            np.save(f"/home/hans/datasets/audio2latent/Wavefunk @ Donderslag II - {title}.npy", latents.numpy())
         else:
-            latents = th.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_latents.npy")).float()
+            latents = torch.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_latents.npy")).float()
         all_latents.append(latents)
 
-        if trans > 0:
-            if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy"):
-                num_latents = max(4, min(int(trans / 24 / 4), 12))  # ~ latent per 4 second
-                transition_latents = ar.spline_loops(interstitial[:num_latents], trans, 1, loop=False)
-                color_latents = th.cat(
-                    [
-                        track_selection[: int(math.floor(num_latents / 2))],
-                        ar.load_latents(next_track["latent"])[: int(math.ceil(num_latents / 2))],
-                    ]
-                )
-                transition_colors = ar.spline_loops(color_latents, trans, 1, loop=False)
-                colayr = 12
-                transition_latents[colayr:] = transition_colors[colayr:]
+        # if trans > 0:
+        #     if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy"):
+        #         num_latents = max(4, min(int(trans / 24 / 4), 12))  # ~ latent per 4 second
+        #         transition_latents = ar.spline_loops(interstitial[:num_latents], trans, 1, loop=False)
+        #         color_latents = torch.cat(
+        #             [
+        #                 track_selection[: int(math.floor(num_latents / 2))],
+        #                 ar.load_latents(next_track["latent"])[: int(math.ceil(num_latents / 2))],
+        #             ]
+        #         )
+        #         transition_colors = ar.spline_loops(color_latents, trans, 1, loop=False)
+        #         colayr = 12
+        #         transition_latents[colayr:] = transition_colors[colayr:]
 
-                np.save(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy", transition_latents.numpy())
-            else:
-                transition_latents = th.from_numpy(
-                    np.load(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy")
-                ).float()
-            all_latents.append(transition_latents)
-        print(f"latent length: {len(th.cat(all_latents))}")
+        #         np.save(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy", transition_latents.numpy())
+        #     else:
+        #         transition_latents = torch.from_numpy(
+        #             np.load(f"workspace/{title.replace(' ','').lower()}_transition_latents.npy")
+        #         ).float()
+        #     all_latents.append(transition_latents)
+        print(f"latent length: {len(torch.cat(all_latents))}")
 
-    all_latents = th.cat(all_latents).float()
+    exit(0)
+
+    all_latents = torch.cat(all_latents).float()
     all_latents = ar.gaussian_filter(all_latents, 3, causal=0.2)
 
     return all_latents[2:vid_frames]
@@ -562,9 +565,13 @@ def get_noise(height, width, scale, num_scales, args):
                 n = [5, 1, 64]
                 noise_factor = 1
 
-            noise_noisy = 9 * ar.gaussian_filter(th.randn((track_frames, 1, height, width), device="cuda"), n[0]).cpu()
-            noise_noiser = 4 * ar.gaussian_filter(th.randn((track_frames, 1, height, width), device="cuda"), n[1]).cpu()
-            noise = 27 * ar.gaussian_filter(th.randn((track_frames, 1, height, width), device="cuda"), n[2]).cpu()
+            noise_noisy = (
+                9 * ar.gaussian_filter(torch.randn((track_frames, 1, height, width), device="cuda"), n[0]).cpu()
+            )
+            noise_noiser = (
+                4 * ar.gaussian_filter(torch.randn((track_frames, 1, height, width), device="cuda"), n[1]).cpu()
+            )
+            noise = 27 * ar.gaussian_filter(torch.randn((track_frames, 1, height, width), device="cuda"), n[2]).cpu()
 
             if scale < 9:
                 noise = ba_onsets * noise_noisy + (1 - ba_onsets) * noise
@@ -577,11 +584,11 @@ def get_noise(height, width, scale, num_scales, args):
 
             np.save(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy", noise.numpy())
         else:
-            noise = th.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy")).float()
+            noise = torch.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy")).float()
 
         all_noise.append(ar.gaussian_filter(noise, 3, causal=0.2))
 
-    all_noise = th.cat(all_noise)
+    all_noise = torch.cat(all_noise)
 
     for track, next_track in zip(track_info[1:], track_info[2:]):
         title, start, end, latent, vibe = track["title"], track["start"], track["end"], track["latent"], track["vibe"]
@@ -604,14 +611,14 @@ def get_noise(height, width, scale, num_scales, args):
 
 
 def get_bends(args):
-    class Bigger0thLayer(th.nn.Module):
+    class Bigger0thLayer(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.noise = th.cuda.FloatTensor([])
+            self.noise = torch.cuda.FloatTensor([])
 
         def forward(self, x):
             if self.noise.shape[0] != x.shape[0]:
-                self.noise = th.cat([th.normal(x.mean(), x.std(), size=(1, x.shape[1], 4, 8))] * x.shape[0])
+                self.noise = torch.cat([torch.normal(x.mean(), x.std(), size=(1, x.shape[1], 4, 8))] * x.shape[0])
             return self.noise.to(x.device)
 
     bends = [{"layer": 0, "transform": Bigger0thLayer()}]
@@ -640,6 +647,42 @@ def get_truncation(args):
 
         trunc += [val] * track_frames
 
-    trunc = th.as_tensor(trunc).float()
+    trunc = torch.as_tensor(trunc).float()
     trunc = ar.gaussian_filter(trunc, 12)
     return trunc[2:vid_frames]
+
+
+if __name__ == "__main__":
+    generate(
+        "/home/hans/modelzoo/maua-sg2/alaeset-GPU1-files-1024-013000___.pt",
+        "/home/hans/datasets/donderslag/WAVEFUNK - TVGF DONDERSLAG II WORLDWIDE MIX.flac",
+        initialize=None,
+        get_latents=get_latents,
+        get_noise=get_noise,
+        get_bends=get_bends,
+        get_rewrites=None,
+        get_truncation=get_truncation,
+        output_dir="./workspace",
+        audioreactive_file="audioreactive/examples/default.py",
+        offset=0,
+        duration=-1,
+        latent_file=None,
+        shuffle_latents=False,
+        G_res=1024,
+        out_size=1024,
+        fps=30,
+        latent_count=12,
+        batch=8,
+        dataparallel=False,
+        truncation=1.0,
+        stylegan1=False,
+        noconst=False,
+        latent_dim=512,
+        n_mlp=8,
+        channel_multiplier=2,
+        randomize_noise=False,
+        ffmpeg_preset="slow",
+        base_res_factor=1,
+        output_file=None,
+        args=None,
+    )
