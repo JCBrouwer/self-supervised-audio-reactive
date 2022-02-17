@@ -485,7 +485,7 @@ class Audio2Latent(torch.nn.Module):
         )
 
         assert n_outputs % n_layerwise == 0, f"n_outputs must be divisible by n_layerwise! {n_outputs} / {n_layerwise}"
-        if layerwise == "mlp":
+        if layerwise == "dense":
             self.layerwise = torch.nn.ModuleList(
                 [
                     torch.nn.Sequential(
@@ -532,9 +532,9 @@ if __name__ == "__main__":
     n_frames = int(DUR * FPS)
     batch_size = 16
 
-    backbone = "fairseq"
-    layerwise = "conv"
-    n_layerwise = 6
+    backbone = "gru"
+    layerwise = "dense"
+    n_layerwise = 18
     hidden_size = 32
     num_layers = 8
     dropout = 0.2

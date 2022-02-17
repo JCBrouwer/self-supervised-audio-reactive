@@ -45,6 +45,7 @@ if __name__ == "__main__":
         else:
             out_file = f"plots/latent-residuals-distribution-{Path(args.audio).stem}-{Path(os.path.dirname(args.ckpt)).stem}-{Path(args.ckpt).stem}.png"
             if not os.path.exists(out_file):
+                print("latent residual distribution for ", Path(os.path.dirname(args.ckpt)).stem, Path(args.ckpt).stem)
                 a2l = joblib.load(args.ckpt)["a2l"].eval().to(device)
 
                 # for block in a2l.backbone.modules():
