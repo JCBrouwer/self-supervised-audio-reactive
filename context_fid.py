@@ -41,39 +41,38 @@ if __name__ == "__main__":
     XO = np.load("cache/audio2latent_preprocessed_train_lats_offsets.npy", mmap_mode="r")
     B, T, N, L = X.shape
 
-    ipca_batch = 8
-    n_components = 64
-    pca = decomposition.IncrementalPCA(n_components=n_components)
-    index_batches = np.split(np.random.permutation(range(len(X))), len(X) // ipca_batch)
-    for idxs in tqdm(index_batches, unit_scale=ipca_batch):
-        batch = (X[idxs] - XO[idxs, None, None]).astype(np.float32)
-        batch = batch.reshape(ipca_batch * T, N * L)
-        pca.partial_fit(batch)
-
-    train = []
-    for i in tqdm(range(0, X.shape[0], ipca_batch)):
-        batch = (X[i : i + ipca_batch] - XO[i : i + ipca_batch]).astype(np.float32)
-        batch = batch.reshape(ipca_batch * T, N * L)
-        batch = pca.transform(batch)
-        batch = batch.reshape(ipca_batch, T, n_components)
-        batch = batch.transpose(0, 2, 1)
-        train.append(batch)
-    train = np.concatenate(train)
+    # ipca_batch = 8
+    # n_components = 64
+    # pca = decomposition.IncrementalPCA(n_components=n_components)
+    # index_batches = np.split(np.random.permutation(range(len(X))), len(X) // ipca_batch)
+    # for idxs in tqdm(index_batches, unit_scale=ipca_batch):
+    #     batch = (X[idxs] - XO[idxs, None, None]).astype(np.float32)
+    #     batch = batch.reshape(ipca_batch * T, N * L)
+    #     pca.partial_fit(batch)
+    # train = []
+    # for i in tqdm(range(0, X.shape[0], ipca_batch)):
+    #     batch = (X[i : i + ipca_batch] - XO[i : i + ipca_batch]).astype(np.float32)
+    #     batch = batch.reshape(ipca_batch * T, N * L)
+    #     batch = pca.transform(batch)
+    #     batch = batch.reshape(ipca_batch, T, n_components)
+    #     batch = batch.transpose(0, 2, 1)
+    #     train.append(batch)
+    # train = np.concatenate(train)
 
     encoder = CausalCNNEncoderClassifier(
-        compared_length=48,
+        compared_length=96,
         nb_random_samples=10,
-        batch_size=64,
-        nb_steps=2000,
-        in_channels=n_components,
+        batch_size=16,
+        nb_steps=200,
+        in_channels=N * L,
         channels=128,
         out_channels=64,
         reduced_size=32,
         depth=10,
         cuda=True,
     )
-    encoder.fit_encoder(train, verbose=True)
-    joblib.dump((pca, encoder), "cache/encoder.pt", compress=9)
+    encoder.fit_encoder(X, XO, verbose=True)
+    joblib.dump(encoder, "cache/encoder.pt", compress=9)
 
     # compared_length=50,
     # nb_random_samples=10,

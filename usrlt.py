@@ -60,14 +60,17 @@ class Dataset(torch.utils.data.Dataset):
     @param dataset Numpy array representing the dataset.
     """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, offset):
         self.dataset = dataset
+        self.offset = offset
 
     def __len__(self):
         return numpy.shape(self.dataset)[0]
 
     def __getitem__(self, index):
-        return self.dataset[index]
+        sample = numpy.copy(self.dataset[index]) - self.offset[index]
+        T, N, L = sample.shape
+        return torch.from_numpy(sample.reshape(T, N * L).transpose().astype(numpy.float32))
 
 
 class LabelledDataset(torch.utils.data.Dataset):
@@ -117,7 +120,7 @@ class TripletLoss(torch.nn.modules.loss._Loss):
         self.nb_random_samples = nb_random_samples
         self.negative_penalty = negative_penalty
 
-    def forward(self, batch, encoder, train, save_memory=False):
+    def forward(self, batch, encoder, train, offset, save_memory=False):
         batch_size = batch.shape[0]
         train_size = train.shape[0]
         length = min(self.compared_length, train.shape[2])
@@ -195,9 +198,18 @@ class TripletLoss(torch.nn.modules.loss._Loss):
             negative_representation = encoder(
                 torch.cat(
                     [
-                        train[samples[i, j] : samples[i, j] + 1][
-                            :, :, beginning_samples_neg[i, j] : beginning_samples_neg[i, j] + length_pos_neg
-                        ].to(loss.device)
+                        torch.from_numpy(
+                            (
+                                train[samples[i, j] : samples[i, j] + 1][
+                                    :, beginning_samples_neg[i, j] : beginning_samples_neg[i, j] + length_pos_neg, :, :
+                                ]
+                                - offset[samples[i, j] : samples[i, j] + 1, None, None]
+                            )
+                            .copy()
+                            .astype(numpy.float32)
+                            .reshape(1, length_pos_neg, -1)
+                            .transpose(0, 2, 1)
+                        ).to(loss.device)
                         for j in range(batch_size)
                     ]
                 )
@@ -251,7 +263,7 @@ class TripletLossVaryingLength(torch.nn.modules.loss._Loss):
         self.nb_random_samples = nb_random_samples
         self.negative_penalty = negative_penalty
 
-    def forward(self, batch, encoder, train, save_memory=False):
+    def forward(self, batch, encoder, train, offset, save_memory=False):
         batch_size = batch.shape[0]
         train_size = train.shape[0]
         max_length = train.shape[2]
@@ -349,11 +361,21 @@ class TripletLossVaryingLength(torch.nn.modules.loss._Loss):
             negative_representation = torch.cat(
                 [
                     encoder(
-                        train[samples[i, j] : samples[i, j] + 1][
-                            :,
-                            :,
-                            beginning_samples_neg[i, j] : beginning_samples_neg[i, j] + lengths_neg[i, j],
-                        ].to(loss.device)
+                        torch.from_numpy(
+                            (
+                                train[samples[i, j] : samples[i, j] + 1][
+                                    :,
+                                    beginning_samples_neg[i, j] : beginning_samples_neg[i, j] + lengths_neg[i, j],
+                                    :,
+                                    :,
+                                ]
+                                - offset[samples[i, j] : samples[i, j] + 1, None, None]
+                            )
+                            .copy()
+                            .astype(numpy.float32)
+                            .reshape(1, lengths_neg[i, j], -1)
+                            .transpose(0, 2, 1)
+                        ).to(loss.device)
                     )
                     for j in range(batch_size)
                 ]
@@ -541,7 +563,7 @@ class TimeSeriesEncoderClassifier(sklearn.base.BaseEstimator, sklearn.base.Class
             self.classifier = grid_search.best_estimator_
             return self.classifier
 
-    def fit_encoder(self, X, y=None, save_memory=False, verbose=False):
+    def fit_encoder(self, X, XO, y=None, save_memory=False, verbose=False):
         """Trains the encoder unsupervisedly using the given training data.
 
         @param X Training set.
@@ -557,14 +579,12 @@ class TimeSeriesEncoderClassifier(sklearn.base.BaseEstimator, sklearn.base.Class
         varying = bool(numpy.isnan(numpy.sum(X)))
         print("varying", varying)
 
-        train = torch.from_numpy(X).float()
-
         if y is not None:
             nb_classes = numpy.shape(numpy.unique(y, return_counts=True)[1])[0]
             train_size = numpy.shape(X)[0]
             ratio = train_size // nb_classes
 
-        train_torch_dataset = Dataset(train)
+        train_torch_dataset = Dataset(X, XO)
         train_generator = torch.utils.data.DataLoader(train_torch_dataset, batch_size=self.batch_size, shuffle=True)
 
         max_score = 0
@@ -587,9 +607,9 @@ class TimeSeriesEncoderClassifier(sklearn.base.BaseEstimator, sklearn.base.Class
                     batch = batch.cuda(self.gpu)
                 self.optimizer.zero_grad()
                 if not varying:
-                    loss = self.loss(batch, self.encoder, train, save_memory=save_memory)
+                    loss = self.loss(batch, self.encoder, X, XO, save_memory=save_memory)
                 else:
-                    loss = self.loss_varying(batch, self.encoder, train, save_memory=save_memory)
+                    loss = self.loss_varying(batch, self.encoder, X, XO, save_memory=save_memory)
                 loss.backward()
                 self.optimizer.step()
                 if verbose:
@@ -962,7 +982,9 @@ class CausalCNNEncoderClassifier(TimeSeriesEncoderClassifier):
         varying = bool(numpy.isnan(numpy.sum(X)))
 
         test = Dataset(X)
-        test_generator = torch.utils.data.DataLoader(test, batch_size=batch_size if not varying else 1)
+        test_generator = torch.utils.data.DataLoader(
+            test, batch_size=batch_size if not varying else 1, num_workers=batch_size
+        )
         length = numpy.shape(X)[2]
         features = numpy.full((numpy.shape(X)[0], self.out_channels, length), numpy.nan)
         self.encoder = self.encoder.eval()

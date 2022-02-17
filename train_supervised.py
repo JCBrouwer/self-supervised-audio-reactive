@@ -1,3 +1,4 @@
+import argparse
 import gc
 import os
 import shutil
@@ -16,7 +17,7 @@ from better_lstm import LSTM
 from fairseq.modules import ConvTBC as _ConvTBC
 from fairseq.modules import FairseqDropout, LinearizedConvolution
 from npy_append_array import NpyAppendArray as NumpyArray
-from scipy import signal
+from scipy import signal, stats
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -417,7 +418,17 @@ class Print(torch.nn.Module):
 
 class Audio2Latent(torch.nn.Module):
     def __init__(
-        self, backbone, layerwise, input_size, hidden_size, num_layers, dropout, n_outputs, n_layerwise, output_size
+        self,
+        backbone,
+        skip_backbone,
+        layerwise,
+        input_size,
+        hidden_size,
+        num_layers,
+        dropout,
+        n_outputs,
+        n_layerwise,
+        output_size,
     ) -> None:
         super().__init__()
         if backbone.lower() == "gru":
@@ -475,21 +486,26 @@ class Audio2Latent(torch.nn.Module):
 
         self.relu = torch.nn.LeakyReLU(0.2)
 
-        self.backbone_skip = torch.nn.Sequential(
-            torch.nn.Linear(input_size, hidden_size),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Linear(hidden_size, hidden_size // 2),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Linear(hidden_size // 2, hidden_size // 2),
-            torch.nn.LeakyReLU(0.2),
-        )
+        if skip_backbone:
+            self.backbone_skip = torch.nn.Sequential(
+                torch.nn.Linear(input_size, hidden_size),
+                torch.nn.LeakyReLU(0.2),
+                torch.nn.Linear(hidden_size, hidden_size // 2),
+                torch.nn.LeakyReLU(0.2),
+                torch.nn.Linear(hidden_size // 2, hidden_size // 2),
+                torch.nn.LeakyReLU(0.2),
+            )
+        else:
+            self.backbone_skip = None
 
         assert n_outputs % n_layerwise == 0, f"n_outputs must be divisible by n_layerwise! {n_outputs} / {n_layerwise}"
+        layerwise_size = hidden_size + (hidden_size // 2 if skip_backbone else 0)
+
         if layerwise == "dense":
             self.layerwise = torch.nn.ModuleList(
                 [
                     torch.nn.Sequential(
-                        torch.nn.Linear(hidden_size + hidden_size // 2, hidden_size * 2),
+                        torch.nn.Linear(layerwise_size, hidden_size * 2),
                         torch.nn.LeakyReLU(0.2),
                         torch.nn.Linear(hidden_size * 2, output_size),
                         UnsqueezeLayerwise(n_outputs // n_layerwise),
@@ -503,7 +519,7 @@ class Audio2Latent(torch.nn.Module):
                 [
                     torch.nn.Sequential(
                         SwapChannels(),
-                        torch.nn.Conv1d(hidden_size + hidden_size // 2, hidden_size * 2, 5, 1, 2),
+                        torch.nn.Conv1d(layerwise_size, hidden_size * 2, 5, 1, 2),
                         torch.nn.LeakyReLU(0.2),
                         torch.nn.Conv1d(hidden_size * 2, output_size, 5, 1, 2),
                         SwapChannels(),
@@ -519,43 +535,56 @@ class Audio2Latent(torch.nn.Module):
     def forward(self, x):
         w, _ = self.backbone(x)
         w = w[:, : x.shape[1]]  # remove padding
-        wx = torch.cat((self.relu(w), self.backbone_skip(x)), axis=2)
+        if self.backbone_skip is not None:
+            wx = torch.cat((self.relu(w), self.backbone_skip(x)), axis=2)
+        else:
+            wx = self.relu(w)
         w_plus = torch.cat([layerwise(wx) for layerwise in self.layerwise], axis=2)
         return w_plus
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backbone", type=str, default="conv", choices=["gru", "lstm", "conv", "fairseq"])
+    parser.add_argument("--skip_backbone", action="store_true")
+    parser.add_argument("--layerwise", type=str, default="conv", choices=["dense", "conv"])
+    parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
+    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--wd", type=float, default=0)
+    parser.add_argument("--batch_size", type=int, default=16)
+    args = parser.parse_args()
+
     in_dir = "/home/hans/datasets/audio2latent/"
     out_file = f"cache/{Path(in_dir).stem}_preprocessed.npy"
     test_audio = "/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac"
 
     n_frames = int(DUR * FPS)
-    batch_size = 16
+    batch_size = args.batch_size
 
-    backbone = "gru"
-    layerwise = "dense"
-    n_layerwise = 18
-    hidden_size = 32
-    num_layers = 8
-    dropout = 0.2
+    backbone = args.backbone
+    skip_backbone = args.skip_backbone
+    layerwise = args.layerwise
+    n_layerwise = args.n_layerwise
+    hidden_size = args.hidden_size
+    num_layers = args.num_layers
+    dropout = args.dropout
 
-    lr = 1e-4
-    wd = 0
+    lr = args.lr
+    wd = args.wd
 
-    name = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else "_".join(
-            [
-                f"backbone:{backbone}",
-                f"layerwise:{layerwise}:{n_layerwise}",
-                f"hidden_size:{hidden_size}",
-                f"num_layers:{num_layers}",
-                f"dropout:{dropout}",
-                f"lr:{lr}",
-                f"wd:{wd}",
-            ]
-        )
+    name = "_".join(
+        [
+            f"backbone:{backbone}:skip{skip_backbone}",
+            f"layerwise:{layerwise}:{n_layerwise}",
+            f"hidden_size:{hidden_size}",
+            f"num_layers:{num_layers}",
+            f"dropout:{dropout}",
+            f"lr:{lr}",
+            f"wd:{wd}",
+        ]
     )
 
     preprocess_audio(in_dir, out_file)
@@ -570,6 +599,7 @@ if __name__ == "__main__":
 
     a2l = Audio2Latent(
         backbone=backbone,
+        skip_backbone=skip_backbone,
         layerwise=layerwise,
         n_layerwise=n_layerwise,
         input_size=feature_dim,
@@ -613,26 +643,33 @@ if __name__ == "__main__":
 
         if (epoch + 1) % eval_interval == 0 or (epoch + 1) == n_epochs:
             with torch.inference_mode():
+                a2l.eval()
                 if len(val_dataset) > 0:
-                    a2l.eval()
                     val_dataloader = DataLoader(
                         val_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True
                     )
-                    val_loss = 0
+                    val_loss, latent_residuals = 0, []
                     for inputs, targets in val_dataloader:
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = a2l(inputs)
+                        latent_residuals.append(outputs.cpu().numpy())
                         val_loss += torch.nn.functional.mse_loss(outputs, targets)
                     val_loss /= len(val_dataloader)
+                    latent_residuals = np.concatenate(latent_residuals)
+                    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
+
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
+                    writer.add_scalar("Loss/val_laplace_b", scale.item(), n_iter)
+
                     a2l.train()
                 else:
-                    val_loss = -1
+                    val_loss, scale = -1, -1
 
             pbar.write("")
             pbar.write(f"epoch {epoch+1}")
             pbar.write(f"train_loss: {train_loss:.4f}")
             pbar.write(f"val_loss  : {val_loss:.4f}")
+            pbar.write(f"laplace_b : {scale:.4f}")
             pbar.write("")
 
         if (epoch + 1) % video_interval == 0 or (epoch + 1) == n_epochs:
