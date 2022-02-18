@@ -1,3 +1,5 @@
+# fmt:off
+
 import argparse
 import gc
 import os
@@ -13,14 +15,20 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchdatasets as td
-import torchvision as tv
 from better_lstm import LSTM
-from fairseq.modules import ConvTBC, FairseqDropout, LinearizedConvolution
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
+from torch.nn import (GRU, Conv1d, Dropout, LazyConv1d, LazyConvTranspose1d,
+                      LeakyReLU, Linear, Module, ModuleList, Parameter,
+                      Sequential, Sigmoid)
+from torch.nn.modules.pooling import AvgPool1d
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from torchqrnn import QRNN
 from tqdm import tqdm
+from x_transformers.x_transformers import AttentionLayers
+
+# fmt:on
 
 sys.path.append("/home/hans/code/maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
@@ -71,7 +79,7 @@ def latent_residual_hist():
     plt.legend()
     plt.xlim(-2, 2)
     plt.tight_layout()
-    plt.savefig(f"plots/latent-residuals-distribution-true-{Path(out_file).stem}.png")
+    plt.savefig(f"plots/latent-residuals-distribution-true-{Path(dataset_cache).stem}.png")
 
 
 @torch.inference_mode()
@@ -235,15 +243,15 @@ def print_data_summary(train, val):
 def print_model_summary(model):
     print()
     print("model summary:")
-    print("name".ljust(25), "shape".ljust(25), "num".ljust(25))
+    print("name".ljust(50), "shape".ljust(25), "num".ljust(25))
     print("-" * 70)
     total = 0
     for name, param in model.named_parameters():
         num = param.numel()
         total += num
-        print(name.ljust(25), f"{tuple(param.shape)}".ljust(25), f"{num}".ljust(25))
-    print("-" * 70)
-    print("total".ljust(25), f"".ljust(25), f"{total/1e6:.2f} M".ljust(25))
+        print(name.ljust(50), f"{tuple(param.shape)}".ljust(25), f"{num}".ljust(25))
+    print("-" * 90)
+    print("total".ljust(50), f"".ljust(25), f"{total/1e6:.2f} M".ljust(25))
     print()
 
 
@@ -274,113 +282,7 @@ class AudioLatentDataset(td.Dataset):
         return torch.from_numpy(self.features[index].copy()), torch.from_numpy(residuals.copy())
 
 
-def Linear(in_features, out_features, dropout=0.0):
-    """Weight-normalized Linear layer (input: N x T x C)"""
-    m = torch.nn.Linear(in_features, out_features)
-    torch.nn.init.normal_(m.weight, mean=0, std=np.sqrt((1 - dropout) / in_features))
-    torch.nn.init.constant_(m.bias, 0)
-    return torch.nn.utils.weight_norm(m)
-
-
-def LinearizedConv1d(in_channels, out_channels, kernel_size, dropout=0.0, **kwargs):
-    """Weight-normalized Conv1d layer optimized for decoding"""
-    m = LinearizedConvolution(in_channels, out_channels, kernel_size, **kwargs)
-    std = np.sqrt((4 * (1.0 - dropout)) / (m.kernel_size[0] * in_channels))
-    torch.nn.init.normal_(m.weight, mean=0, std=std)
-    torch.nn.init.constant_(m.bias, 0)
-    return torch.nn.utils.weight_norm(m, dim=2)
-
-
-def WNConvTBC(in_channels, out_channels, kernel_size, dropout=0.0, **kwargs):
-    """Weight-normalized Conv1d layer"""
-    m = ConvTBC(in_channels, out_channels, kernel_size, **kwargs)
-    std = np.sqrt((4 * (1.0 - dropout)) / (m.kernel_size[0] * in_channels))
-    torch.nn.init.normal_(m.weight, mean=0, std=std)
-    torch.nn.init.constant_(m.bias, 0)
-    return torch.nn.utils.weight_norm(m, dim=2)
-
-
-class FairseqConvEncoder(torch.nn.Module):
-    def __init__(self, input_size, hidden_size, conv_channels=512, kernel_size=3, num_layers=20, dropout=0.1):
-        super().__init__()
-        self.dropout_module = FairseqDropout(dropout, module_name=self.__class__.__name__)
-        self.num_attention_layers = None
-
-        convolutions = ((conv_channels, kernel_size, 1),) * num_layers
-
-        in_channels = convolutions[0][0]
-        self.fc0 = Linear(input_size, hidden_size, dropout=dropout)
-        self.fc1 = Linear(hidden_size, in_channels, dropout=dropout)
-        self.projections = torch.nn.ModuleList()
-        self.convolutions = torch.nn.ModuleList()
-        self.residuals = []
-
-        layer_in_channels = [in_channels]
-        for _, (out_channels, kernel_size, residual) in enumerate(convolutions):
-            if residual == 0:
-                residual_dim = out_channels
-            else:
-                residual_dim = layer_in_channels[-residual]
-            self.projections.append(Linear(residual_dim, out_channels) if residual_dim != out_channels else None)
-            if kernel_size % 2 == 1:
-                padding = kernel_size // 2
-            else:
-                padding = 0
-            self.convolutions.append(
-                WNConvTBC(
-                    in_channels,
-                    out_channels * 2,
-                    kernel_size,
-                    dropout=dropout,
-                    padding=padding,
-                )
-            )
-            self.residuals.append(residual)
-            in_channels = out_channels
-            layer_in_channels.append(out_channels)
-        self.fc2 = Linear(in_channels, hidden_size)
-
-    def forward(self, x):
-        x = self.fc0(x)
-        x = self.dropout_module(x)
-        x = self.fc1(x)
-
-        x = x.transpose(0, 1)  # B x T x C -> T x B x C
-
-        residuals = [x]
-        # temporal convolutions
-        for proj, conv, res_layer in zip(self.projections, self.convolutions, self.residuals):
-            if res_layer > 0:
-                residual = residuals[-res_layer]
-                residual = residual if proj is None else proj(residual)
-            else:
-                residual = None
-
-            x = self.dropout_module(x)
-            if conv.kernel_size[0] % 2 == 1:
-                # padding is implicit in the conv
-                x = conv(x)
-            else:
-                padding_l = (conv.kernel_size[0] - 1) // 2
-                padding_r = conv.kernel_size[0] // 2
-                x = F.pad(x, (0, 0, 0, 0, padding_l, padding_r))
-                x = conv(x)
-            x = F.glu(x, dim=2)
-
-            if residual is not None:
-                x = (x + residual) * np.sqrt(0.5)
-            residuals.append(x)
-
-        # T x B x C -> B x T x C
-        x = x.transpose(1, 0)
-
-        # project back to size of embedding
-        x = self.fc2(x)
-
-        return x, None
-
-
-class Normalize(torch.nn.Module):
+class Normalize(Module):
     def __init__(self, mean, std):
         super().__init__()
         self.register_buffer("mean", torch.FloatTensor(mean))
@@ -390,7 +292,7 @@ class Normalize(torch.nn.Module):
         return (x - self.mean) / self.std
 
 
-class MaybePad(torch.nn.Module):
+class MaybePad(Module):
     def __init__(self, l):
         super().__init__()
         self.l = l
@@ -398,36 +300,41 @@ class MaybePad(torch.nn.Module):
     def forward(self, x):
         remainder = x.shape[1] % (2 ** self.l)
         if remainder != 0:
-            x = torch.nn.functional.pad(x, (0, 0, 0, remainder))
+            x = F.pad(x, (0, 0, 0, remainder))
         return x
 
 
-class SwapChannels(torch.nn.Module):
+class SwapChannels(Module):
     def forward(self, x):
-        return x.transpose(1, 2)
+        return x.transpose(1, 2)  # B, T, C <---> B, C, T
 
 
-class DummyHiddenState(torch.nn.Module):
+class SwapBatch(Module):
     def forward(self, x):
-        return x, None
+        return x.transpose(0, 1)  # B, T, C <---> T, B, C
 
 
-class UnsqueezeLayerwise(torch.nn.Module):
-    def __init__(self, n) -> None:
+class DummyHiddenState(Module):
+    def forward(self, x):
+        return x, 0
+
+
+class UnsqueezeLayerwise(Module):
+    def __init__(self, n):
         super().__init__()
         self.n = n
 
-    def forward(self, x):
-        return x.unsqueeze(2).repeat(1, 1, self.n, 1)
+    def forward(self, x, *args):
+        return x.unsqueeze(2).repeat(1, 1, self.n, 1), *args
 
 
-class Print(torch.nn.Module):
+class Print(Module):
     def forward(self, x):
         print(x.shape)
         return x
 
 
-class Audio2Latent(torch.nn.Module):
+class Audio2Latent(Module):
     def __init__(
         self,
         input_mean,
@@ -442,12 +349,12 @@ class Audio2Latent(torch.nn.Module):
         layerwise,
         n_layerwise,
         dropout,
-    ) -> None:
+    ):
         super().__init__()
         self.normalize = Normalize(input_mean, input_std)
 
         if backbone.lower() == "gru":
-            self.backbone = torch.nn.GRU(
+            self.backbone = GRU(
                 input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, batch_first=True
             )
             self.backbone.flatten_parameters()
@@ -467,18 +374,14 @@ class Audio2Latent(torch.nn.Module):
         elif backbone.lower() == "conv":
 
             def ConvBlock(out_c, transpose, k=5, s=2, p=2, op=1):
-                return torch.nn.Sequential(
-                    (
-                        torch.nn.LazyConvTranspose1d(out_c, k, s, p, op)
-                        if transpose
-                        else torch.nn.LazyConv1d(out_c, k, s, p)
-                    ),
-                    torch.nn.LeakyReLU(0.2),
-                    torch.nn.Dropout(dropout),
+                return Sequential(
+                    (LazyConvTranspose1d(out_c, k, s, p, op) if transpose else LazyConv1d(out_c, k, s, p)),
+                    LeakyReLU(0.2),
+                    Dropout(dropout),
                 )
 
             multiplier = lambda x: 2 ** min(x, num_layers - x - 1)
-            self.backbone = torch.nn.Sequential(
+            self.backbone = Sequential(
                 MaybePad(num_layers // 2),
                 SwapChannels(),
                 *[ConvBlock(hidden_size * multiplier(n), transpose=n >= num_layers // 2) for n in range(num_layers)],
@@ -486,29 +389,19 @@ class Audio2Latent(torch.nn.Module):
                 DummyHiddenState(),
             )
 
-        elif backbone.lower() == "fairseq":
-            self.backbone = FairseqConvEncoder(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                dropout=dropout,
-                conv_channels=256,
-                kernel_size=3,
-            )
-
         else:
             raise NotImplementedError()
 
-        self.relu = torch.nn.LeakyReLU(0.2)
+        self.relu = LeakyReLU(0.2)
 
         if skip_backbone:
-            self.backbone_skip = torch.nn.Sequential(
-                torch.nn.Linear(input_size, hidden_size),
-                torch.nn.LeakyReLU(0.2),
-                torch.nn.Linear(hidden_size, hidden_size // 2),
-                torch.nn.LeakyReLU(0.2),
-                torch.nn.Linear(hidden_size // 2, hidden_size // 2),
-                torch.nn.LeakyReLU(0.2),
+            self.backbone_skip = Sequential(
+                Linear(input_size, hidden_size),
+                LeakyReLU(0.2),
+                Linear(hidden_size, hidden_size // 2),
+                LeakyReLU(0.2),
+                Linear(hidden_size // 2, hidden_size // 2),
+                LeakyReLU(0.2),
             )
         else:
             self.backbone_skip = None
@@ -517,12 +410,12 @@ class Audio2Latent(torch.nn.Module):
         layerwise_size = hidden_size + (hidden_size // 2 if skip_backbone else 0)
 
         if layerwise == "dense":
-            self.layerwise = torch.nn.ModuleList(
+            self.layerwise = ModuleList(
                 [
-                    torch.nn.Sequential(
-                        torch.nn.Linear(layerwise_size, hidden_size * 2),
-                        torch.nn.LeakyReLU(0.2),
-                        torch.nn.Linear(hidden_size * 2, output_size),
+                    Sequential(
+                        Linear(layerwise_size, hidden_size * 2),
+                        LeakyReLU(0.2),
+                        Linear(hidden_size * 2, output_size),
                         UnsqueezeLayerwise(n_outputs // n_layerwise),
                     )
                     for _ in range(n_layerwise)
@@ -530,13 +423,13 @@ class Audio2Latent(torch.nn.Module):
             )
 
         elif layerwise == "conv":
-            self.layerwise = torch.nn.ModuleList(
+            self.layerwise = ModuleList(
                 [
-                    torch.nn.Sequential(
+                    Sequential(
                         SwapChannels(),
-                        torch.nn.Conv1d(layerwise_size, hidden_size * 2, 5, 1, 2),
-                        torch.nn.LeakyReLU(0.2),
-                        torch.nn.Conv1d(hidden_size * 2, output_size, 5, 1, 2),
+                        Conv1d(layerwise_size, hidden_size * 2, 5, 1, 2),
+                        LeakyReLU(0.2),
+                        Conv1d(hidden_size * 2, output_size, 5, 1, 2),
                         SwapChannels(),
                         UnsqueezeLayerwise(n_outputs // n_layerwise),
                     )
@@ -558,11 +451,282 @@ class Audio2Latent(torch.nn.Module):
         return w_plus
 
 
+class Pool(Module):
+    """Average pooling to halve length along 0th (time) axis"""
+
+    def __init__(self, kernel_size) -> None:
+        super().__init__()
+        self.pool = AvgPool1d(kernel_size=kernel_size, stride=2, padding=(kernel_size - 1) // 2)
+
+    def forward(self, x):
+        return self.pool(x.permute(1, 2, 0)).permute(2, 0, 1)  # TODO find a way without permutes?
+
+
+class Unpool(Module):
+    """Linear interpolation to double length along 0th (time) axis"""
+
+    def forward(self, y):
+        T, B, C = y.shape
+        x = torch.linspace(0, 1, T, device=y.device, dtype=y.dtype)
+        xq = torch.linspace(0, 1, T * 2, device=y.device, dtype=y.dtype)
+        idxr = torch.searchsorted(x, xq, right=False)  # (Tq)
+        idxr = torch.clamp(idxr, 1, T - 1)
+        idxl = idxr - 1  # (Tq) from [0 to T-2]
+        yl = y[:-1]  # (T-1, B, C)
+        xl = x[:-1]  # (T-1)
+        dy = y[1:] - yl  # (T-1, B, C)
+        dx = x[1:] - xl  # (T-1)
+        t = (xq - xl[idxl]) / dx[idxl]  # (Tq)
+        yq = dy[idxl] * t[:, None, None]  # (Tq, B, C)
+        yq += yl[idxl]
+        return yq
+
+
+class ConvTBC(Module):
+    """1D convolution over an input of shape (time x batch x channel)"""
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=True):
+        super(ConvTBC, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+
+        self.weight = Parameter(torch.Tensor(self.kernel_size[0], in_channels, out_channels))
+        self.bias = Parameter(torch.Tensor(out_channels)) if bias else None
+
+    def forward(self, input):
+        return torch.conv_tbc(input.contiguous(), self.weight, self.bias, self.padding[0])
+
+
+class EfficientChannelAttention(Module):
+    def __init__(self, kernel_size=5):
+        super(EfficientChannelAttention, self).__init__()
+        self.conv = ConvTBC(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2)
+        self.sigmoid = Sigmoid()
+
+    def forward(self, x):
+        y = torch.mean(x, dim=0, keepdim=True)
+        y = self.conv(y.transpose(0, 2)).transpose(0, 2)  # conv over channels
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
+class ConvolutionalBlockAttention(Module):
+    def __init__(self, in_channels, out_channels, ratio=8):
+        super(ConvolutionalBlockAttention, self).__init__()
+        self.linear = Linear(in_channels, out_channels)
+        self.fc = Sequential(
+            ConvTBC(in_channels, in_channels // ratio, 1, bias=False),
+            LeakyReLU(0.2),
+            ConvTBC(in_channels // ratio, out_channels, 1, bias=False),
+        )
+        self.sigmoid = Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(torch.mean(x, dim=0, keepdim=True))
+        max_out = self.fc(torch.max(x, dim=0, keepdim=True).values)
+        return self.linear(x) * self.sigmoid(avg_out + max_out).expand_as(x)
+
+
+class TransformerLayer(AttentionLayers):
+    def __init__(self, in_channels, dropout):
+        super(AttentionLayers, self).__init__(in_channels, depth=1, dropout=dropout, rotary_pos_emb=True)
+
+
+class ContextAndCorrelationLayer(Module):
+    def __init__(self, context, correlation, in_channels, out_channels, kernel_size, dropout, additive=False):
+        super().__init__()
+        self.additive = additive
+        out_channels = out_channels if additive else out_channels // 2
+
+        if context == "gru":
+            self.context = GRU(in_channels, out_channels)  # TODO dropout?
+        elif context == "lstm":
+            self.context = LSTM(in_channels, out_channels, dropouti=dropout, dropoutw=dropout, dropouto=dropout)
+        elif context == "qrnn":
+            self.context = QRNN(in_channels, out_channels, dropout=dropout)
+        elif context == "conv":
+            self.context = Sequential(
+                ConvTBC(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2),
+                Dropout(dropout),
+                DummyHiddenState(),
+            )
+        elif context == "transformer":
+            self.context = torch.nn.Sequential(TransformerLayer(in_channels, dropout=dropout), DummyHiddenState())
+        else:
+            raise NotImplementedError()
+
+        if correlation == "linear":
+            self.correlation = Sequential(Linear(in_channels, out_channels), Dropout(dropout))
+        elif correlation == "eca":
+            self.correlation = Sequential(
+                EfficientChannelAttention(kernel_size),
+                Linear(in_channels, out_channels),
+                Dropout(dropout),
+            )
+        elif correlation == "cba":
+            self.correlation = Sequential(ConvolutionalBlockAttention(in_channels, out_channels), Dropout(dropout))
+        else:
+            raise NotImplementedError()
+
+        self.activation = LeakyReLU(0.2)
+
+    def forward(self, x, h):
+        context, h = self.context(x, h)
+        correlation = self.correlation(x)
+        if self.additive:
+            return self.activation(context + correlation), h
+        else:
+            return self.activation(torch.cat((context, correlation), dim=2)), h
+
+
+class ContextAndCorrelationLayers(Module):
+    def __init__(self, num_layers, context, correlation, in_channels, out_channels, kernel_size, dropout):
+        super().__init__()
+        self.layers = ModuleList(
+            [
+                ContextAndCorrelationLayer(
+                    context=context,
+                    correlation=correlation,
+                    in_channels=in_channels * 2 ** n,
+                    out_channels=in_channels * 2 ** (n + 1),
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    additive=True,
+                )
+                for n in range(num_layers - 1)
+            ]
+            + [
+                ContextAndCorrelationLayer(
+                    context=context,
+                    correlation=correlation,
+                    in_channels=in_channels * 2 ** (num_layers - 1),
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dropout=0,
+                    additive=True,
+                )
+            ]
+        )
+
+        dense_hidden = []
+        prev_channels = in_channels // 2
+        for n in range(num_layers):
+            dense_hidden.append(Linear(prev_channels, in_channels * 2 ** (n + 1)))
+            prev_channels = in_channels * 2 ** (n + 1)
+        self.dense_hidden = ModuleList(dense_hidden)
+
+    def forward(self, x, h):
+        print("c&c s", x.shape, h.shape)
+        for l, layer in enumerate(self.layers):
+            x, h = layer(x, self.dense_hidden[l](h))
+            print("c&c s", x.shape, h.shape)
+        print(x.shape)
+        return x
+
+
+class Audio2Latent2(Module):
+    def __init__(
+        self,
+        input_mean,
+        input_std,
+        input_size,
+        hidden_size,
+        num_layers,
+        n_outputs,
+        output_size,
+        context,
+        correlation,
+        n_layerwise,
+        dropout,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        self.normalize = Normalize(input_mean, input_std)
+        self.maybe_pad = MaybePad(num_layers // 2)
+        self.swap_batch = SwapBatch()
+
+        multiplier = lambda x: 2 ** min(x, num_layers - x - 1)
+        in_channels = input_size
+        in_dense = input_size
+        layers, dense_hidden = [], []
+        for n in range(num_layers):
+            out_channels = hidden_size * multiplier(n)
+            print(n, in_channels, out_channels, out_channels // 2)
+            layers.append(
+                ContextAndCorrelationLayer(
+                    context=context,
+                    correlation=correlation,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=5,
+                    dropout=dropout,
+                )
+            )
+            dense_hidden.append(Linear(in_dense, out_channels // 2))
+            in_channels, in_dense = out_channels, out_channels // 2
+        self.layers = ModuleList(layers)
+        self.dense_hidden = ModuleList(dense_hidden)
+
+        self.pool = Pool(kernel_size=5)
+        self.unpool = Unpool()
+        self.unsqueeze = UnsqueezeLayerwise(n_outputs // n_layerwise)
+
+        self.layerwise = ModuleList(
+            [
+                ContextAndCorrelationLayers(
+                    num_layers=2,
+                    context=context,
+                    correlation=correlation,
+                    in_channels=out_channels,
+                    out_channels=output_size,
+                    kernel_size=5,
+                    dropout=dropout,
+                )
+                for _ in range(n_layerwise)
+            ]
+        )
+
+    # fmt: off
+    def forward(self, x):
+        print(x.shape, f"{x.min().item():.2f}",f"{x.mean().item():.2f}",f"{x.max().item():.2f}")
+        B, T, C = x.shape
+        w = self.maybe_pad(self.normalize(x))
+        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}")
+        w = self.swap_batch(w)
+        h = self.dense_hidden[0](torch.mean(w,dim=0,keepdim=True))
+        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+        for n, layer in enumerate(self.layers):
+            w, h = layer(w, h)
+            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+            w = self.pool(w) if n < len(self.layers) // 2 else self.unpool(w)
+            if n+1 < num_layers:
+                h = self.dense_hidden[n+1](h)
+            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+        w = w[:T]  # remove padding
+        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+        w_plus = torch.cat([self.unsqueeze(layerwise(w, h)) for layerwise in self.layerwise], axis=2)
+        print(w_plus.shape, f"{w_plus.min().item():.2f}",f"{w_plus.mean().item():.2f}",f"{w_plus.max().item():.2f}")
+        return w_plus
+    # fmt: on
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backbone", type=str, default="conv", choices=["gru", "lstm", "conv", "fairseq"])
+
+    # Audio2Latent options
+    parser.add_argument("--backbone", type=str, default=None, choices=["gru", "lstm", "conv"])
     parser.add_argument("--skip_backbone", action="store_true")
-    parser.add_argument("--layerwise", type=str, default="conv", choices=["dense", "conv"])
+    parser.add_argument("--layerwise", type=str, default=None, choices=["dense", "conv"])
+
+    # Audio2Latent2 options
+    parser.add_argument("--context", type=str, default=None, choices=["gru", "lstm", "qrnn", "conv", "transformer"])
+    parser.add_argument("--correlation", type=str, default=None, choices=["linear", "eca", "cba"])
+
+    # Shared options
     parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=8)
@@ -612,21 +776,48 @@ if __name__ == "__main__":
     feature_dim = inputs.shape[2]
     n_outputs, output_size = targets.shape[2], targets.shape[3]
 
-    a2l = Audio2Latent(
-        input_mean=train_dataset.mean,
-        input_std=train_dataset.std,
-        backbone=backbone,
-        skip_backbone=skip_backbone,
-        layerwise=layerwise,
-        n_layerwise=n_layerwise,
-        input_size=feature_dim,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        n_outputs=n_outputs,
-        output_size=output_size,
-    ).to(device)
-    a2l(torch.randn_like(inputs.to(device)))
+    if args.backbone is not None:
+        a2l = Audio2Latent(
+            input_mean=train_dataset.mean,
+            input_std=train_dataset.std,
+            backbone=backbone,
+            skip_backbone=skip_backbone,
+            layerwise=layerwise,
+            n_layerwise=n_layerwise,
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            n_outputs=n_outputs,
+            output_size=output_size,
+        ).to(device)
+    else:
+        for context in ["gru", "lstm", "qrnn", "conv", "transformer"]:
+            for correlation in ["linear", "eca", "cba"]:
+                print()
+                print(context, correlation)
+                a2l = Audio2Latent2(
+                    context=context,
+                    correlation=correlation,
+                    input_mean=train_dataset.mean,
+                    input_std=train_dataset.std,
+                    n_layerwise=n_layerwise,
+                    input_size=feature_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                    n_outputs=n_outputs,
+                    output_size=output_size,
+                ).to(device)
+                print_model_summary(a2l)
+                from time import time
+
+                t = time()
+                tets = inputs.to(device)
+                for _ in range(10):
+                    a2l(tets)
+                print((time() - t) / 10)
+    exit(0)
     # a2l = torch.cuda.make_graphed_callables(a2l, (torch.randn_like(inputs.to(device)),))
     print_model_summary(a2l)
 
@@ -646,7 +837,7 @@ if __name__ == "__main__":
 
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = a2l(inputs)
-            loss = torch.nn.functional.mse_loss(outputs, targets)
+            loss = F.mse_loss(outputs, targets)
 
             optimizer.zero_grad()
             loss.backward()
@@ -670,7 +861,7 @@ if __name__ == "__main__":
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = a2l(inputs)
                         latent_residuals.append(outputs.cpu().numpy())
-                        val_loss += torch.nn.functional.mse_loss(outputs, targets)
+                        val_loss += F.mse_loss(outputs, targets)
                     val_loss /= len(val_dataloader)
                     latent_residuals = np.concatenate(latent_residuals)
                     loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
