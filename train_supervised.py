@@ -324,8 +324,8 @@ class UnsqueezeLayerwise(Module):
         super().__init__()
         self.n = n
 
-    def forward(self, x, *args):
-        return x.unsqueeze(2).repeat(1, 1, self.n, 1), *args
+    def forward(self, x):
+        return x.unsqueeze(2).repeat(1, 1, self.n, 1)
 
 
 class Print(Module):
@@ -492,11 +492,17 @@ class ConvTBC(Module):
         self.kernel_size = kernel_size
         self.padding = padding
 
-        self.weight = Parameter(torch.Tensor(self.kernel_size[0], in_channels, out_channels))
-        self.bias = Parameter(torch.Tensor(out_channels)) if bias else None
+        self.weight = Parameter(torch.Tensor(kernel_size, in_channels, out_channels))
+        self.bias = Parameter(torch.Tensor(out_channels))
 
-    def forward(self, input):
-        return torch.conv_tbc(input.contiguous(), self.weight, self.bias, self.padding[0])
+        torch.nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5))
+
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / np.sqrt(fan_in)
+        torch.nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input, *unused):
+        return torch.conv_tbc(input.contiguous(), self.weight, self.bias, self.padding)
 
 
 class EfficientChannelAttention(Module):
@@ -522,16 +528,19 @@ class ConvolutionalBlockAttention(Module):
             ConvTBC(in_channels // ratio, out_channels, 1, bias=False),
         )
         self.sigmoid = Sigmoid()
+        self.in_channels, self.out_channels = in_channels, out_channels
 
     def forward(self, x):
+        print(x.shape, self.in_channels, self.out_channels)
         avg_out = self.fc(torch.mean(x, dim=0, keepdim=True))
         max_out = self.fc(torch.max(x, dim=0, keepdim=True).values)
-        return self.linear(x) * self.sigmoid(avg_out + max_out).expand_as(x)
+        print(self.linear(x).shape, avg_out.shape, max_out.shape)
+        return self.linear(x) * self.sigmoid(avg_out + max_out)
 
 
 class TransformerLayer(AttentionLayers):
     def __init__(self, in_channels, dropout):
-        super(AttentionLayers, self).__init__(in_channels, depth=1, dropout=dropout, rotary_pos_emb=True)
+        super().__init__(dim=in_channels, depth=1, dropout=dropout, rotary_pos_emb=True)
 
 
 class ContextAndCorrelationLayer(Module):
@@ -539,11 +548,14 @@ class ContextAndCorrelationLayer(Module):
         super().__init__()
         self.additive = additive
         out_channels = out_channels if additive else out_channels // 2
+        self.hidden_channels = out_channels
 
         if context == "gru":
             self.context = GRU(in_channels, out_channels)  # TODO dropout?
+            self.context.flatten_parameters()
         elif context == "lstm":
             self.context = LSTM(in_channels, out_channels, dropouti=dropout, dropoutw=dropout, dropouto=dropout)
+            self.context.flatten_parameters()
         elif context == "qrnn":
             self.context = QRNN(in_channels, out_channels, dropout=dropout)
         elif context == "conv":
@@ -570,60 +582,10 @@ class ContextAndCorrelationLayer(Module):
         else:
             raise NotImplementedError()
 
-        self.activation = LeakyReLU(0.2)
-
-    def forward(self, x, h):
-        context, h = self.context(x, h)
+    def forward(self, x):
+        context, _ = self.context(x)
         correlation = self.correlation(x)
-        if self.additive:
-            return self.activation(context + correlation), h
-        else:
-            return self.activation(torch.cat((context, correlation), dim=2)), h
-
-
-class ContextAndCorrelationLayers(Module):
-    def __init__(self, num_layers, context, correlation, in_channels, out_channels, kernel_size, dropout):
-        super().__init__()
-        self.layers = ModuleList(
-            [
-                ContextAndCorrelationLayer(
-                    context=context,
-                    correlation=correlation,
-                    in_channels=in_channels * 2 ** n,
-                    out_channels=in_channels * 2 ** (n + 1),
-                    kernel_size=kernel_size,
-                    dropout=dropout,
-                    additive=True,
-                )
-                for n in range(num_layers - 1)
-            ]
-            + [
-                ContextAndCorrelationLayer(
-                    context=context,
-                    correlation=correlation,
-                    in_channels=in_channels * 2 ** (num_layers - 1),
-                    out_channels=out_channels,
-                    kernel_size=kernel_size,
-                    dropout=0,
-                    additive=True,
-                )
-            ]
-        )
-
-        dense_hidden = []
-        prev_channels = in_channels // 2
-        for n in range(num_layers):
-            dense_hidden.append(Linear(prev_channels, in_channels * 2 ** (n + 1)))
-            prev_channels = in_channels * 2 ** (n + 1)
-        self.dense_hidden = ModuleList(dense_hidden)
-
-    def forward(self, x, h):
-        print("c&c s", x.shape, h.shape)
-        for l, layer in enumerate(self.layers):
-            x, h = layer(x, self.dense_hidden[l](h))
-            print("c&c s", x.shape, h.shape)
-        print(x.shape)
-        return x
+        return context + correlation if self.additive else torch.cat((context, correlation), dim=2)
 
 
 class Audio2Latent2(Module):
@@ -644,17 +606,15 @@ class Audio2Latent2(Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        self.normalize = Normalize(input_mean, input_std)
+        self.normalize = Normalize(input_mean, input_std + 1e-8)
         self.maybe_pad = MaybePad(num_layers // 2)
         self.swap_batch = SwapBatch()
 
         multiplier = lambda x: 2 ** min(x, num_layers - x - 1)
         in_channels = input_size
-        in_dense = input_size
-        layers, dense_hidden = [], []
+        layers = []
         for n in range(num_layers):
             out_channels = hidden_size * multiplier(n)
-            print(n, in_channels, out_channels, out_channels // 2)
             layers.append(
                 ContextAndCorrelationLayer(
                     context=context,
@@ -665,53 +625,53 @@ class Audio2Latent2(Module):
                     dropout=dropout,
                 )
             )
-            dense_hidden.append(Linear(in_dense, out_channels // 2))
-            in_channels, in_dense = out_channels, out_channels // 2
+            in_channels = out_channels
         self.layers = ModuleList(layers)
-        self.dense_hidden = ModuleList(dense_hidden)
+        self.activation = LeakyReLU(0.2)
 
         self.pool = Pool(kernel_size=5)
         self.unpool = Unpool()
-        self.unsqueeze = UnsqueezeLayerwise(n_outputs // n_layerwise)
 
         self.layerwise = ModuleList(
             [
-                ContextAndCorrelationLayers(
-                    num_layers=2,
-                    context=context,
-                    correlation=correlation,
-                    in_channels=out_channels,
-                    out_channels=output_size,
-                    kernel_size=5,
-                    dropout=dropout,
+                Sequential(
+                    ContextAndCorrelationLayer(
+                        context=context,
+                        correlation=correlation,
+                        in_channels=hidden_size,
+                        out_channels=hidden_size * 2,
+                        kernel_size=5,
+                        dropout=dropout,
+                        additive=True,
+                    ),
+                    LeakyReLU(0.2),
+                    ContextAndCorrelationLayer(
+                        context=context,
+                        correlation=correlation,
+                        in_channels=hidden_size * 2,
+                        out_channels=output_size,
+                        kernel_size=5,
+                        dropout=dropout,
+                        additive=True,
+                    ),
+                    UnsqueezeLayerwise(n_outputs // n_layerwise),
                 )
                 for _ in range(n_layerwise)
             ]
         )
 
-    # fmt: off
     def forward(self, x):
-        print(x.shape, f"{x.min().item():.2f}",f"{x.mean().item():.2f}",f"{x.max().item():.2f}")
         B, T, C = x.shape
         w = self.maybe_pad(self.normalize(x))
-        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}")
         w = self.swap_batch(w)
-        h = self.dense_hidden[0](torch.mean(w,dim=0,keepdim=True))
-        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
         for n, layer in enumerate(self.layers):
-            w, h = layer(w, h)
-            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
-            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
+            w = layer(w)
+            w = self.activation(w)
             w = self.pool(w) if n < len(self.layers) // 2 else self.unpool(w)
-            if n+1 < num_layers:
-                h = self.dense_hidden[n+1](h)
-            print(n,w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
         w = w[:T]  # remove padding
-        print(w.shape, f"{w.min().item():.2f}",f"{w.mean().item():.2f}",f"{w.max().item():.2f}",h.shape, f"{h.min().item():.2f}",f"{h.mean().item():.2f}",f"{h.max().item():.2f}")
-        w_plus = torch.cat([self.unsqueeze(layerwise(w, h)) for layerwise in self.layerwise], axis=2)
-        print(w_plus.shape, f"{w_plus.min().item():.2f}",f"{w_plus.mean().item():.2f}",f"{w_plus.max().item():.2f}")
+        w_plus = torch.cat([layerwise(w) for layerwise in self.layerwise], axis=2)
+        w_plus = self.swap_batch(w_plus)
         return w_plus
-    # fmt: on
 
 
 if __name__ == "__main__":
@@ -727,13 +687,16 @@ if __name__ == "__main__":
     parser.add_argument("--correlation", type=str, default=None, choices=["linear", "eca", "cba"])
 
     # Shared options
-    parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
+    parser.add_argument("--n_layerwise", type=int, default=6, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.2)
+
+    # Training options
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
     in_dir = "/home/hans/datasets/audio2latent/"
@@ -745,6 +708,8 @@ if __name__ == "__main__":
 
     backbone = args.backbone
     skip_backbone = args.skip_backbone
+    context = args.context
+    correlation = args.correlation
     layerwise = args.layerwise
     n_layerwise = args.n_layerwise
     hidden_size = args.hidden_size
@@ -753,18 +718,6 @@ if __name__ == "__main__":
 
     lr = args.lr
     wd = args.wd
-
-    name = "_".join(
-        [
-            f"backbone:{backbone}:skip{skip_backbone}",
-            f"layerwise:{layerwise}:{n_layerwise}",
-            f"hidden_size:{hidden_size}",
-            f"num_layers:{num_layers}",
-            f"dropout:{dropout}",
-            f"lr:{lr}",
-            f"wd:{wd}",
-        ]
-    )
 
     preprocess_audio(in_dir, dataset_cache)
     train_dataset = AudioLatentDataset(dataset_cache, "train")
@@ -777,6 +730,17 @@ if __name__ == "__main__":
     n_outputs, output_size = targets.shape[2], targets.shape[3]
 
     if args.backbone is not None:
+        name = "_".join(
+            [
+                f"backbone:{backbone}:skip{skip_backbone}",
+                f"layerwise:{layerwise}:{n_layerwise}",
+                f"hidden_size:{hidden_size}",
+                f"num_layers:{num_layers}",
+                f"dropout:{dropout}",
+                f"lr:{lr}",
+                f"wd:{wd}",
+            ]
+        )
         a2l = Audio2Latent(
             input_mean=train_dataset.mean,
             input_std=train_dataset.std,
@@ -792,32 +756,32 @@ if __name__ == "__main__":
             output_size=output_size,
         ).to(device)
     else:
-        for context in ["gru", "lstm", "qrnn", "conv", "transformer"]:
-            for correlation in ["linear", "eca", "cba"]:
-                print()
-                print(context, correlation)
-                a2l = Audio2Latent2(
-                    context=context,
-                    correlation=correlation,
-                    input_mean=train_dataset.mean,
-                    input_std=train_dataset.std,
-                    n_layerwise=n_layerwise,
-                    input_size=feature_dim,
-                    hidden_size=hidden_size,
-                    num_layers=num_layers,
-                    dropout=dropout,
-                    n_outputs=n_outputs,
-                    output_size=output_size,
-                ).to(device)
-                print_model_summary(a2l)
-                from time import time
-
-                t = time()
-                tets = inputs.to(device)
-                for _ in range(10):
-                    a2l(tets)
-                print((time() - t) / 10)
-    exit(0)
+        name = "_".join(
+            [
+                f"context:{context}",
+                f"correlation:{correlation}",
+                f"n_layerwise:{n_layerwise}",
+                f"hidden_size:{hidden_size}",
+                f"num_layers:{num_layers}",
+                f"dropout:{dropout}",
+                f"lr:{lr}",
+                f"wd:{wd}",
+            ]
+        )
+        a2l = Audio2Latent2(
+            context=context,
+            correlation=correlation,
+            input_mean=train_dataset.mean,
+            input_std=train_dataset.std,
+            n_layerwise=n_layerwise,
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            n_outputs=n_outputs,
+            output_size=output_size,
+        ).to(device)
+    a2l(inputs.to(device))
     # a2l = torch.cuda.make_graphed_callables(a2l, (torch.randn_like(inputs.to(device)),))
     print_model_summary(a2l)
 
@@ -827,7 +791,7 @@ if __name__ == "__main__":
     shutil.copy(__file__, writer.log_dir)
 
     n_iter = 0
-    n_epochs = 200
+    n_epochs = args.epochs
     video_interval = 20
     eval_interval = 5
     pbar = tqdm(range(n_epochs))
