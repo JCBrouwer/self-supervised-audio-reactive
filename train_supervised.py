@@ -13,9 +13,9 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchdatasets as td
+import torchvision as tv
 from better_lstm import LSTM
-from fairseq.modules import ConvTBC as _ConvTBC
-from fairseq.modules import FairseqDropout, LinearizedConvolution
+from fairseq.modules import ConvTBC, FairseqDropout, LinearizedConvolution
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
 from torch.utils.data import DataLoader, Dataset
@@ -75,15 +75,11 @@ def latent_residual_hist():
 
 
 @torch.inference_mode()
-def audio2video(a2l_file, audio_file, stylegan_file, output_size=(512, 512), batch_size=8, offset=0, duration=40):
-    a2l: Audio2Latent = joblib.load(a2l_file)["a2l"].eval().to(device)
+def audio2video(a2l, audio_file, out_file, stylegan_file, output_size=(512, 512), batch_size=8, offset=0, duration=40):
+    a2l = a2l.eval().to(device)
 
     test_features = audio2features(*torchaudio.load(audio_file))[24 * offset : 24 * (offset + duration)].to(device)
     test_latents = a2l(test_features.unsqueeze(0)).squeeze()
-
-    del a2l
-    gc.collect()
-    torch.cuda.empty_cache()
 
     mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
     latent_offset = mapper(torch.from_numpy(np.random.RandomState(42).randn(1, 512))).to(device)
@@ -95,7 +91,7 @@ def audio2video(a2l_file, audio_file, stylegan_file, output_size=(512, 512), bat
     synthesizer.eval().to(device)
 
     with VideoWriter(
-        output_file=f"{os.path.splitext(a2l_file)[0]}_{Path(audio_file).stem}.mp4",
+        output_file=out_file,
         output_size=output_size,
         audio_file=audio_file,
         audio_offset=offset,
@@ -173,50 +169,56 @@ class PreprocessAudioLatentDataset(Dataset):
             sum([list(torch.split(latents[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, FPS)], [])
         )
 
-        return features, latents
+        return file, features, latents
 
 
 def collate(batch):
     return tuple(torch.cat(b) for b in list(map(list, zip(*batch))))
 
 
+def filename(file, name):
+    return file.replace(".npy", f"_{name}.npy")
+
+
 def preprocess_audio(in_dir, out_file):
-    train_feat_file, train_lat_file = out_file.replace(".npy", "_train_feats.npy"), out_file.replace(
-        ".npy", "_train_lats.npy"
-    )
-    val_feat_file, val_lat_file = out_file.replace(".npy", "_val_feats.npy"), out_file.replace(".npy", "_val_lats.npy")
+    train_feat_file, train_lat_file = filename(out_file, "train_feats"), filename(out_file, "train_lats")
+    val_feat_file, val_lat_file = filename(out_file, "val_feats"), filename(out_file, "val_lats")
     if not os.path.exists(train_lat_file):
         dataset = PreprocessAudioLatentDataset(in_dir)
         train_or_val = np.random.RandomState(42).rand(len(dataset)) < 0.8
+        val_files, train_files = [], []
         with NumpyArray(train_feat_file) as train_feats, NumpyArray(train_lat_file) as train_lats, NumpyArray(
             val_feat_file
         ) as val_feats, NumpyArray(val_lat_file) as val_lats:
-            for i, (features, latents) in enumerate(
-                tqdm(
-                    DataLoader(dataset, batch_size=1, num_workers=16, collate_fn=collate),
-                    desc="Preprocessing...",
-                )
+            for i, ((file,), features, latents) in enumerate(
+                tqdm(DataLoader(dataset, num_workers=16, collate_fn=collate), desc="Preprocessing...")
             ):
+                (train_files if train_or_val[i] else val_files).append(file)
                 feats = train_feats if train_or_val[i] else val_feats
                 lats = train_lats if train_or_val[i] else val_lats
                 for feat, lat in zip(features, latents):
                     feats.append(feat.unsqueeze(0).contiguous().numpy())
                     lats.append(lat.unsqueeze(0).contiguous().numpy())
 
+        with open(filename(out_file, "train_files").replace(".npy", ".txt"), "w") as f:
+            f.write("\n".join(train_files))
+        with open(filename(out_file, "val_files").replace(".npy", ".txt"), "w") as f:
+            f.write("\n".join(val_files))
+
         feats_train = np.load(train_feat_file, mmap_mode="r")
-        np.save(out_file.replace(".npy", "_train_feats_mean.npy"), np.mean(feats_train, axis=(0, 1)))
-        np.save(out_file.replace(".npy", "_train_feats_std.npy"), np.std(feats_train, axis=(0, 1)))
+        np.save(filename(out_file, "train_feats_mean"), np.mean(feats_train, axis=(0, 1)))
+        np.save(filename(out_file, "train_feats_std"), np.std(feats_train, axis=(0, 1)))
 
         lats_train = np.load(train_lat_file, mmap_mode="r")
-        np.save(out_file.replace(".npy", "_train_lats_offsets.npy"), np.mean(lats_train, axis=(1, 2)))
+        np.save(filename(out_file, "train_lats_offsets"), np.mean(lats_train, axis=(1, 2)))
 
         if os.path.exists(val_feat_file):
             feats_val = np.load(val_feat_file, mmap_mode="r")
-            np.save(out_file.replace(".npy", "_val_feats_mean.npy"), np.mean(feats_val, axis=(0, 1)))
-            np.save(out_file.replace(".npy", "_val_feats_std.npy"), np.std(feats_val, axis=(0, 1)))
+            np.save(filename(out_file, "val_feats_mean"), np.mean(feats_val, axis=(0, 1)))
+            np.save(filename(out_file, "val_feats_std"), np.std(feats_val, axis=(0, 1)))
 
             lats_val = np.load(val_lat_file, mmap_mode="r")
-            np.save(out_file.replace(".npy", "_val_lats_offsets.npy"), np.mean(lats_val, axis=(1, 2)))
+            np.save(filename(out_file, "val_lats_offsets"), np.mean(lats_val, axis=(1, 2)))
 
 
 def print_data_summary(train, val):
@@ -250,27 +252,26 @@ class AudioLatentDataset(td.Dataset):
         super().__init__()
         try:
             self.features = np.load(file.replace(".npy", f"_{split}_feats.npy"), mmap_mode="r")
-            self.mean = np.load(file.replace(".npy", f"_{split}_feats_mean.npy"), mmap_mode="r")
-            self.std = np.load(file.replace(".npy", f"_{split}_feats_std.npy"), mmap_mode="r")
             self.latents = np.load(file.replace(".npy", f"_{split}_lats.npy"), mmap_mode="r")
             self.offsets = np.load(file.replace(".npy", f"_{split}_lats_offsets.npy"), mmap_mode="r")
+
+            self.mean = np.load(file.replace(".npy", f"_{split}_feats_mean.npy"))
+            self.std = np.load(file.replace(".npy", f"_{split}_feats_std.npy"))
+
         except FileNotFoundError:
             self.features = np.empty((0, 0, 0))
-            self.mean = np.empty((0, 0, 0))
-            self.std = np.empty((0, 0, 0))
             self.latents = np.empty((0, 0, 0, 0))
             self.offsets = np.empty((0, 0, 0, 0))
+
+            self.mean = np.empty((0, 0, 0))
+            self.std = np.empty((0, 0, 0))
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, index):
-        features = self.features[index]
-        features = (features - self.mean) / self.std
-
-        latents = self.latents[index]
-        latents = latents - self.offsets[index]
-        return torch.from_numpy(features.copy()), torch.from_numpy(latents.copy())
+        residuals = self.latents[index] - self.offsets[index]
+        return torch.from_numpy(self.features[index].copy()), torch.from_numpy(residuals.copy())
 
 
 def Linear(in_features, out_features, dropout=0.0):
@@ -290,9 +291,9 @@ def LinearizedConv1d(in_channels, out_channels, kernel_size, dropout=0.0, **kwar
     return torch.nn.utils.weight_norm(m, dim=2)
 
 
-def ConvTBC(in_channels, out_channels, kernel_size, dropout=0.0, **kwargs):
+def WNConvTBC(in_channels, out_channels, kernel_size, dropout=0.0, **kwargs):
     """Weight-normalized Conv1d layer"""
-    m = _ConvTBC(in_channels, out_channels, kernel_size, **kwargs)
+    m = ConvTBC(in_channels, out_channels, kernel_size, **kwargs)
     std = np.sqrt((4 * (1.0 - dropout)) / (m.kernel_size[0] * in_channels))
     torch.nn.init.normal_(m.weight, mean=0, std=std)
     torch.nn.init.constant_(m.bias, 0)
@@ -326,7 +327,7 @@ class FairseqConvEncoder(torch.nn.Module):
             else:
                 padding = 0
             self.convolutions.append(
-                ConvTBC(
+                WNConvTBC(
                     in_channels,
                     out_channels * 2,
                     kernel_size,
@@ -379,6 +380,16 @@ class FairseqConvEncoder(torch.nn.Module):
         return x, None
 
 
+class Normalize(torch.nn.Module):
+    def __init__(self, mean, std):
+        super().__init__()
+        self.register_buffer("mean", torch.FloatTensor(mean))
+        self.register_buffer("std", torch.FloatTensor(std))
+
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+
 class MaybePad(torch.nn.Module):
     def __init__(self, l):
         super().__init__()
@@ -419,18 +430,22 @@ class Print(torch.nn.Module):
 class Audio2Latent(torch.nn.Module):
     def __init__(
         self,
-        backbone,
-        skip_backbone,
-        layerwise,
+        input_mean,
+        input_std,
         input_size,
         hidden_size,
         num_layers,
-        dropout,
         n_outputs,
-        n_layerwise,
         output_size,
+        backbone,
+        skip_backbone,
+        layerwise,
+        n_layerwise,
+        dropout,
     ) -> None:
         super().__init__()
+        self.normalize = Normalize(input_mean, input_std)
+
         if backbone.lower() == "gru":
             self.backbone = torch.nn.GRU(
                 input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, batch_first=True
@@ -533,7 +548,7 @@ class Audio2Latent(torch.nn.Module):
             raise NotImplementedError()
 
     def forward(self, x):
-        w, _ = self.backbone(x)
+        w, _ = self.backbone(self.normalize(x))
         w = w[:, : x.shape[1]]  # remove padding
         if self.backbone_skip is not None:
             wx = torch.cat((self.relu(w), self.backbone_skip(x)), axis=2)
@@ -558,7 +573,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     in_dir = "/home/hans/datasets/audio2latent/"
-    out_file = f"cache/{Path(in_dir).stem}_preprocessed.npy"
+    dataset_cache = f"cache/{Path(in_dir).stem}_preprocessed.npy"
     test_audio = "/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac"
 
     n_frames = int(DUR * FPS)
@@ -587,9 +602,9 @@ if __name__ == "__main__":
         ]
     )
 
-    preprocess_audio(in_dir, out_file)
-    train_dataset = AudioLatentDataset(out_file, "train")
-    val_dataset = AudioLatentDataset(out_file, "val")
+    preprocess_audio(in_dir, dataset_cache)
+    train_dataset = AudioLatentDataset(dataset_cache, "train")
+    val_dataset = AudioLatentDataset(dataset_cache, "val")
     print_data_summary(train_dataset, val_dataset)
 
     dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True)
@@ -598,6 +613,8 @@ if __name__ == "__main__":
     n_outputs, output_size = targets.shape[2], targets.shape[3]
 
     a2l = Audio2Latent(
+        input_mean=train_dataset.mean,
+        input_std=train_dataset.std,
         backbone=backbone,
         skip_backbone=skip_backbone,
         layerwise=layerwise,
@@ -659,7 +676,7 @@ if __name__ == "__main__":
                     loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
 
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
-                    writer.add_scalar("Loss/val_laplace_b", scale.item(), n_iter)
+                    writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
 
                     a2l.train()
                 else:
@@ -673,14 +690,14 @@ if __name__ == "__main__":
             pbar.write("")
 
         if (epoch + 1) % video_interval == 0 or (epoch + 1) == n_epochs:
+            checkpoint_name = f"audio2latent_{name}_steps{n_iter}_val{val_loss:.4f}_b{scale:.4f}"
             joblib.dump(
-                {"a2l": a2l, "optim": optimizer, "n_iter": n_iter},
-                f"{writer.log_dir}/audio2latent_{name}_steps{n_iter}_val{val_loss:.4f}.pt",
-                compress=9,
+                {"a2l": a2l, "optim": optimizer, "n_iter": n_iter}, f"{writer.log_dir}/{checkpoint_name}.pt", compress=9
             )
             audio2video(
-                a2l_file=f"{writer.log_dir}/audio2latent_{name}_steps{n_iter}_val{val_loss:.4f}.pt",
+                a2l=a2l,
                 audio_file=test_audio,
+                out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
                 stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
             )
 
