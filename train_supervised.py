@@ -692,7 +692,7 @@ class MLP(Module):
         n_layerwise,
         num_layers,
         dropout,
-        mult=4,
+        mult=2,
         kernel_size=15,
     ):
         super().__init__()
@@ -700,7 +700,8 @@ class MLP(Module):
         self.attn = Sequential(
             Linear(in_channels, channels * mult // 2),
             GELU(),
-            AttentionLayer(channels * mult // 2, channels * mult // 2, n_head=1, dim_head=128, dropout=dropout),
+            Dropout(dropout),
+            AttentionLayer(channels * mult // 2, channels * mult // 2, n_head=4, dim_head=128, dropout=dropout),
         )
         self.input_dense = Linear(in_channels, channels)
         self.dropout = Dropout(dropout)
@@ -878,13 +879,13 @@ if __name__ == "__main__":
 
     # Shared options
     parser.add_argument("--n_layerwise", type=int, default=6, choices=[1, 2, 3, 6, 9, 18])
-    parser.add_argument("--hidden_size", type=int, default=32)
+    parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.2)
 
     # Training options
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--acv", "--anti_correlation_variance", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -1001,7 +1002,7 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
 
-    writer = SummaryWriter()
+    writer = SummaryWriter(comment=name)
     shutil.copy(__file__, writer.log_dir)
 
     n_iter = 0
@@ -1046,17 +1047,23 @@ if __name__ == "__main__":
                     val_dataloader = DataLoader(
                         val_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True
                     )
-                    val_loss, latent_residuals = 0, [0 for _ in range(5)]
+                    n_lap_b = 32
+                    val_loss, latent_residuals = 0, [0 for _ in range(n_lap_b)]
                     for it, (inputs, targets) in enumerate(val_dataloader):
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = a2l(inputs)
-                        latent_residuals[it % 5] = outputs.cpu().numpy().flatten()
+                        latent_residuals[it % n_lap_b] = outputs.cpu().numpy().flatten()
                         val_loss += F.mse_loss(outputs, targets)
                     val_loss /= len(val_dataloader)
-                    loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
-
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
-                    writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
+
+                    try:
+                        loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
+                        writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
+                    except Exception as e:
+                        pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
+                        scale = -1
+
                 else:
                     val_loss, scale = -1, -1
 

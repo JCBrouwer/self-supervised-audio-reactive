@@ -59,34 +59,21 @@ if __name__ == "__main__":
     #     train.append(batch)
     # train = np.concatenate(train)
 
-    encoder = CausalCNNEncoderClassifier(
-        compared_length=96,
-        nb_random_samples=10,
-        batch_size=16,
-        nb_steps=200,
-        in_channels=N * L,
-        channels=128,
-        out_channels=64,
-        reduced_size=32,
-        depth=10,
-        cuda=True,
-    )
-    encoder.fit_encoder(X, XO, verbose=True)
-    joblib.dump(encoder, "cache/encoder.pt", compress=9)
-
-    # compared_length=50,
-    # nb_random_samples=10,
-    # negative_penalty=1,
-    # batch_size=1,
-    # nb_steps=2000,
-    # lr=0.001,
-    # penalty=1,
-    # early_stopping=None,
-    # channels=10,
-    # depth=1,
-    # reduced_size=10,
-    # out_channels=10,
-    # kernel_size=4,
-    # in_channels=1,
-    # cuda=False,
-    # gpu=0,
+    encoder_checkpoint = "cache/encoder.pt"
+    if not os.path.exists(encoder_checkpoint):
+        encoder = CausalCNNEncoderClassifier(
+            compared_length=96,
+            nb_random_samples=10,
+            batch_size=16,
+            nb_steps=200,
+            in_channels=N * L,
+            channels=128,
+            out_channels=64,
+            reduced_size=32,
+            depth=10,
+            cuda=True,
+        )
+        encoder.fit_encoder(X, XO, verbose=True)
+        joblib.dump(encoder, encoder_checkpoint, compress=9)
+    else:
+        encoder = joblib.load(encoder_checkpoint)
