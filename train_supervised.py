@@ -13,6 +13,7 @@ import librosa as rosa
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.modules.activation import GELU
 import torchaudio
 import torchdatasets as td
 from better_lstm import LSTM
@@ -243,16 +244,37 @@ def print_data_summary(train, val):
 def print_model_summary(model):
     print()
     print("model summary:")
-    print("name".ljust(50), "shape".ljust(25), "num".ljust(25))
-    print("-" * 70)
-    total = 0
-    for name, param in model.named_parameters():
-        num = param.numel()
-        total += num
-        print(name.ljust(50), f"{tuple(param.shape)}".ljust(25), f"{num}".ljust(25))
-    print("-" * 90)
-    print("total".ljust(50), f"".ljust(25), f"{total/1e6:.2f} M".ljust(25))
-    print()
+    print("name".ljust(30), "class".ljust(20), "output shape".ljust(40), "num params")
+    print("-" * 111)
+    global total_params
+    total_params = 0
+    handles = []
+    for name, block in a2l.named_modules():
+
+        def hook(m, i, o, name=name):
+            global total_params
+            if len(list(m.named_modules())) == 1:
+                class_name = m.__class__.__name__
+                output_shape = (
+                    tuple(tuple(oo.shape) if not isinstance(oo, int) else oo for oo in o)
+                    if isinstance(o, tuple)
+                    else tuple(o.shape)
+                )
+                num_params = sum(p.numel() for p in m.parameters())
+                total_params += num_params
+                print(
+                    name.ljust(30),
+                    class_name.ljust(20),
+                    f"{output_shape}".ljust(40),
+                    f"{num_params/ 1000:.2f} K" if num_params > 0 else "0",
+                )
+
+        handles.append(block.register_forward_hook(hook))
+    a2l(inputs.to(device))
+    for handle in handles:
+        handle.remove()
+    print("-" * 111)
+    print("total".ljust(30), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
 
 
 class AudioLatentDataset(td.Dataset):
@@ -493,13 +515,17 @@ class ConvTBC(Module):
         self.padding = padding
 
         self.weight = Parameter(torch.Tensor(kernel_size, in_channels, out_channels))
-        self.bias = Parameter(torch.Tensor(out_channels))
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.bias = torch.zeros(out_channels)
 
         torch.nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5))
 
-        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
-        bound = 1 / np.sqrt(fan_in)
-        torch.nn.init.uniform_(self.bias, -bound, bound)
+        if bias:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / np.sqrt(fan_in)
+            torch.nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input, *unused):
         return torch.conv_tbc(input.contiguous(), self.weight, self.bias, self.padding)
@@ -538,9 +564,159 @@ class ConvolutionalBlockAttention(Module):
         return self.linear(x) * self.sigmoid(avg_out + max_out)
 
 
-class TransformerLayer(AttentionLayers):
-    def __init__(self, in_channels, dropout):
-        super().__init__(dim=in_channels, depth=1, dropout=dropout, rotary_pos_emb=True)
+class AttentionLayer(AttentionLayers):
+    def __init__(self, in_channels, out_channels, n_head, dim_head, dropout):
+        super().__init__(
+            dim=in_channels,
+            depth=1,
+            heads=n_head,
+            attn_dim_head=dim_head,
+            ff_dim_out=out_channels,
+            dropout=dropout,
+            rotary_pos_emb=True,
+        )
+
+
+class ConvolutionalGatingUnit(Module):
+    def __init__(self, channels, kernel_size):
+        super().__init__()
+        self.conv = Conv1d(
+            channels // 2, channels // 2, kernel_size, padding=(kernel_size - 1) // 2, groups=channels // 2
+        )
+        self.dense = Linear(channels // 2, channels // 2)
+
+    def forward(self, x, z=None):
+        xr, xg = x.chunk(2, dim=2)
+        xg = self.conv(xg.transpose(1, 2)).transpose(1, 2)
+        xg = self.dense(xg)
+        if z is not None:
+            xg = xg + z
+        return xr * xg
+
+
+class MLPBlock(Module):
+    def __init__(self, channels, kernel_size, mult):
+        super().__init__()
+        self.dense1 = Linear(channels, channels * mult)
+        self.act = GELU()
+        self.cgu = ConvolutionalGatingUnit(channels * mult, kernel_size)
+        self.dense2 = Linear(channels * mult // 2, channels)
+
+    def forward(self, x, z=None):
+        y = self.dense1(x)
+        y = self.act(y)
+        y = self.cgu(y, z)
+        y = self.dense2(y)
+        return x + y
+
+
+class LayerwiseLinear(Module):
+    def __init__(self, in_channels, out_channels, n_outputs, n_layerwise, act=F.gelu):
+        super().__init__()
+        self.NO = n_outputs
+        self.NL = n_layerwise
+        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels * 2)
+        self.w2, self.b2 = self.get_weights_and_bias(n_layerwise, in_channels * 2, out_channels)
+        self.act = act
+
+    def get_weights_and_bias(self, NL, IC, OC):
+        w, b = torch.Tensor(NL, IC, OC), torch.Tensor(NL, OC)
+
+        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / np.sqrt(fan_in)
+        torch.nn.init.uniform_(b, -bound, bound)
+        return Parameter(w), Parameter(b)
+
+    def forward(self, x):  # B,T,IC
+        x = x.unsqueeze(2)  # B,T,1,IC
+        x = x.tile(1, 1, self.NL, 1)  # B,T,NL,IC
+        x = torch.matmul(x.unsqueeze(3), self.w1).squeeze(3) + self.b1  # B,T,NL,IC*2
+        x = self.act(x)
+        x = torch.matmul(x.unsqueeze(3), self.w2).squeeze(3) + self.b2  # B,T,NL,OC
+        B, T, _, OC = x.shape
+        x = x.unsqueeze(3)  # B,T,NL,1,OC
+        x = x.tile(1, 1, 1, self.NO // self.NL, 1)  # B,T,NL,NO//NL,OC
+        x = x.reshape(B, T, self.NO, OC)  # B,T,NO,OC
+        return x
+
+
+class LayerwiseConv(Module):
+    def __init__(self, in_channels, out_channels, kernel_size, n_outputs, n_layerwise, act=F.gelu):
+        super().__init__()
+        self.NO = n_outputs
+        self.NL = n_layerwise
+        self.padding = (kernel_size - 1) // 2
+        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels * 2, kernel_size)
+        self.w2, self.b2 = self.get_weights_and_bias(n_layerwise, in_channels * 2, out_channels, kernel_size)
+        self.act = act
+
+    def get_weights_and_bias(self, NL, IC, OC, ks):
+        w, b = torch.Tensor(NL * OC, IC, ks), torch.Tensor(1, NL * OC, 1)
+
+        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / np.sqrt(fan_in)
+        torch.nn.init.uniform_(b, -bound, bound)
+        return Parameter(w), Parameter(b)
+
+    def forward(self, x):  # B,T,IC
+        B, T, IC = x.shape
+        x = x.transpose(1, 2)  # B,IC,T
+        x = x.unsqueeze(2)  # B,IC,1,T
+        x = x.tile(1, 1, self.NL, 1)  # B,NL,IC,T
+        x = x.reshape(B, self.NL * IC, T)  # B,NL*IC,T
+        x = F.conv1d(x, self.w1, padding=self.padding, groups=self.NL) + self.b1  # B,NL*IC*2,T
+        x = self.act(x)
+        x = F.conv1d(x, self.w2, padding=self.padding, groups=self.NL) + self.b2  # B,NL*OC,T
+        x = x.reshape(B, self.NL, -1, T)  # B,NL,OC,T
+        _, _, OC, _ = x.shape
+        x = x.unsqueeze(2)  # B,NL,1,OC,T
+        x = x.tile(1, 1, self.NO // self.NL, 1, 1)  # B,NL,NO//NL,OC,T
+        x = x.reshape(B, self.NO, OC, T)  # B,NO,OC,T
+        x = x.permute(0, 3, 1, 2)  # B,T,NO,OC
+        return x
+
+
+class MLP(Module):
+    def __init__(
+        self,
+        input_mean,
+        input_std,
+        in_channels,
+        channels,
+        out_channels,
+        n_outputs,
+        n_layerwise,
+        num_layers,
+        dropout,
+        mult=4,
+        kernel_size=15,
+    ):
+        super().__init__()
+        self.normalize = Normalize(input_mean, input_std + 1e-8)
+        self.attn = Sequential(
+            Linear(in_channels, channels * mult // 2),
+            GELU(),
+            AttentionLayer(channels * mult // 2, channels * mult // 2, n_head=1, dim_head=128, dropout=dropout),
+        )
+        self.input_dense = Linear(in_channels, channels)
+        self.dropout = Dropout(dropout)
+        self.blocks = ModuleList([MLPBlock(channels, kernel_size=kernel_size, mult=mult) for _ in range(num_layers)])
+        self.layerwise = LayerwiseConv(channels, out_channels, 5, n_outputs, n_layerwise)
+
+    def forward(self, x):
+        x = self.normalize(x)
+        z = self.attn(x)
+        x = self.input_dense(x)
+        x = self.dropout(x)
+        for block in self.blocks:
+            x = block(x, z)
+            x = self.dropout(x)
+        w = self.layerwise(x)
+        return w
 
 
 class ContextAndCorrelationLayer(Module):
@@ -565,7 +741,7 @@ class ContextAndCorrelationLayer(Module):
                 DummyHiddenState(),
             )
         elif context == "transformer":
-            self.context = torch.nn.Sequential(TransformerLayer(in_channels, dropout=dropout), DummyHiddenState())
+            self.context = torch.nn.Sequential(AttentionLayer(in_channels, dropout=dropout), DummyHiddenState())
         else:
             raise NotImplementedError()
 
@@ -616,13 +792,25 @@ class Audio2Latent2(Module):
         for n in range(num_layers):
             out_channels = hidden_size * multiplier(n)
             layers.append(
-                ContextAndCorrelationLayer(
-                    context=context,
-                    correlation=correlation,
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=5,
-                    dropout=dropout,
+                Sequential(
+                    ContextAndCorrelationLayer(
+                        context=context,
+                        correlation=correlation,
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=5,
+                        dropout=dropout,
+                    ),
+                    LeakyReLU(0.2),
+                    ContextAndCorrelationLayer(
+                        context=context,
+                        correlation=correlation,
+                        in_channels=out_channels,
+                        out_channels=out_channels,
+                        kernel_size=5,
+                        dropout=dropout,
+                    ),
+                    LeakyReLU(0.2),
                 )
             )
             in_channels = out_channels
@@ -666,7 +854,6 @@ class Audio2Latent2(Module):
         w = self.swap_batch(w)
         for n, layer in enumerate(self.layers):
             w = layer(w)
-            w = self.activation(w)
             w = self.pool(w) if n < len(self.layers) // 2 else self.unpool(w)
         w = w[:T]  # remove padding
         w_plus = torch.cat([layerwise(w) for layerwise in self.layerwise], axis=2)
@@ -686,16 +873,20 @@ if __name__ == "__main__":
     parser.add_argument("--context", type=str, default=None, choices=["gru", "lstm", "qrnn", "conv", "transformer"])
     parser.add_argument("--correlation", type=str, default=None, choices=["linear", "eca", "cba"])
 
+    # MLP options
+    parser.add_argument("--mlp", action="store_true")
+
     # Shared options
     parser.add_argument("--n_layerwise", type=int, default=6, choices=[1, 2, 3, 6, 9, 18])
-    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--hidden_size", type=int, default=32)
     parser.add_argument("--num_layers", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.1)
 
     # Training options
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0)
+    parser.add_argument("--acv", "--anti_correlation_variance", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
@@ -718,13 +909,14 @@ if __name__ == "__main__":
 
     lr = args.lr
     wd = args.wd
+    acv = args.acv
 
     preprocess_audio(in_dir, dataset_cache)
     train_dataset = AudioLatentDataset(dataset_cache, "train")
     val_dataset = AudioLatentDataset(dataset_cache, "val")
     print_data_summary(train_dataset, val_dataset)
 
-    dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True)
+    dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
     inputs, targets = next(iter(dataloader))
     feature_dim = inputs.shape[2]
     n_outputs, output_size = targets.shape[2], targets.shape[3]
@@ -755,7 +947,7 @@ if __name__ == "__main__":
             n_outputs=n_outputs,
             output_size=output_size,
         ).to(device)
-    else:
+    elif args.context is not None:
         name = "_".join(
             [
                 f"context:{context}",
@@ -781,8 +973,30 @@ if __name__ == "__main__":
             n_outputs=n_outputs,
             output_size=output_size,
         ).to(device)
-    a2l(inputs.to(device))
-    # a2l = torch.cuda.make_graphed_callables(a2l, (torch.randn_like(inputs.to(device)),))
+    else:
+        name = "_".join(
+            [
+                f"mlp",
+                f"layerwise:{n_layerwise}",
+                f"hidden_size:{hidden_size}",
+                f"num_layers:{num_layers}",
+                f"dropout:{dropout}",
+                f"lr:{lr}",
+                f"wd:{wd}",
+            ]
+        )
+        a2l = MLP(
+            input_mean=train_dataset.mean,
+            input_std=train_dataset.std,
+            in_channels=feature_dim,
+            channels=hidden_size,
+            out_channels=output_size,
+            n_outputs=n_outputs,
+            n_layerwise=n_layerwise,
+            num_layers=num_layers,
+            dropout=dropout,
+        ).to(device)
+    # a2l(inputs.to(device))
     print_model_summary(a2l)
 
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
@@ -795,8 +1009,10 @@ if __name__ == "__main__":
     video_interval = 20
     eval_interval = 5
     pbar = tqdm(range(n_epochs))
+    grad_noise = []
     for epoch in pbar:
         losses = []
+        a2l.train()
         for inputs, targets in dataloader:
 
             inputs, targets = inputs.to(device), targets.to(device)
@@ -805,6 +1021,16 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
             loss.backward()
+
+            if acv > 0:
+                with torch.no_grad():
+                    for p, param in enumerate(a2l.parameters()):
+                        if len(grad_noise) <= p:
+                            grad_noise.append(torch.randn_like(param) * acv)
+                        new_noise = torch.randn_like(param) * acv
+                        param.grad.data.add_(new_noise - grad_noise[p])
+                        grad_noise[p] = new_noise
+
             optimizer.step()
 
             writer.add_scalar("Loss/train", loss.item(), n_iter)
@@ -820,20 +1046,17 @@ if __name__ == "__main__":
                     val_dataloader = DataLoader(
                         val_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True
                     )
-                    val_loss, latent_residuals = 0, []
-                    for inputs, targets in val_dataloader:
+                    val_loss, latent_residuals = 0, [0 for _ in range(5)]
+                    for it, (inputs, targets) in enumerate(val_dataloader):
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = a2l(inputs)
-                        latent_residuals.append(outputs.cpu().numpy())
+                        latent_residuals[it % 5] = outputs.cpu().numpy().flatten()
                         val_loss += F.mse_loss(outputs, targets)
                     val_loss /= len(val_dataloader)
-                    latent_residuals = np.concatenate(latent_residuals)
-                    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
+                    loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
 
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
                     writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
-
-                    a2l.train()
                 else:
                     val_loss, scale = -1, -1
 
