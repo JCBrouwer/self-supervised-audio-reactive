@@ -1,23 +1,24 @@
 import numpy as np
+import torch
 
 
 def rank_ordinal(a):
-    arr = np.ravel(np.asarray(a))
-    sorter = np.argsort(arr, kind="mergesort")
-    inv = np.empty(sorter.size, dtype=np.intp)
-    inv[sorter] = np.arange(sorter.size, dtype=np.intp)
+    arr = torch.flatten(a)
+    sorter = torch.argsort(arr)
+    inv = torch.empty(sorter.numel(), dtype=torch.long)
+    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long)
     return inv + 1
 
 
 def rank_max(a):
-    arr = np.ravel(np.asarray(a))
-    sorter = np.argsort(arr, kind="quicksort")
-    inv = np.empty(sorter.size, dtype=np.intp)
-    inv[sorter] = np.arange(sorter.size, dtype=np.intp)
+    arr = torch.flatten(a)
+    sorter = torch.argsort(arr)
+    inv = torch.empty(sorter.numel(), dtype=torch.long)
+    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long)
     arr = arr[sorter]
-    obs = np.r_[True, arr[1:] != arr[:-1]]
-    dense = obs.cumsum()[inv]
-    count = np.r_[np.nonzero(obs)[0], len(obs)]
+    obs = torch.cat((torch.ones((1)).to(arr), (arr[1:] != arr[:-1]))).to(torch.long)
+    dense = torch.cumsum(obs, 0)[inv]
+    count = torch.cat((torch.nonzero(obs).squeeze(), torch.tensor([len(obs)]).to(obs)))
     return count[dense]
 
 
@@ -26,9 +27,20 @@ def rank(x):
     randomized_indices = np.random.choice(np.arange(len_x), len_x, replace=False)
     randomized = x[randomized_indices]
     rankdata = rank_ordinal(randomized)
-    randomized_indices_order = np.argsort(randomized_indices)
-    unrandomized_indices = np.arange(len_x)[randomized_indices_order]
+    randomized_indices_order = torch.argsort(randomized_indices)
+    unrandomized_indices = torch.arange(len_x)[randomized_indices_order]
     return rankdata[unrandomized_indices]
+
+
+from tqdm import tqdm
+
+
+def quadratic_xi(x, y):
+    xis = []
+    for xcol in tqdm(range(x.shape[1])):
+        for ycol in range(y.shape[1]):
+            xis.append(xi(x[:, xcol], y[:, ycol]))
+    return xis
 
 
 def xi(x, y):
@@ -61,13 +73,13 @@ def xi(x, y):
 
     y_rank_max = rank_max(y) / n
 
-    x_ordered = np.argsort(rank_ordinal(x))
+    x_ordered = torch.argsort(rank_ordinal(x))
     x_rank_max_ordered = y_rank_max[x_ordered]
 
-    mean_absolute = np.mean(np.abs(x_rank_max_ordered[:-1] - x_rank_max_ordered[1:])) * (n - 1) / (2 * n)
+    mean_absolute = torch.mean(torch.abs(x_rank_max_ordered[:-1] - x_rank_max_ordered[1:])) * (n - 1) / (2 * n)
 
     g = rank_max(-y) / n
-    inverse_g_mean = np.mean(g * (1 - g))
+    inverse_g_mean = torch.mean(g * (1 - g))
 
     return 1 - mean_absolute / inverse_g_mean
 
@@ -88,8 +100,13 @@ foci_r = importr("FOCI")
 numpy2ri.activate()
 
 
-def foci(x, y):
-    results = foci_r.foci(y, x, num_features=x.shape[1], stop=False)
+def mean_conditional_dependence(x, y):
+    results = foci_r.foci(y.detach().cpu().numpy(), x.detach().cpu().numpy(), num_features=x.shape[1], stop=False)
+    return np.mean([c[0] for c in results[0]])
+
+
+def conditional_dependence(x, y):
+    results = foci_r.foci(y.detach().cpu().numpy(), x.detach().cpu().numpy(), num_features=x.shape[1], stop=False)
     columns = [c[0] for c in results[0]]
     order = np.argsort(columns)
     return results[1][order]
@@ -103,22 +120,22 @@ if __name__ == "__main__":
 
     import matplotlib.pyplot as plt
 
-    x = np.linspace(-5, 5, 100)
-    y = np.linspace(-5, 5, 100)
+    x = torch.linspace(-5, 5, 100)
+    y = torch.linspace(-5, 5, 100)
 
-    n0 = lambda: np.zeros_like(y)
-    n1 = lambda: np.random.uniform(0, 1, 100)
-    n2 = lambda: np.random.uniform(0, 3, 100)
-    n3 = lambda: np.random.uniform(0, 5, 100)
+    n0 = lambda: torch.zeros_like(y)
+    n1 = lambda: torch.from_numpy(np.random.uniform(0, 1, 100))
+    n2 = lambda: torch.from_numpy(np.random.uniform(0, 3, 100))
+    n3 = lambda: torch.from_numpy(np.random.uniform(0, 5, 100))
 
     fig, ax = plt.subplots(3, 4, figsize=(12, 8))
-    for i, fn in enumerate([lambda y: y, lambda y: np.sin(y), lambda y: y ** 2]):
+    for i, fn in enumerate([lambda y: y, lambda y: torch.sin(y), lambda y: y ** 2]):
         for j, n in enumerate([n0, n1, n2, n3]):
 
             yy = fn(y) + n()
 
             xi_score = xi(x, yy)
-            foci_score = foci(x[:, None], yy)[0]
+            foci_score = conditional_dependence(x[:, None], yy)[0]
 
             ax[i, j].plot(x, yy, ".")
             ax[i, j].set_title(f"xi={xi_score:.3f}, foci={foci_score:.3f}")

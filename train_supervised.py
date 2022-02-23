@@ -5,6 +5,7 @@ import gc
 import os
 import shutil
 import sys
+from functools import partial
 from glob import glob
 from pathlib import Path
 
@@ -13,21 +14,21 @@ import librosa as rosa
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.nn.modules.activation import GELU
 import torchaudio
 import torchdatasets as td
 from better_lstm import LSTM
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
-from torch.nn import (GRU, Conv1d, Dropout, LazyConv1d, LazyConvTranspose1d,
-                      LeakyReLU, Linear, Module, ModuleList, Parameter,
-                      Sequential, Sigmoid)
-from torch.nn.modules.pooling import AvgPool1d
+from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, Dropout, LazyConv1d,
+                      LazyConvTranspose1d, LeakyReLU, Linear, Module,
+                      ModuleList, Parameter, Sequential, Sigmoid)
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchqrnn import QRNN
 from tqdm import tqdm
 from x_transformers.x_transformers import AttentionLayers
+
+from context_fid import calculate_fcd
 
 # fmt:on
 
@@ -43,55 +44,23 @@ DUR = 8
 FPS = 24
 
 
-def latent_residual_hist():
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from scipy import stats
-
-    latent_residuals = []
-    i, n = 0, 32
-    for _, targets in dataloader:
-        latent_residuals.append(targets.numpy())
-        i += 1
-        if i > n:
-            break
-    latent_residuals = np.concatenate(latent_residuals).flatten()
-    plt.figure(figsize=(16, 9))
-    plt.hist(
-        latent_residuals,
-        bins=1000,
-        label=f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})",
-        color="tab:blue",
-        alpha=0.5,
-        density=True,
-    )
-    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
-    xs = np.linspace(-2, 2, 1000)
-    plt.plot(
-        xs,
-        stats.laplace.pdf(xs, loc=loc, scale=scale),
-        label=rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})",
-        color="tab:orange",
-        alpha=0.75,
-    )
-    plt.title("Distribution of latent residuals")
-    plt.legend()
-    plt.xlim(-2, 2)
-    plt.tight_layout()
-    plt.savefig(f"plots/latent-residuals-distribution-true-{Path(dataset_cache).stem}.png")
-
-
 @torch.inference_mode()
-def audio2video(a2l, audio_file, out_file, stylegan_file, output_size=(512, 512), batch_size=8, offset=0, duration=40):
-    a2l = a2l.eval().to(device)
-
-    test_features = audio2features(*torchaudio.load(audio_file))[24 * offset : 24 * (offset + duration)].to(device)
-    test_latents = a2l(test_features.unsqueeze(0)).squeeze()
+def _audio2video(
+    a2l,
+    test_features,
+    audio_file,
+    out_file,
+    stylegan_file,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    seed=42,
+):
+    test_latents = a2l(test_features).squeeze()
 
     mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
-    latent_offset = mapper(torch.from_numpy(np.random.RandomState(42).randn(1, 512))).to(device)
+    latent_offset = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
     del mapper
 
     synthesizer = StyleGAN2Synthesizer(
@@ -115,6 +84,16 @@ def audio2video(a2l, audio_file, out_file, stylegan_file, output_size=(512, 512)
     torch.cuda.empty_cache()
 
 
+@torch.inference_mode()
+def audio2video(a2l, audio_file, out_file, stylegan_file, output_size=(512, 512), batch_size=8, offset=0, duration=40):
+    a2l = a2l.eval().to(device)
+    audio, sr = torchaudio.load(audio_file)
+    test_features = audio2features(audio, sr)
+    test_features = test_features[24 * offset : 24 * (offset + duration)]
+    test_features = test_features.unsqueeze(0).to(device)
+    _audio2video(a2l, test_features, audio_file, out_file, stylegan_file, output_size, batch_size, offset, duration)
+
+
 def low_pass(audio, sr):
     return signal.sosfilt(signal.butter(12, 200, "low", fs=sr, output="sos"), audio)
 
@@ -127,7 +106,7 @@ def high_pass(audio, sr):
     return signal.sosfilt(signal.butter(12, 2000, "high", fs=sr, output="sos"), audio)
 
 
-def audio2features(audio, sr):
+def audio2features(audio, sr, clamp=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
     audio = torchaudio.transforms.Resample(sr, SR)(audio).numpy()
@@ -148,7 +127,8 @@ def audio2features(audio, sr):
         (mfcc, chroma, tonnetz, contrast, onsets, onsets_low, onsets_mid, onsets_high, pulse, volume, flatness), axis=1
     )
     features = torch.from_numpy(features).float()
-
+    if clamp:
+        features = features.clamp(torch.quantile(features, q=0.025, dim=0), torch.quantile(features, q=0.975, dim=0))
     return features
 
 
@@ -244,8 +224,8 @@ def print_data_summary(train, val):
 def print_model_summary(model):
     print()
     print("model summary:")
-    print("name".ljust(30), "class".ljust(20), "output shape".ljust(40), "num params")
-    print("-" * 111)
+    print("name".ljust(50), "class".ljust(20), "output shape".ljust(40), "num params")
+    print("-" * 130)
     global total_params
     total_params = 0
     handles = []
@@ -263,7 +243,7 @@ def print_model_summary(model):
                 num_params = sum(p.numel() for p in m.parameters())
                 total_params += num_params
                 print(
-                    name.ljust(30),
+                    name.ljust(50),
                     class_name.ljust(20),
                     f"{output_shape}".ljust(40),
                     f"{num_params/ 1000:.2f} K" if num_params > 0 else "0",
@@ -273,8 +253,8 @@ def print_model_summary(model):
     a2l(inputs.to(device))
     for handle in handles:
         handle.remove()
-    print("-" * 111)
-    print("total".ljust(30), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
+    print("-" * 130)
+    print("total".ljust(50), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
 
 
 class AudioLatentDataset(td.Dataset):
@@ -414,49 +394,46 @@ class Audio2Latent(Module):
         else:
             raise NotImplementedError()
 
-        self.relu = LeakyReLU(0.2)
+        self.relu = Sequential(LeakyReLU(0.2), Dropout(dropout))
 
         if skip_backbone:
+            skip_size = hidden_size
             self.backbone_skip = Sequential(
                 Linear(input_size, hidden_size),
                 LeakyReLU(0.2),
-                Linear(hidden_size, hidden_size // 2),
+                Dropout(dropout),
+                Linear(hidden_size, skip_size),
                 LeakyReLU(0.2),
-                Linear(hidden_size // 2, hidden_size // 2),
+                Dropout(dropout),
+                AttentionLayer(skip_size, skip_size, 4, 128, dropout),
                 LeakyReLU(0.2),
+                Dropout(dropout),
             )
         else:
             self.backbone_skip = None
 
         assert n_outputs % n_layerwise == 0, f"n_outputs must be divisible by n_layerwise! {n_outputs} / {n_layerwise}"
-        layerwise_size = hidden_size + (hidden_size // 2 if skip_backbone else 0)
+        layerwise_size = hidden_size + (skip_size if skip_backbone else 0)
 
         if layerwise == "dense":
-            self.layerwise = ModuleList(
-                [
-                    Sequential(
-                        Linear(layerwise_size, hidden_size * 2),
-                        LeakyReLU(0.2),
-                        Linear(hidden_size * 2, output_size),
-                        UnsqueezeLayerwise(n_outputs // n_layerwise),
-                    )
-                    for _ in range(n_layerwise)
-                ]
+            self.layerwise = LayerwiseLinear(
+                in_channels=layerwise_size,
+                out_channels=output_size,
+                n_outputs=n_outputs,
+                n_layerwise=n_layerwise,
+                dropout=dropout,
+                act=partial(F.leaky_relu, negative_slope=0.2),
             )
 
         elif layerwise == "conv":
-            self.layerwise = ModuleList(
-                [
-                    Sequential(
-                        SwapChannels(),
-                        Conv1d(layerwise_size, hidden_size * 2, 5, 1, 2),
-                        LeakyReLU(0.2),
-                        Conv1d(hidden_size * 2, output_size, 5, 1, 2),
-                        SwapChannels(),
-                        UnsqueezeLayerwise(n_outputs // n_layerwise),
-                    )
-                    for _ in range(n_layerwise)
-                ]
+            self.layerwise = LayerwiseConv(
+                in_channels=layerwise_size,
+                out_channels=output_size,
+                kernel_size=5,
+                n_outputs=n_outputs,
+                n_layerwise=n_layerwise,
+                dropout=dropout,
+                act=partial(F.leaky_relu, negative_slope=0.2),
             )
 
         else:
@@ -465,12 +442,84 @@ class Audio2Latent(Module):
     def forward(self, x):
         w, _ = self.backbone(self.normalize(x))
         w = w[:, : x.shape[1]]  # remove padding
-        if self.backbone_skip is not None:
-            wx = torch.cat((self.relu(w), self.backbone_skip(x)), axis=2)
-        else:
-            wx = self.relu(w)
-        w_plus = torch.cat([layerwise(wx) for layerwise in self.layerwise], axis=2)
+        wx = self.relu(w) if self.backbone_skip is None else torch.cat((self.relu(w), self.backbone_skip(x)), axis=2)
+        w_plus = self.layerwise(wx)
         return w_plus
+
+
+class LayerwiseLinear(Module):
+    def __init__(self, in_channels, out_channels, n_outputs, n_layerwise, dropout, act=F.gelu):
+        super().__init__()
+        self.dropout = dropout
+        self.NO = n_outputs
+        self.NL = n_layerwise
+        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels)
+        self.w2, self.b2 = self.get_weights_and_bias(1, in_channels, out_channels)
+        self.act = act
+
+    def get_weights_and_bias(self, NL, IC, OC):
+        w, b = torch.Tensor(NL, IC, OC), torch.Tensor(NL, OC)
+
+        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / np.sqrt(fan_in)
+        torch.nn.init.uniform_(b, -bound, bound)
+        return Parameter(w.squeeze()), Parameter(b.squeeze())
+
+    def forward(self, x):  # B,T,IC
+        x = x.unsqueeze(2)  # B,T,1,IC
+        x = x.tile(1, 1, self.NL, 1)  # B,T,NL,IC
+        x = torch.matmul(x.unsqueeze(3), self.w1).squeeze(3) + self.b1  # B,T,NL,IC*2
+        x = self.act(x)
+        x = F.dropout(x, self.dropout, self.training)
+        x = torch.matmul(x, self.w2) + self.b2  # B,T,NL,OC
+        B, T, _, OC = x.shape
+        x = x.unsqueeze(3)  # B,T,NL,1,OC
+        x = x.tile(1, 1, 1, self.NO // self.NL, 1)  # B,T,NL,NO//NL,OC
+        x = x.reshape(B, T, self.NO, OC)  # B,T,NO,OC
+        return x
+
+
+class LayerwiseConv(Module):
+    def __init__(self, in_channels, out_channels, kernel_size, n_outputs, n_layerwise, dropout, act=F.gelu):
+        super().__init__()
+        self.dropout = dropout
+        self.NO = n_outputs
+        self.NL = n_layerwise
+        self.padding = (kernel_size - 1) // 2
+        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels, kernel_size)
+        self.w2, self.b2 = self.get_weights_and_bias(1, in_channels, out_channels, kernel_size)
+        self.act = act
+
+    def get_weights_and_bias(self, NL, IC, OC, ks):
+        w, b = torch.Tensor(NL * OC, IC, ks), torch.Tensor(1, NL * OC, 1)
+
+        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
+
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / np.sqrt(fan_in)
+        torch.nn.init.uniform_(b, -bound, bound)
+        return Parameter(w), Parameter(b)
+
+    def forward(self, x):  # B,T,IC
+        B, T, IC = x.shape
+        x = x.transpose(1, 2)  # B,IC,T
+        x = x.unsqueeze(2)  # B,IC,1,T
+        x = x.tile(1, 1, self.NL, 1)  # B,NL,IC,T
+        x = x.reshape(B, self.NL * IC, T)  # B,NL*IC,T
+        x = F.conv1d(x, self.w1, padding=self.padding, groups=self.NL) + self.b1  # B,NL*IC*2,T
+        x = self.act(x)
+        x = F.dropout(x, self.dropout, self.training)
+        x = x.reshape(B * self.NL, -1, T)  # B*NL,IC*2,T
+        x = F.conv1d(x, self.w2, padding=self.padding) + self.b2  # B*NL,OC,T
+        x = x.reshape(B, self.NL, -1, T)  # B,NL,OC,T
+        _, _, OC, _ = x.shape
+        x = x.unsqueeze(2)  # B,NL,1,OC,T
+        x = x.tile(1, 1, self.NO // self.NL, 1, 1)  # B,NL,NO//NL,OC,T
+        x = x.reshape(B, self.NO, OC, T)  # B,NO,OC,T
+        x = x.permute(0, 3, 1, 2)  # B,T,NO,OC
+        return x
 
 
 class Pool(Module):
@@ -575,149 +624,6 @@ class AttentionLayer(AttentionLayers):
             dropout=dropout,
             rotary_pos_emb=True,
         )
-
-
-class ConvolutionalGatingUnit(Module):
-    def __init__(self, channels, kernel_size):
-        super().__init__()
-        self.conv = Conv1d(
-            channels // 2, channels // 2, kernel_size, padding=(kernel_size - 1) // 2, groups=channels // 2
-        )
-        self.dense = Linear(channels // 2, channels // 2)
-
-    def forward(self, x, z=None):
-        xr, xg = x.chunk(2, dim=2)
-        xg = self.conv(xg.transpose(1, 2)).transpose(1, 2)
-        xg = self.dense(xg)
-        if z is not None:
-            xg = xg + z
-        return xr * xg
-
-
-class MLPBlock(Module):
-    def __init__(self, channels, kernel_size, mult):
-        super().__init__()
-        self.dense1 = Linear(channels, channels * mult)
-        self.act = GELU()
-        self.cgu = ConvolutionalGatingUnit(channels * mult, kernel_size)
-        self.dense2 = Linear(channels * mult // 2, channels)
-
-    def forward(self, x, z=None):
-        y = self.dense1(x)
-        y = self.act(y)
-        y = self.cgu(y, z)
-        y = self.dense2(y)
-        return x + y
-
-
-class LayerwiseLinear(Module):
-    def __init__(self, in_channels, out_channels, n_outputs, n_layerwise, act=F.gelu):
-        super().__init__()
-        self.NO = n_outputs
-        self.NL = n_layerwise
-        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels * 2)
-        self.w2, self.b2 = self.get_weights_and_bias(n_layerwise, in_channels * 2, out_channels)
-        self.act = act
-
-    def get_weights_and_bias(self, NL, IC, OC):
-        w, b = torch.Tensor(NL, IC, OC), torch.Tensor(NL, OC)
-
-        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
-
-        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
-        bound = 1 / np.sqrt(fan_in)
-        torch.nn.init.uniform_(b, -bound, bound)
-        return Parameter(w), Parameter(b)
-
-    def forward(self, x):  # B,T,IC
-        x = x.unsqueeze(2)  # B,T,1,IC
-        x = x.tile(1, 1, self.NL, 1)  # B,T,NL,IC
-        x = torch.matmul(x.unsqueeze(3), self.w1).squeeze(3) + self.b1  # B,T,NL,IC*2
-        x = self.act(x)
-        x = torch.matmul(x.unsqueeze(3), self.w2).squeeze(3) + self.b2  # B,T,NL,OC
-        B, T, _, OC = x.shape
-        x = x.unsqueeze(3)  # B,T,NL,1,OC
-        x = x.tile(1, 1, 1, self.NO // self.NL, 1)  # B,T,NL,NO//NL,OC
-        x = x.reshape(B, T, self.NO, OC)  # B,T,NO,OC
-        return x
-
-
-class LayerwiseConv(Module):
-    def __init__(self, in_channels, out_channels, kernel_size, n_outputs, n_layerwise, act=F.gelu):
-        super().__init__()
-        self.NO = n_outputs
-        self.NL = n_layerwise
-        self.padding = (kernel_size - 1) // 2
-        self.w1, self.b1 = self.get_weights_and_bias(n_layerwise, in_channels, in_channels * 2, kernel_size)
-        self.w2, self.b2 = self.get_weights_and_bias(n_layerwise, in_channels * 2, out_channels, kernel_size)
-        self.act = act
-
-    def get_weights_and_bias(self, NL, IC, OC, ks):
-        w, b = torch.Tensor(NL * OC, IC, ks), torch.Tensor(1, NL * OC, 1)
-
-        torch.nn.init.kaiming_uniform_(w, a=np.sqrt(5))
-
-        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
-        bound = 1 / np.sqrt(fan_in)
-        torch.nn.init.uniform_(b, -bound, bound)
-        return Parameter(w), Parameter(b)
-
-    def forward(self, x):  # B,T,IC
-        B, T, IC = x.shape
-        x = x.transpose(1, 2)  # B,IC,T
-        x = x.unsqueeze(2)  # B,IC,1,T
-        x = x.tile(1, 1, self.NL, 1)  # B,NL,IC,T
-        x = x.reshape(B, self.NL * IC, T)  # B,NL*IC,T
-        x = F.conv1d(x, self.w1, padding=self.padding, groups=self.NL) + self.b1  # B,NL*IC*2,T
-        x = self.act(x)
-        x = F.conv1d(x, self.w2, padding=self.padding, groups=self.NL) + self.b2  # B,NL*OC,T
-        x = x.reshape(B, self.NL, -1, T)  # B,NL,OC,T
-        _, _, OC, _ = x.shape
-        x = x.unsqueeze(2)  # B,NL,1,OC,T
-        x = x.tile(1, 1, self.NO // self.NL, 1, 1)  # B,NL,NO//NL,OC,T
-        x = x.reshape(B, self.NO, OC, T)  # B,NO,OC,T
-        x = x.permute(0, 3, 1, 2)  # B,T,NO,OC
-        return x
-
-
-class MLP(Module):
-    def __init__(
-        self,
-        input_mean,
-        input_std,
-        in_channels,
-        channels,
-        out_channels,
-        n_outputs,
-        n_layerwise,
-        num_layers,
-        dropout,
-        mult=2,
-        kernel_size=15,
-    ):
-        super().__init__()
-        self.normalize = Normalize(input_mean, input_std + 1e-8)
-        self.attn = Sequential(
-            Linear(in_channels, channels * mult // 2),
-            GELU(),
-            Dropout(dropout),
-            AttentionLayer(channels * mult // 2, channels * mult // 2, n_head=4, dim_head=128, dropout=dropout),
-        )
-        self.input_dense = Linear(in_channels, channels)
-        self.dropout = Dropout(dropout)
-        self.blocks = ModuleList([MLPBlock(channels, kernel_size=kernel_size, mult=mult) for _ in range(num_layers)])
-        self.layerwise = LayerwiseConv(channels, out_channels, 5, n_outputs, n_layerwise)
-
-    def forward(self, x):
-        x = self.normalize(x)
-        z = self.attn(x)
-        x = self.input_dense(x)
-        x = self.dropout(x)
-        for block in self.blocks:
-            x = block(x, z)
-            x = self.dropout(x)
-        w = self.layerwise(x)
-        return w
 
 
 class ContextAndCorrelationLayer(Module):
@@ -862,6 +768,79 @@ class Audio2Latent2(Module):
         return w_plus
 
 
+class ConvolutionalGatingUnit(Module):
+    def __init__(self, channels, kernel_size):
+        super().__init__()
+        self.conv = Conv1d(
+            channels // 2, channels // 2, kernel_size, padding=(kernel_size - 1) // 2, groups=channels // 2
+        )
+        self.dense = Linear(channels // 2, channels // 2)
+
+    def forward(self, x, z=None):
+        xr, xg = x.chunk(2, dim=2)
+        xg = self.conv(xg.transpose(1, 2)).transpose(1, 2)
+        xg = self.dense(xg)
+        if z is not None:
+            xg = xg + z
+        return xr * xg
+
+
+class MLPBlock(Module):
+    def __init__(self, channels, kernel_size, mult):
+        super().__init__()
+        self.dense1 = Linear(channels, channels * mult)
+        self.act = GELU()
+        self.cgu = ConvolutionalGatingUnit(channels * mult, kernel_size)
+        self.dense2 = Linear(channels * mult // 2, channels)
+
+    def forward(self, x, z=None):
+        y = self.dense1(x)
+        y = self.act(y)
+        y = self.cgu(y, z)
+        y = self.dense2(y)
+        return x + y
+
+
+class MLP(Module):
+    def __init__(
+        self,
+        input_mean,
+        input_std,
+        in_channels,
+        channels,
+        out_channels,
+        n_outputs,
+        n_layerwise,
+        num_layers,
+        dropout,
+        mult=2,
+        kernel_size=15,
+    ):
+        super().__init__()
+        self.normalize = Normalize(input_mean, input_std + 1e-8)
+        self.attn = Sequential(
+            Linear(in_channels, channels * mult // 2),
+            GELU(),
+            Dropout(dropout),
+            AttentionLayer(channels * mult // 2, channels * mult // 2, n_head=4, dim_head=128, dropout=dropout),
+        )
+        self.input_dense = Linear(in_channels, channels)
+        self.dropout = Dropout(dropout)
+        self.blocks = ModuleList([MLPBlock(channels, kernel_size=kernel_size, mult=mult) for _ in range(num_layers)])
+        self.layerwise = LayerwiseConv(channels, out_channels, 5, n_outputs, n_layerwise, dropout)
+
+    def forward(self, x):
+        x = self.normalize(x)
+        z = self.attn(x)
+        x = self.input_dense(x)
+        x = self.dropout(x)
+        for block in self.blocks:
+            x = block(x, z)
+            x = self.dropout(x)
+        w = self.layerwise(x)
+        return w
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -878,16 +857,15 @@ if __name__ == "__main__":
     parser.add_argument("--mlp", action="store_true")
 
     # Shared options
-    parser.add_argument("--n_layerwise", type=int, default=6, choices=[1, 2, 3, 6, 9, 18])
+    parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.2)
 
     # Training options
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0)
-    parser.add_argument("--acv", "--anti_correlation_variance", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
@@ -910,7 +888,6 @@ if __name__ == "__main__":
 
     lr = args.lr
     wd = args.wd
-    acv = args.acv
 
     preprocess_audio(in_dir, dataset_cache)
     train_dataset = AudioLatentDataset(dataset_cache, "train")
@@ -997,7 +974,7 @@ if __name__ == "__main__":
             num_layers=num_layers,
             dropout=dropout,
         ).to(device)
-    # a2l(inputs.to(device))
+    a2l(inputs.to(device))
     print_model_summary(a2l)
 
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
@@ -1023,15 +1000,6 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             loss.backward()
 
-            if acv > 0:
-                with torch.no_grad():
-                    for p, param in enumerate(a2l.parameters()):
-                        if len(grad_noise) <= p:
-                            grad_noise.append(torch.randn_like(param) * acv)
-                        new_noise = torch.randn_like(param) * acv
-                        param.grad.data.add_(new_noise - grad_noise[p])
-                        grad_noise[p] = new_noise
-
             optimizer.step()
 
             writer.add_scalar("Loss/train", loss.item(), n_iter)
@@ -1047,15 +1015,17 @@ if __name__ == "__main__":
                     val_dataloader = DataLoader(
                         val_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True
                     )
-                    n_lap_b = 32
-                    val_loss, latent_residuals = 0, [0 for _ in range(n_lap_b)]
+                    val_loss, latent_residuals = 0, []
                     for it, (inputs, targets) in enumerate(val_dataloader):
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = a2l(inputs)
-                        latent_residuals[it % n_lap_b] = outputs.cpu().numpy().flatten()
+                        latent_residuals.append(np.random.choice(outputs.cpu().numpy().flatten(), 100_000))
                         val_loss += F.mse_loss(outputs, targets)
                     val_loss /= len(val_dataloader)
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
+
+                    fcd = calculate_fcd(val_dataloader, a2l)
+                    writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
 
                     try:
                         loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
@@ -1068,14 +1038,15 @@ if __name__ == "__main__":
                     val_loss, scale = -1, -1
 
             pbar.write("")
-            pbar.write(f"epoch {epoch+1}")
+            pbar.write(f"epoch {epoch + 1}")
             pbar.write(f"train_loss: {train_loss:.4f}")
             pbar.write(f"val_loss  : {val_loss:.4f}")
             pbar.write(f"laplace_b : {scale:.4f}")
+            pbar.write(f"fcd       : {fcd:.4f}")
             pbar.write("")
 
         if (epoch + 1) % video_interval == 0 or (epoch + 1) == n_epochs:
-            checkpoint_name = f"audio2latent_{name}_steps{n_iter}_val{val_loss:.4f}_b{scale:.4f}"
+            checkpoint_name = f"audio2latent_{name}_steps{n_iter:08}_fcd{fcd:.4f}_b{scale:.4f}_val{val_loss:.4f}"
             joblib.dump(
                 {"a2l": a2l, "optim": optimizer, "n_iter": n_iter}, f"{writer.log_dir}/{checkpoint_name}.pt", compress=9
             )
