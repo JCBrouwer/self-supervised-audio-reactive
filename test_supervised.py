@@ -1,4 +1,3 @@
-#%%
 import argparse
 import importlib
 import os
@@ -8,18 +7,26 @@ from copy import copy, deepcopy
 from glob import glob
 from pathlib import Path
 
-import matplotlib
-
-# matplotlib.use("Agg")
-
 import joblib
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchaudio
 from scipy import stats
+from scipy.stats import ttest_ind
+from tqdm import tqdm
 
-from train_supervised import Normalize, _audio2video, audio2features, audio2video, device
+from sgw import sgw_gpu
+from train_supervised import (
+    Normalize,
+    StyleGAN2Synthesizer,
+    VideoWriter,
+    _audio2video,
+    audio2features,
+    audio2video,
+    device,
+)
 
 
 class FullLengthAudioFeatureDataset(torch.utils.data.Dataset):
@@ -125,231 +132,296 @@ def load_a2l(path):
     return a2l
 
 
-#%%
-test_audio = "/home/hans/datasets/wavefunk/tau ceti alpha.flac"
-audio, sr = torchaudio.load(test_audio)
-#%%
-features = audio2features(audio, sr).unsqueeze(0).to(device)
-#%%
-features = features[:, int(22.5 * 24) : int((22.5 + 45) * 24)]
-#%%
-checkpoint = "runs/Feb22_11-02-45_ubuntu94025backbone:gru:skipTrue_layerwise:conv:6_hidden_size:128_num_layers:8_dropout:0.2_lr:0.0001_wd:0/audio2latent_backbone:gru:skipTrue_layerwise:conv:6_hidden_size:128_num_layers:8_dropout:0.2_lr:0.0001_wd:0_steps01358720_fcd57.8728_b0.0446_val0.0439.pt"
-a2l = load_a2l(checkpoint)
-#%%
-norm_feats = a2l.normalize(features)
-#%%
-col_widths = [20, 12, 6, 7, 1, 1, 1, 1, 1, 1, 1]
-feature_names = [
-    "mfcc",
-    "chroma",
-    "tonnetz",
-    "contrast",
-    "onsets",
-    "onsets_low",
-    "onsets_mid",
-    "onsets_high",
-    "pulse",
-    "volume",
-    "flatness",
-]
-assert sum(col_widths) == 52
-col_names = [
-    *[f"mfcc_{i}" for i in range(20)],
-    *[f"chroma_{i}" for i in range(12)],
-    *[f"tonnetz_{i}" for i in range(6)],
-    *[f"contrast_{i}" for i in range(7)],
-    "onsets",
-    "onsets_low",
-    "onsets_mid",
-    "onsets_high",
-    "pulse",
-    "volume",
-    "flatness",
-]
-for col in range(52):
-    print(
-        col_names[col],
-        f"{norm_feats[:, :, col].min().item():.4f}",
-        f"{norm_feats[:, :, col].mean().item():.4f}",
-        f"{norm_feats[:, :, col].max().item():.4f}",
-    )
-#%%
-import pandas as pd
+# for col in range(52):
+#     print(
+#         col_names[col],
+#         f"{norm_feats[:, :, col].min().item():.4f}",
+#         f"{norm_feats[:, :, col].mean().item():.4f}",
+#         f"{norm_feats[:, :, col].max().item():.4f}",
+#     )
 
-#%%
-df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=col_names)
-#%%
-for col in df.columns:
-    plt.plot(df[col].values, label=col)
-plt.show()
-#%%
-fig, ax = plt.subplots(52, 1, figsize=(8, 64))
-for c, col in enumerate(df.columns):
-    ax[c].plot(df[col])
-    ax[c].set_ylabel(col)
-plt.tight_layout()
-plt.show()
-#%%
-_audio2video(
-    a2l=a2l,
-    test_features=features,
-    audio_file=test_audio,
-    out_file=f"runs/{Path(checkpoint).stem}_{Path(test_audio).stem}_unchanged.mp4",
-    stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
-    offset=22.5,
-    duration=45,
-    output_size=(1024, 1024),
-    seed=123,
-)
-#%%
-from scipy.stats import ttest_ind
-from sgw import sgw_gpu
+# import pandas as pd
 
-#%%
-def perturb_zero(x):
-    x[:, c_idx : c_idx + col_width] = 0
-    return x
+# df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=col_names)
+
+# for col in df.columns:
+#     plt.plot(df[col].values, label=col)
+# plt.show()
+
+# fig, ax = plt.subplots(52, 1, figsize=(8, 64))
+# for c, col in enumerate(df.columns):
+#     ax[c].plot(df[col])
+#     ax[c].set_ylabel(col)
+# plt.tight_layout()
+# plt.show()
+
+# _audio2video(
+#     a2l=a2l,
+#     test_features=features[:, int(22.5 * 24) : int((22.5 + 45) * 24)],
+#     audio_file=test_audio,
+#     out_file=f"runs/{Path(checkpoint).stem}_{Path(test_audio).stem}_unchanged.mp4",
+#     stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
+#     offset=22.5,
+#     duration=45,
+#     output_size=(1024, 1024),
+#     seed=123,
+# )
+import librosa as rosa
 
 
-def perturb_invert(x):
-    x[:, c_idx : c_idx + col_width] *= -1
-    return x
+def feature_sensitivity(whole_feature, checkpoint):
+    a2l = load_a2l(checkpoint)
 
+    cache_file = "cache/test_features.npy"
+    if not os.path.exists(cache_file):
+        features = []
+        min_len = 1e10
+        for test_audio in tqdm(glob("/home/hans/datasets/wavefunk/*")):
+            if rosa.get_duration(filename=test_audio) < 128:
+                continue
+            audio, sr = torchaudio.load(test_audio)
+            feats = audio2features(audio, sr)
+            features.append(feats)
+            if len(feats) < min_len:
+                min_len = len(feats)
+        features = torch.stack([f[:min_len] for f in features])
+        np.save(cache_file, features.numpy())
+    else:
+        features = torch.from_numpy(np.load(cache_file))
+    features = features[:, :3072].to(device)
 
-def perturb_random(x):
-    x[:, c_idx : c_idx + col_width] = torch.randn_like(x[:, c_idx : c_idx + col_width])
-    return x
+    norm_feats = a2l.normalize(features)
 
+    col_names = [
+        *[f"mfcc_{i}" for i in range(20)],
+        *[f"chroma_{i}" for i in range(12)],
+        *[f"tonnetz_{i}" for i in range(6)],
+        *[f"contrast_{i}" for i in range(7)],
+        "onsets",
+        "onsets_low",
+        "onsets_mid",
+        "onsets_high",
+        "pulse",
+        "volume",
+        "flatness",
+    ]
+    feature_names = [
+        "mfcc",
+        "chroma",
+        "tonnetz",
+        "contrast",
+        "onsets",
+        "onsets_low",
+        "onsets_mid",
+        "onsets_high",
+        "pulse",
+        "volume",
+        "flatness",
+        "all",
+    ]
 
-def perturb_scale(x):
-    x[:, c_idx : c_idx + col_width] *= 2
-    return x
+    def perturb_zero(x):
+        x[:, c_idx : c_idx + col_width] = 0
+        return x
 
+    def perturb_invert(x):
+        x[:, c_idx : c_idx + col_width] *= -1
+        return x
 
-#%%
-with torch.inference_mode():
-    c_idx = 0
-    trials = 10
-    y = a2l(features).squeeze().mean(1)
-    x = norm_feats.squeeze().clone()
-    xs = torch.stack(sum([list(torch.split(x[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
-    ys = torch.stack(sum([list(torch.split(y[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
+    def perturb_random(x):
+        x[:, c_idx : c_idx + col_width] = torch.randn_like(x[:, c_idx : c_idx + col_width])
+        return x
 
-    ref_sgws = [sgw_gpu(xs, ys, device).item() for _ in range(trials)]
+    def perturb_scale(x):
+        x[:, c_idx : c_idx + col_width] *= 2
+        return x
 
-    print(
-        f"feature".ljust(15),
-        "perturbation".ljust(15),
-        "grom/wass".ljust(10),
-        "std. dev.".ljust(10),
-        "t-stat".ljust(10),
-        "p-value".ljust(10),
-    )
-    print(f"all".ljust(15), "none".ljust(15), f"{np.mean(ref_sgws):.4f}".ljust(10), f"{np.std(ref_sgws):.4f}")
+    if whole_feature:
+        col_widths = [20, 12, 6, 7, 1, 1, 1, 1, 1, 1, 1, 53]
+        col_idxs = [0, 20, 32, 38, 45, 46, 47, 48, 49, 50, 51, 0]
+    else:
+        col_widths = [1] * 52
+        col_idxs = list(range(52))
+        feature_names = col_names
 
-    for perturb_name, perturb in [
-        ("zeroed", perturb_zero),
-        ("inverted", perturb_invert),
-        ("random", perturb_random),
-        ("2x'd", perturb_scale),
-    ]:
-        for feat_name, col_width in zip(feature_names, col_widths):
-            x = norm_feats.squeeze().clone()
-            x = perturb(x)
+    with torch.inference_mode():
+        trials = 5
 
-            xs = torch.stack(sum([list(torch.split(x[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
-            ys = torch.stack(sum([list(torch.split(y[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
+        y = a2l(features).mean(2).squeeze()
+        b, t, c = y.shape
+        y = y.reshape(b * t, c)
 
-            sgws = [sgw_gpu(xs, ys, device).item() for _ in range(trials)]
-            t, p = ttest_ind(ref_sgws, sgws)
-
-            print(
-                feat_name.ljust(15),
-                perturb_name.ljust(15),
-                f"{np.mean(sgws):.4f}".ljust(10),
-                f"{np.std(sgws):.4f}".ljust(10),
-                f"{t:.4f}".ljust(10),
-                f"{p:.4f}",
-                "" if p > 0.01 else "*",
-            )
-
-            c_idx += col_width
-
-        c_idx, col_width = 0, 53
         x = norm_feats.squeeze().clone()
-        x = perturb(x)
+        b, t, c = x.shape
+        x = x.reshape(b * t, c)
 
         xs = torch.stack(sum([list(torch.split(x[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
         ys = torch.stack(sum([list(torch.split(y[start:], 24)[:-1]) for start in range(0, 24, 8)], [])).flatten(1)
 
-        sgws = [sgw_gpu(xs, ys, device).item() for _ in range(trials)]
-        t, p = ttest_ind(ref_sgws, sgws)
+        ref_sgws = [sgw_gpu(xs, ys, device).item() for _ in range(trials)]
 
+        print()
         print(
-            f"all".ljust(15),
-            perturb_name.ljust(15),
-            f"{np.mean(sgws):.4f}".ljust(10),
-            f"{np.std(sgws):.4f}".ljust(10),
-            f"{t:.4f}".ljust(10),
-            f"{p:.4f}",
-            "" if p > 0.01 else "*",
-        )
-
-#%%
-from chatterjee import quadratic_xi
-
-with torch.inference_mode():
-    c_idx = 0
-    yr = a2l(features).squeeze()
-    print(
-        f"feature".ljust(15),
-        "perturbation".ljust(15),
-        "l1/100000".ljust(15),
-        "l2/100".ljust(15),
-        # "mean correlation".ljust(17),
-        # "std. correlation".ljust(17),
-    )
-    for perturb_name, perturb in [
-        ("zeroed", perturb_zero),
-        ("inverted", perturb_invert),
-        ("random", perturb_random),
-        ("2x'd", perturb_scale),
-    ]:
-        for feat_name, col_width in zip(feature_names, col_widths):
-            handle = a2l.normalize.register_forward_hook(lambda m, i, o: perturb(o))
-            y = a2l(features).squeeze()
-            l1 = torch.norm(yr - y, p=1).item()
-            l2 = torch.norm(yr - y, p=2).item()
-            # cd = quadratic_xi(yr.mean(1), y.mean(1))
-            print(
-                feat_name.ljust(15),
-                perturb_name.ljust(15),
-                f"{l1/100_000:.4f}".ljust(15),
-                f"{l2/100:.4f}".ljust(15),
-                # f"{np.mean(cd):.4f}".ljust(17),
-                # f"{np.std(cd):.4f}".ljust(17),
+            " | ".join(
+                [
+                    "",
+                    f"feature".ljust(15),
+                    "perturbation".ljust(15),
+                    "grom/wass".ljust(10),
+                    "std. dev.".ljust(10),
+                    "t-stat".ljust(10),
+                    "p-value".ljust(10),
+                    "*",
+                    "",
+                ]
             )
-            handle.remove()
-            c_idx += col_width
-
-        c_idx, col_width = 0, 53
-        handle = a2l.normalize.register_forward_hook(lambda m, i, o: perturb(o))
-        y = a2l(features).squeeze()
-        l1 = torch.norm(yr - y, p=1).item()
-        l2 = torch.norm(yr - y, p=2).item()
-        # cd = quadratic_xi(yr.mean(1).cpu(), y.mean(1).cpu()).item()
-        print(
-            "all".ljust(15),
-            perturb_name.ljust(15),
-            f"{l1/100_000:.4f}".ljust(15),
-            f"{l2/100:.4f}".ljust(15),
-            # f"{np.mean(cd):.4f}".ljust(17),
-            # f"{np.std(cd):.4f}".ljust(17),
         )
-        handle.remove()
-#%%"
+        print(" | ".join(["", "-" * 15, "-" * 15, "-" * 10, "-" * 10, "-" * 10, "-" * 10, "-", ""]))
+        print(
+            " | ".join(
+                [
+                    "",
+                    f"all".ljust(15),
+                    "none".ljust(15),
+                    f"{np.mean(ref_sgws):.4f}".ljust(10),
+                    f"{np.std(ref_sgws):.4f}".ljust(10),
+                    "".ljust(10),
+                    "".ljust(10),
+                    " ",
+                    "",
+                ]
+            )
+        )
+
+        for perturb_name, perturb in [
+            ("zeroed", perturb_zero),
+            ("inverted", perturb_invert),
+            ("random", perturb_random),
+            ("2x'd", perturb_scale),
+        ]:
+            for feat_name, c_idx, col_width in zip(feature_names, col_idxs, col_widths):
+                x = norm_feats.squeeze().clone()
+                b, t, c = x.shape
+                x = x.reshape(b * t, c)
+                x = perturb(x)
+
+                xs = torch.stack(
+                    sum([list(torch.split(x[start:], 192)[:-1]) for start in range(0, 192, 24)], [])
+                ).flatten(1)
+                ys = torch.stack(
+                    sum([list(torch.split(y[start:], 192)[:-1]) for start in range(0, 192, 24)], [])
+                ).flatten(1)
+
+                sgws = [sgw_gpu(xs, ys, device).item() for _ in range(trials)]
+                t, p = ttest_ind(ref_sgws, sgws)
+
+                print(
+                    " | ".join(
+                        [
+                            "",
+                            feat_name.ljust(15),
+                            perturb_name.ljust(15),
+                            f"{np.mean(sgws):.4f}".ljust(10),
+                            f"{np.std(sgws):.4f}".ljust(10),
+                            f"{t:.4f}".ljust(10),
+                            f"{p:.4f}".ljust(10),
+                            " " if abs(np.mean(sgws) - np.mean(ref_sgws)) < 0.03 else "*",
+                            "",
+                        ]
+                    )
+                )
+
+        print()
+        print(
+            " | ".join(
+                ["", f"feature".ljust(15), "perturbation".ljust(15), "l1/100000".ljust(15), "l2/100".ljust(15), ""]
+            )
+        )
+        print(" | ".join(["", "-" * 15, "-" * 15, "-" * 15, "-" * 15, ""]))
+        yr = a2l(features).squeeze()
+        for perturb_name, perturb in [
+            ("zeroed", perturb_zero),
+            ("inverted", perturb_invert),
+            ("random", perturb_random),
+            ("2x'd", perturb_scale),
+        ]:
+            for feat_name, c_idx, col_width in zip(feature_names, col_idxs, col_widths):
+                handle = a2l.normalize.register_forward_hook(lambda m, i, o: perturb(o))
+                y = a2l(features).squeeze()
+                l1 = torch.norm(yr - y, p=1).item()
+                l2 = torch.norm(yr - y, p=2).item()
+                print(
+                    " | ".join(
+                        [
+                            "",
+                            feat_name.ljust(15),
+                            perturb_name.ljust(15),
+                            f"{l1/100_000:.4f}".ljust(15),
+                            f"{l2/100:.4f}".ljust(15),
+                            "",
+                        ]
+                    )
+                )
+                handle.remove()
+
 
 if __name__ == "__main__":
+    from train_supervised import LatentAugmenter
+
+    with torch.inference_mode():
+        checkpoint = "/home/hans/modelzoo/train_checks/neurout2-117.pt"
+        n_patches = 3
+        output_size = (512, 512)
+        augmenter = LatentAugmenter(checkpoint, n_patches)
+        synthesizer = (
+            StyleGAN2Synthesizer(
+                model_file=checkpoint, inference=False, output_size=output_size, strategy="stretch", layer=0
+            )
+            .eval()
+            .to(device)
+        )
+
+        vid_len = 20
+        fps = 24
+        vid_frames = vid_len * fps
+        batch_size = 16
+
+        for test_audio in tqdm(glob("/home/hans/datasets/wavefunk/*")):
+            if rosa.get_duration(filename=test_audio) <= 40 or "finow" in test_audio:
+                continue
+            audio, sr = torchaudio.load(test_audio)
+            feats = audio2features(audio, sr)
+            start_idx = np.random.randint(0, len(feats) - vid_frames)
+            feats = feats[start_idx : start_idx + vid_frames]
+            residuals, offset = augmenter(feats)
+
+            with VideoWriter(
+                output_file=f"output/{Path(test_audio).stem}_{start_idx}.mp4",
+                output_size=output_size,
+                audio_file=test_audio,
+                audio_offset=start_idx / fps,
+                audio_duration=vid_len,
+            ) as video:
+                for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
+                    for frame in (
+                        synthesizer((residuals[i : i + batch_size] + offset[i : i + batch_size]).to(device))
+                        .add(1)
+                        .div(2)
+                    ):
+                        video.write(frame.unsqueeze(0))
+
+    exit()
+
+    feature_sensitivity(
+        True,
+        "runs/Feb22_17-58-40_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_steps00123520_fcd63.5721_b0.0331_val0.0423.pt",
+    )
+    feature_sensitivity(
+        False,
+        "runs/Feb22_17-58-40_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_steps00123520_fcd63.5721_b0.0331_val0.0423.pt",
+    )
+    exit()
+
     current_a2v = deepcopy(audio2video)
 
     # fmt:off

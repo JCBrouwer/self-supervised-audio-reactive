@@ -1,6 +1,7 @@
 # fmt:off
 
 import argparse
+from copy import deepcopy
 import gc
 import os
 import shutil
@@ -19,10 +20,11 @@ import torchdatasets as td
 from better_lstm import LSTM
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
+from scipy.interpolate import splev, splrep
 from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, Dropout, LazyConv1d,
                       LazyConvTranspose1d, LeakyReLU, Linear, Module,
                       ModuleList, Parameter, Sequential, Sigmoid)
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchqrnn import QRNN
 from tqdm import tqdm
@@ -106,7 +108,7 @@ def high_pass(audio, sr):
     return signal.sosfilt(signal.butter(12, 2000, "high", fs=sr, output="sos"), audio)
 
 
-def audio2features(audio, sr, clamp=True):
+def audio2features(audio, sr, clamp=True, smooth=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
     audio = torchaudio.transforms.Resample(sr, SR)(audio).numpy()
@@ -129,6 +131,8 @@ def audio2features(audio, sr, clamp=True):
     features = torch.from_numpy(features).float()
     if clamp:
         features = features.clamp(torch.quantile(features, q=0.025, dim=0), torch.quantile(features, q=0.975, dim=0))
+    if smooth:
+        features = gaussian_filter(features, 2)
     return features
 
 
@@ -147,7 +151,10 @@ class PreprocessAudioLatentDataset(Dataset):
         audio, sr = torchaudio.load(file)
         features = audio2features(audio, sr)
         features = torch.stack(  # overlapping slices of DUR seconds
-            sum([list(torch.split(features[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, FPS)], [])
+            sum(
+                [list(torch.split(features[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, DUR // 4 * FPS)],
+                [],
+            )
         )
 
         try:
@@ -155,14 +162,17 @@ class PreprocessAudioLatentDataset(Dataset):
         except:
             latents = torch.from_numpy(np.load(f"{filename}.npy")).float()
         latents = torch.stack(
-            sum([list(torch.split(latents[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, FPS)], [])
+            sum(
+                [list(torch.split(latents[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, DUR // 4 * FPS)],
+                [],
+            )
         )
 
         return file, features, latents
 
 
 def collate(batch):
-    return tuple(torch.cat(b) for b in list(map(list, zip(*batch))))
+    return tuple(b if isinstance(b[0], str) else torch.cat(b) for b in list(map(list, zip(*batch))))
 
 
 def filename(file, name):
@@ -179,9 +189,11 @@ def preprocess_audio(in_dir, out_file):
         with NumpyArray(train_feat_file) as train_feats, NumpyArray(train_lat_file) as train_lats, NumpyArray(
             val_feat_file
         ) as val_feats, NumpyArray(val_lat_file) as val_lats:
-            for i, ((file,), features, latents) in enumerate(
+            for i, ((_file,), _features, _latents) in enumerate(
                 tqdm(DataLoader(dataset, num_workers=16, collate_fn=collate), desc="Preprocessing...")
             ):
+                file, features, latents = deepcopy(_file), deepcopy(_features), deepcopy(_latents)
+                del _file, _features, _latents
                 (train_files if train_or_val[i] else val_files).append(file)
                 feats = train_feats if train_or_val[i] else val_feats
                 lats = train_lats if train_or_val[i] else val_lats
@@ -282,6 +294,145 @@ class AudioLatentDataset(td.Dataset):
     def __getitem__(self, index):
         residuals = self.latents[index] - self.offsets[index]
         return torch.from_numpy(self.features[index].copy()), torch.from_numpy(residuals.copy())
+
+
+import random
+
+
+def normalize(x):
+    y = x - x.min()
+    y = y / y.max()
+    return y
+
+
+def gaussian_filter(x, sigma, mode="replicate"):
+    dim = len(x.shape)
+    n_frames = x.shape[0]
+    while len(x.shape) < 3:
+        x = x[:, None]
+
+    radius = min(int(sigma * 4), 3 * len(x))
+    channels = x.shape[1]
+
+    kernel = torch.arange(-radius, radius + 1, dtype=torch.float32, device=x.device)
+    kernel = torch.exp(-0.5 / sigma ** 2 * kernel ** 2)
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, len(kernel)).repeat(channels, 1, 1)
+
+    if dim == 4:
+        t, c, h, w = x.shape
+        x = x.view(t, c, h * w)
+    x = x.transpose(0, 2)
+
+    if radius > n_frames:  # prevent padding errors on short sequences
+        x = F.pad(x, (n_frames, n_frames), mode=mode)
+        print(
+            f"WARNING: Gaussian filter radius ({int(sigma * 4)}) is larger than number of frames ({n_frames}).\n\t Filter size has been lowered to ({radius}). You might want to consider lowering sigma ({sigma})."
+        )
+        x = F.pad(x, (radius - n_frames, radius - n_frames), mode="replicate")
+    else:
+        x = F.pad(x, (radius, radius), mode=mode)
+
+    x = F.conv1d(x, weight=kernel, groups=channels)
+
+    x = x.transpose(0, 2)
+    if dim == 4:
+        x = x.view(t, c, h, w)
+
+    if len(x.shape) > dim:
+        x = x.squeeze()
+
+    return x
+
+
+def spline_loop_latents(latent_selection, loop_len):
+    latent_selection = np.concatenate([latent_selection, latent_selection[[0]]])
+    x = np.linspace(0, 1, loop_len)
+    latents = np.zeros((loop_len, *latent_selection.shape[1:]))
+    for lay in range(latent_selection.shape[1]):
+        for lat in range(latent_selection.shape[2]):
+            tck = splrep(np.linspace(0, 1, latent_selection.shape[0]), latent_selection[:, lay, lat])
+            latents[:, lay, lat] = splev(x, tck)
+    latents = torch.from_numpy(latents)
+    return latents
+
+
+class LatentAugmenter:
+    def __init__(self, checkpoint, n_patches) -> None:
+        model = StyleGAN2Mapper(checkpoint, inference=False).eval()
+        self.n_patches = n_patches
+        self.ws = model.forward(latent_z=torch.randn((16384, 512)))
+        self.feat_idxs = {
+            # "mfccs": (0, 20),
+            "chroma": (20, 32),
+            "tonnetz": (32, 38),
+            # "contrast": (38, 45),
+            "onsets": (45, 46),
+            "onsets_low": (46, 47),
+            "onsets_mid": (47, 48),
+            "onsets_high": (48, 49),
+            # "pulse": (49, 50),
+            "volume": (50, 51),
+            # "flatness": (51, 52),
+        }
+        self.feat_keys = list(self.feat_idxs.keys())
+        self.single_dim = -5
+
+    @torch.no_grad()
+    def __call__(self, feature):
+        latent = spline_loop_latents(
+            self.ws[np.random.randint(0, self.ws.shape[0], np.random.randint(3, 12))], len(feature)
+        )
+
+        for n in range(self.n_patches):
+            start, stop = self.feat_idxs[random.choice(self.feat_keys)]
+
+            if np.random.rand() > 0.5:
+                lay_start = np.random.randint(0, latent.shape[1] - 6)
+                lay_stop = np.random.randint(lay_start, latent.shape[1])
+            else:
+                lay_start = 0
+                lay_stop = self.ws.shape[1]
+
+            if stop - start == 1:
+                lat = self.ws[np.random.randint(0, self.ws.shape[0], 1)]
+                modulation = normalize(feature[:, start:stop, None])
+                latent[:, lay_start:lay_stop] *= 1 - modulation
+                latent[:, lay_start:lay_stop] += modulation * lat[:, lay_start:lay_stop]
+
+            else:
+                lats = self.ws[np.random.randint(0, self.ws.shape[0], stop - start)]
+                modulation = normalize(feature[:, start:stop])
+                modulation /= modulation.sum(1, keepdim=True)
+                patch_latent = torch.einsum("Atwl,Atwl->twl", modulation.permute(1, 0)[..., None, None], lats[:, None])
+
+                if np.random.rand() > 0.666:
+                    inter_start, inter_stop = self.feat_idxs[random.choice(self.feat_keys[self.single_dim :])]
+                    intermodulator = normalize(feature[:, inter_start:inter_stop, None])
+                    latent[:, lay_start:lay_stop] *= 1 - intermodulator
+                    latent[:, lay_start:lay_stop] += intermodulator * patch_latent[:, lay_start:lay_stop]
+                else:
+                    latent[:, lay_start:lay_stop] = patch_latent[:, lay_start:lay_stop]
+
+        offset = latent.mean(dim=(1, 2), keepdim=True)
+        residuals = latent - offset
+        return residuals, offset
+
+
+class AugmentedLatentDataset(td.Dataset):
+    def __init__(self, file, split="train", checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3):
+        super().__init__()
+        self.features = np.load(file.replace(".npy", f"_{split}_feats.npy"), mmap_mode="r")
+        self.augmenter = LatentAugmenter(checkpoint, n_patches)
+
+    def __len__(self):
+        return len(self.features)
+
+    @torch.no_grad()
+    def __getitem__(self, index):
+        features = torch.from_numpy(self.features[index].copy())
+        residuals, offsets = self.augmenter(features)
+        return features.float(), residuals.float()
 
 
 class Normalize(Module):
@@ -863,17 +1014,20 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.2)
 
     # Training options
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--aug_weight", type=float, default=0.25)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
+
     args = parser.parse_args()
 
+    n_frames = int(DUR * FPS)
+
     in_dir = "/home/hans/datasets/audio2latent/"
-    dataset_cache = f"cache/{Path(in_dir).stem}_preprocessed.npy"
+    dataset_cache = f"cache/{Path(in_dir).stem}_preprocessed_{n_frames}frames.npy"
     test_audio = "/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac"
 
-    n_frames = int(DUR * FPS)
     batch_size = args.batch_size
 
     backbone = args.backbone
@@ -888,14 +1042,19 @@ if __name__ == "__main__":
 
     lr = args.lr
     wd = args.wd
+    aug_weight = args.aug_weight
 
     preprocess_audio(in_dir, dataset_cache)
     train_dataset = AudioLatentDataset(dataset_cache, "train")
+    if aug_weight > 0:
+        aug_dataset = AugmentedLatentDataset(dataset_cache, "train")
     val_dataset = AudioLatentDataset(dataset_cache, "val")
     print_data_summary(train_dataset, val_dataset)
 
-    dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
-    inputs, targets = next(iter(dataloader))
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
+    if aug_weight > 0:
+        aug_dataloader = DataLoader(aug_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True)
+    inputs, targets = next(iter(train_dataloader))
     feature_dim = inputs.shape[2]
     n_outputs, output_size = targets.shape[2], targets.shape[3]
 
@@ -977,10 +1136,15 @@ if __name__ == "__main__":
     a2l(inputs.to(device))
     print_model_summary(a2l)
 
+    if aug_weight > 0:
+        name += "_augmented"
+
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
 
     writer = SummaryWriter(comment=name)
     shutil.copy(__file__, writer.log_dir)
+
+    from time import time
 
     n_iter = 0
     n_epochs = args.epochs
@@ -989,24 +1153,48 @@ if __name__ == "__main__":
     pbar = tqdm(range(n_epochs))
     grad_noise = []
     for epoch in pbar:
-        losses = []
+        losses, aug_losses = [], []
         a2l.train()
-        for inputs, targets in dataloader:
+
+        # t = time()
+        if aug_weight > 0:
+            dataloader = zip(train_dataloader, aug_dataloader)
+        else:
+            dataloader = train_dataloader
+
+        for batch in dataloader:
+            if aug_weight > 0:
+                (inputs, targets), (aug_inputs, aug_targets) = batch
+            else:
+                inputs, targets = batch
 
             inputs, targets = inputs.to(device), targets.to(device)
+
+            # print("data", time() - t)
+            # t = time()
+
             outputs = a2l(inputs)
             loss = F.mse_loss(outputs, targets)
 
-            optimizer.zero_grad()
-            loss.backward()
+            if aug_weight > 0:
+                aug_inputs, aug_targets = aug_inputs.to(device), aug_targets.to(device)
+                aug_outputs = a2l(aug_inputs)
+                aug_loss = aug_weight * F.mse_loss(aug_outputs, aug_targets)
+            else:
+                aug_loss = 0
 
+            optimizer.zero_grad()
+            (loss + aug_loss).backward()
             optimizer.step()
 
             writer.add_scalar("Loss/train", loss.item(), n_iter)
+            writer.add_scalar("Loss/augtrain", aug_loss.item(), n_iter)
             losses.append(loss.item())
+            aug_losses.append(aug_loss.item())
 
             n_iter += len(inputs)
         train_loss = np.mean(losses)
+        aug_loss = np.mean(aug_losses)
 
         if (epoch + 1) % eval_interval == 0 or (epoch + 1) == n_epochs:
             with torch.inference_mode():
@@ -1040,6 +1228,7 @@ if __name__ == "__main__":
             pbar.write("")
             pbar.write(f"epoch {epoch + 1}")
             pbar.write(f"train_loss: {train_loss:.4f}")
+            pbar.write(f"aug_loss  : {aug_loss:.4f}")
             pbar.write(f"val_loss  : {val_loss:.4f}")
             pbar.write(f"laplace_b : {scale:.4f}")
             pbar.write(f"fcd       : {fcd:.4f}")
