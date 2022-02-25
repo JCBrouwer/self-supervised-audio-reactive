@@ -1,18 +1,19 @@
 # fmt:off
 
 import argparse
-from copy import deepcopy
 import gc
 import os
+import random
 import shutil
 import sys
+from copy import deepcopy
 from functools import partial
 from glob import glob
 from pathlib import Path
-import random
 
 import joblib
 import librosa as rosa
+import madmom as mm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,16 +22,16 @@ import torchdatasets as td
 from better_lstm import LSTM
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
-from scipy.interpolate import splev, splrep
-from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, Dropout, LazyConv1d,
-                      LazyConvTranspose1d, LeakyReLU, Linear, Module,
-                      ModuleList, Parameter, Sequential, Sigmoid)
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, ConvTranspose1d, Dropout,
+                      Identity, LazyConv1d, LazyConvTranspose1d, LeakyReLU,
+                      Linear, Module, ModuleList, Parameter, Sequential,
+                      Sigmoid)
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 from torchqrnn import QRNN
 from tqdm import tqdm
 from x_transformers.x_transformers import AttentionLayers
-from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 
 from context_fid import calculate_fcd
 
@@ -46,6 +47,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SR = 24575
 DUR = 8
 FPS = 24
+
+
+def info(x, label=None):
+    if label is None:
+        print(
+            f"{tuple(x.shape)}".ljust(20),
+            f"{x.min().item():.4f}".ljust(10),
+            f"{x.mean().item():.4f}".ljust(10),
+            f"{x.max().item():.4f}".ljust(10),
+        )
+    else:
+        print(
+            label.ljust(25),
+            f"{tuple(x.shape)}".ljust(20),
+            f"{x.min().item():.4f}".ljust(10),
+            f"{x.mean().item():.4f}".ljust(10),
+            f"{x.max().item():.4f}".ljust(10),
+        )
 
 
 @torch.inference_mode()
@@ -110,19 +129,48 @@ def high_pass(audio, sr):
     return signal.sosfilt(signal.butter(12, 2000, "high", fs=sr, output="sos"), audio)
 
 
+def onset_strength(audio, sr):
+    audio = rosa.effects.percussive(audio, sr, margin=4.0)
+
+    sig = mm.audio.signal.Signal(audio, num_channels=1, sample_rate=sr)
+    sig_frames = mm.audio.signal.FramedSignal(sig, frame_size=2048, hop_length=1024)
+    stft = mm.audio.stft.ShortTimeFourierTransform(sig_frames, circular_shift=True)
+    spec = mm.audio.spectrogram.Spectrogram(stft, circular_shift=True)
+    filt_spec = mm.audio.spectrogram.FilteredSpectrogram(spec, num_bands=24)
+
+    spectral_diff = mm.features.onsets.spectral_diff(filt_spec)
+    spectral_flux = mm.features.onsets.spectral_flux(filt_spec)
+    superflux = mm.features.onsets.superflux(filt_spec)
+    complex_flux = mm.features.onsets.complex_flux(filt_spec)
+    modified_kullback_leibler = mm.features.onsets.modified_kullback_leibler(filt_spec)
+
+    onset = np.mean(
+        [
+            spectral_diff / spectral_diff.max(),
+            spectral_flux / spectral_flux.max(),
+            superflux / superflux.max(),
+            complex_flux / complex_flux.max(),
+            modified_kullback_leibler / modified_kullback_leibler.max(),
+        ],
+        axis=0,
+    )
+
+    return onset
+
+
 def audio2features(audio, sr, clamp=True, smooth=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
     audio = torchaudio.transforms.Resample(sr, SR)(audio).numpy()
 
     mfcc = rosa.feature.mfcc(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
-    chroma = rosa.feature.chroma_cens(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
-    tonnetz = rosa.feature.tonnetz(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
+    chroma = rosa.feature.chroma_cens(y=rosa.effects.harmonic(audio, sr, 4.0), sr=SR, hop_length=1024).transpose(1, 0)
+    tonnetz = rosa.feature.tonnetz(y=rosa.effects.harmonic(audio, sr, 4.0), sr=SR, hop_length=1024).transpose(1, 0)
     contrast = rosa.feature.spectral_contrast(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
-    onsets = rosa.onset.onset_strength(y=audio, sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_low = rosa.onset.onset_strength(y=low_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_mid = rosa.onset.onset_strength(y=mid_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_high = rosa.onset.onset_strength(y=high_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
+    onsets = onset_strength(y=audio, sr=SR, hop_length=1024).reshape(-1, 1)
+    onsets_low = onset_strength(y=low_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
+    onsets_mid = onset_strength(y=mid_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
+    onsets_high = onset_strength(y=high_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
     pulse = rosa.beat.plp(audio, SR, hop_length=1024, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1)
     volume = rosa.feature.rms(y=audio, hop_length=1024).reshape(-1, 1)
     flatness = rosa.feature.spectral_flatness(y=audio, hop_length=1024).reshape(-1, 1)
@@ -657,6 +705,7 @@ class LayerwiseConv(Module):
         fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
         bound = 1 / np.sqrt(fan_in)
         torch.nn.init.uniform_(b, -bound, bound)
+
         return Parameter(w), Parameter(b)
 
     def forward(self, x):  # B,T,IC
@@ -914,9 +963,15 @@ class Audio2Latent2(Module):
         B, T, C = x.shape
         w = self.maybe_pad(self.normalize(x))
         w = self.swap_batch(w)
+        skips = []
         for n, layer in enumerate(self.layers):
             w = layer(w)
-            w = self.pool(w) if n < len(self.layers) // 2 else self.unpool(w)
+            if n < len(self.layers) // 2:
+                w = self.pool(w)
+                skips.append(w)
+            else:
+                w = self.unpool(w)
+                w += skips.pop()
         w = w[:T]  # remove padding
         w_plus = torch.cat([layerwise(w) for layerwise in self.layerwise], axis=2)
         w_plus = self.swap_batch(w_plus)
@@ -996,6 +1051,146 @@ class MLP(Module):
         return w
 
 
+class DropPath(Module):
+    def __init__(self, drop_prob=None, scale_by_keep=True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0 and self.scale_by_keep:
+            random_tensor.div_(keep_prob)
+        return x * random_tensor
+
+
+class LayerNorm(Module):
+    def __init__(self, normalized_shape, data_format="channels_first", eps=1e-6):
+        super().__init__()
+        self.weight = Parameter(torch.ones(normalized_shape))
+        self.bias = Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[None, :, None] * x + self.bias[None, :, None]
+            return x
+
+
+class ConvNeXtBlock(Module):
+    def __init__(self, dim, drop_path=0.0, gamma_eps=1e-6):
+        super().__init__()
+        self.dwconv = Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
+        self.norm = LayerNorm(dim, data_format="channels_last")
+        self.pwconv1 = Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
+        self.act = GELU()
+        self.pwconv2 = Linear(4 * dim, dim)
+        self.gamma = Parameter(gamma_eps * torch.ones((dim)), requires_grad=True) if gamma_eps > 0 else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 1)  # (B, C, T) -> (B, T, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 2, 1)  # (B, T, C) -> (B, C, T)
+        x = input + self.drop_path(x)
+        return x
+
+
+class ConvNeXt(Module):
+    def __init__(
+        self,
+        input_mean,
+        input_std,
+        input_size=52,
+        hidden_size=64,
+        output_size=512,
+        n_outputs=18,
+        n_layerwise=3,
+        depths=[3, 3, 6, 3],
+        cbase=16,
+        drop_path_rate=0.2,
+        gamma_eps=1e-6,
+    ):
+        super().__init__()
+        self.normalize = Normalize(input_mean, input_std + 1e-8)
+
+        dims = cbase * np.array([1, 2, 4, 8])
+
+        self.downsample_layers, self.upsample_layers = ModuleList(), ModuleList()
+        self.downsample_layers.append(
+            Sequential(Conv1d(input_size, dims[0], kernel_size=4, stride=4), LayerNorm(dims[0]))
+        )
+        for i in range(3):
+            self.downsample_layers.append(Conv1d(dims[i], dims[i + 1], kernel_size=2, stride=2))
+            self.upsample_layers.append(ConvTranspose1d(dims[3 - i], dims[3 - i - 1], kernel_size=2, stride=2))
+        self.upsample_layers.append(
+            Sequential(ConvTranspose1d(dims[0], hidden_size, kernel_size=4, stride=4), LayerNorm(hidden_size))
+        )
+
+        # 4 feature resolution stages, each consisting of multiple residual blocks
+        drop_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        c = 0
+        self.down_stages, self.up_stages = ModuleList(), ModuleList()
+        for i in range(4):
+            self.down_stages.append(
+                Sequential(
+                    *[ConvNeXtBlock(dims[i], drop_rates[c + j], gamma_eps) for j in range(depths[i])],
+                    LayerNorm(dims[i]),
+                )
+            )
+            self.up_stages.append(
+                Sequential(
+                    *[ConvNeXtBlock(dims[3 - i], drop_rates[c + j], gamma_eps) for j in reversed(range(depths[3 - i]))],
+                    LayerNorm(dims[3 - i]),
+                )
+            )
+            c += depths[i]
+
+        self.norm = LayerNorm(hidden_size, data_format="channels_last")
+        self.layerwise = LayerwiseConv(
+            hidden_size, output_size, kernel_size=5, n_outputs=n_outputs, n_layerwise=n_layerwise, dropout=dropout
+        )
+
+    def forward(self, x):
+        x = self.normalize(x)
+        x = x.permute(0, 2, 1)
+        skips = []
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.down_stages[i](x)
+            if i < 3:  # don't need last x
+                skips.append(x)
+        for i in range(4):
+            x = self.up_stages[i](x)
+            x = self.upsample_layers[i](x)
+            if i < 3:  # don't need last x
+                x += skips.pop()
+        x = x.permute(0, 2, 1)
+        x = self.norm(x)
+        x = self.layerwise(x)
+        return x
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -1008,8 +1203,9 @@ if __name__ == "__main__":
     parser.add_argument("--context", type=str, default=None, choices=["gru", "lstm", "qrnn", "conv", "transformer"])
     parser.add_argument("--correlation", type=str, default=None, choices=["linear", "eca", "cba"])
 
-    # MLP options
+    # Other architectures
     parser.add_argument("--mlp", action="store_true")
+    parser.add_argument("--convnext", action="store_true")
 
     # Shared options
     parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
@@ -1018,7 +1214,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.2)
 
     # Training options
-    parser.add_argument("--aug_weight", type=float, default=0.25)
+    parser.add_argument("--aug_weight", type=float, default=0.75)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0)
@@ -1111,11 +1307,11 @@ if __name__ == "__main__":
             input_size=feature_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            dropout=dropout,
             n_outputs=n_outputs,
             output_size=output_size,
+            dropout=dropout,
         ).to(device)
-    else:
+    elif args.mlp:
         name = "_".join(
             [
                 f"mlp",
@@ -1138,6 +1334,28 @@ if __name__ == "__main__":
             num_layers=num_layers,
             dropout=dropout,
         ).to(device)
+    elif args.convnext:
+        name = "_".join(
+            [
+                f"convnext",
+                f"layerwise:conv:{n_layerwise}",
+                f"hidden_size:{hidden_size}",
+                f"dropout:{dropout}",
+                f"lr:{lr}",
+            ]
+        )
+        a2l = ConvNeXt(
+            input_mean=train_dataset.mean,
+            input_std=train_dataset.std,
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            output_size=output_size,
+            n_outputs=n_outputs,
+            n_layerwise=n_layerwise,
+            drop_path_rate=dropout,
+        ).to(device)
+    else:
+        raise NotImplementedError()
     a2l(inputs.to(device))
     print_model_summary(a2l)
 
