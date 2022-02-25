@@ -71,8 +71,8 @@ def calculate_fcd(dataloader, model):
 
 if __name__ == "__main__":
     if not os.path.exists(encoder_checkpoint):
-        X = np.load("cache/audio2latent_preprocessed_train_lats.npy", mmap_mode="r")
-        XO = np.load("cache/audio2latent_preprocessed_train_lats_offsets.npy", mmap_mode="r")
+        X = np.load("cache/audio2latent_preprocessed_192frames_train_lats.npy", mmap_mode="r")
+        XO = np.load("cache/audio2latent_preprocessed_192frames_train_lats_offsets.npy", mmap_mode="r")
         B, T, N, L = X.shape
         encoder = CausalCNNEncoderClassifier(
             compared_length=96,
@@ -98,9 +98,9 @@ if __name__ == "__main__":
     with torch.inference_mode():
         ckpts = sys.argv[1:]
 
-        X = np.load("cache/audio2latent_preprocessed_val_lats.npy", mmap_mode="r")
-        XO = np.load("cache/audio2latent_preprocessed_val_lats_offsets.npy", mmap_mode="r")
-        F = np.load("cache/audio2latent_preprocessed_val_feats.npy", mmap_mode="r")
+        X = np.load("cache/audio2latent_preprocessed_192frames_val_lats.npy", mmap_mode="r")
+        XO = np.load("cache/audio2latent_preprocessed_192frames_val_lats_offsets.npy", mmap_mode="r")
+        F = np.load("cache/audio2latent_preprocessed_192frames_val_feats.npy", mmap_mode="r")
 
         bs = 16
         T = X.shape[1]

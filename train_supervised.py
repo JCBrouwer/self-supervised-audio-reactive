@@ -9,6 +9,7 @@ import sys
 from functools import partial
 from glob import glob
 from pathlib import Path
+import random
 
 import joblib
 import librosa as rosa
@@ -29,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchqrnn import QRNN
 from tqdm import tqdm
 from x_transformers.x_transformers import AttentionLayers
+from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 
 from context_fid import calculate_fcd
 
@@ -293,15 +295,12 @@ class AudioLatentDataset(td.Dataset):
 
     def __getitem__(self, index):
         residuals = self.latents[index] - self.offsets[index]
-        return torch.from_numpy(self.features[index].copy()), torch.from_numpy(residuals.copy())
-
-
-import random
+        return torch.from_numpy(self.features[index].copy()).detach(), torch.from_numpy(residuals.copy()).detach()
 
 
 def normalize(x):
     y = x - x.min()
-    y = y / y.max()
+    y = y / (y.max() + 1e-8)
     return y
 
 
@@ -345,23 +344,22 @@ def gaussian_filter(x, sigma, mode="replicate"):
     return x
 
 
-def spline_loop_latents(latent_selection, loop_len):
-    latent_selection = np.concatenate([latent_selection, latent_selection[[0]]])
-    x = np.linspace(0, 1, loop_len)
-    latents = np.zeros((loop_len, *latent_selection.shape[1:]))
-    for lay in range(latent_selection.shape[1]):
-        for lat in range(latent_selection.shape[2]):
-            tck = splrep(np.linspace(0, 1, latent_selection.shape[0]), latent_selection[:, lay, lat])
-            latents[:, lay, lat] = splev(x, tck)
-    latents = torch.from_numpy(latents)
-    return latents
+def spline_loop_latents(y, size):
+    y = torch.cat((y, y[[0]]))
+    t_in = torch.linspace(0, 1, len(y)).to(y)
+    t_out = torch.linspace(0, 1, size).to(y)
+    coeffs = natural_cubic_spline_coeffs(t_in, y.permute(1, 0, 2))
+    out = NaturalCubicSpline(coeffs).evaluate(t_out)
+    return out.permute(1, 0, 2)
 
 
 class LatentAugmenter:
     def __init__(self, checkpoint, n_patches) -> None:
         model = StyleGAN2Mapper(checkpoint, inference=False).eval()
         self.n_patches = n_patches
-        self.ws = model.forward(latent_z=torch.randn((16384, 512)))
+        self.num = 16384
+        self.ws = model.forward(latent_z=torch.randn((self.num, 512)))
+        self.nw = self.ws.shape[1]
         self.feat_idxs = {
             # "mfccs": (0, 20),
             "chroma": (20, 32),
@@ -381,29 +379,29 @@ class LatentAugmenter:
     @torch.no_grad()
     def __call__(self, feature):
         latent = spline_loop_latents(
-            self.ws[np.random.randint(0, self.ws.shape[0], np.random.randint(3, 12))], len(feature)
+            self.ws[np.random.randint(0, self.num, np.random.randint(3, 12))].to(feature), len(feature)
         )
 
-        for n in range(self.n_patches):
+        for _ in range(self.n_patches):
             start, stop = self.feat_idxs[random.choice(self.feat_keys)]
 
             if np.random.rand() > 0.5:
-                lay_start = np.random.randint(0, latent.shape[1] - 6)
-                lay_stop = np.random.randint(lay_start, latent.shape[1])
+                lay_start = np.random.randint(0, self.nw - 6)
+                lay_stop = np.random.randint(lay_start, self.nw)
             else:
                 lay_start = 0
-                lay_stop = self.ws.shape[1]
+                lay_stop = self.nw
 
             if stop - start == 1:
-                lat = self.ws[np.random.randint(0, self.ws.shape[0], 1)]
+                lat = self.ws[np.random.randint(0, self.num, 1)].to(feature)
                 modulation = normalize(feature[:, start:stop, None])
                 latent[:, lay_start:lay_stop] *= 1 - modulation
                 latent[:, lay_start:lay_stop] += modulation * lat[:, lay_start:lay_stop]
 
             else:
-                lats = self.ws[np.random.randint(0, self.ws.shape[0], stop - start)]
+                lats = self.ws[np.random.randint(0, self.num, stop - start)].to(feature)
                 modulation = normalize(feature[:, start:stop])
-                modulation /= modulation.sum(1, keepdim=True)
+                modulation /= modulation.sum(1, keepdim=True) + 1e-8
                 patch_latent = torch.einsum("Atwl,Atwl->twl", modulation.permute(1, 0)[..., None, None], lats[:, None])
 
                 if np.random.rand() > 0.666:
@@ -414,25 +412,33 @@ class LatentAugmenter:
                 else:
                     latent[:, lay_start:lay_stop] = patch_latent[:, lay_start:lay_stop]
 
-        offset = latent.mean(dim=(1, 2), keepdim=True)
+        offset = latent.mean(dim=(0, 1), keepdim=True)
         residuals = latent - offset
-        return residuals, offset
+        return residuals.detach(), offset.detach()
 
 
 class AugmentedLatentDataset(td.Dataset):
-    def __init__(self, file, split="train", checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3):
+    def __init__(
+        self,
+        file,
+        split="train",
+        checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt",
+        n_patches=3,
+        device=device,
+    ):
         super().__init__()
         self.features = np.load(file.replace(".npy", f"_{split}_feats.npy"), mmap_mode="r")
         self.augmenter = LatentAugmenter(checkpoint, n_patches)
+        self.device = device
 
     def __len__(self):
         return len(self.features)
 
     @torch.no_grad()
     def __getitem__(self, index):
-        features = torch.from_numpy(self.features[index].copy())
+        features = torch.from_numpy(self.features[index].copy()).float().to(self.device)
         residuals, offsets = self.augmenter(features)
-        return features.float(), residuals.float()
+        return features.detach().cpu(), residuals.detach().cpu()
 
 
 class Normalize(Module):
@@ -757,10 +763,8 @@ class ConvolutionalBlockAttention(Module):
         self.in_channels, self.out_channels = in_channels, out_channels
 
     def forward(self, x):
-        print(x.shape, self.in_channels, self.out_channels)
         avg_out = self.fc(torch.mean(x, dim=0, keepdim=True))
         max_out = self.fc(torch.max(x, dim=0, keepdim=True).values)
-        print(self.linear(x).shape, avg_out.shape, max_out.shape)
         return self.linear(x) * self.sigmoid(avg_out + max_out)
 
 
@@ -1045,7 +1049,8 @@ if __name__ == "__main__":
     aug_weight = args.aug_weight
 
     preprocess_audio(in_dir, dataset_cache)
-    train_dataset = AudioLatentDataset(dataset_cache, "train")
+    pklcache = "cache/ald/"
+    train_dataset = AudioLatentDataset(dataset_cache, "train").cache(td.cachers.Pickle(Path(pklcache)))
     if aug_weight > 0:
         aug_dataset = AugmentedLatentDataset(dataset_cache, "train")
     val_dataset = AudioLatentDataset(dataset_cache, "val")
@@ -1053,7 +1058,7 @@ if __name__ == "__main__":
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
     if aug_weight > 0:
-        aug_dataloader = DataLoader(aug_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True)
+        aug_dataloader = DataLoader(aug_dataset, batch_size=batch_size, num_workers=0, shuffle=True, drop_last=True)
     inputs, targets = next(iter(train_dataloader))
     feature_dim = inputs.shape[2]
     n_outputs, output_size = targets.shape[2], targets.shape[3]
@@ -1157,6 +1162,7 @@ if __name__ == "__main__":
         a2l.train()
 
         # t = time()
+
         if aug_weight > 0:
             dataloader = zip(train_dataloader, aug_dataloader)
         else:
@@ -1212,8 +1218,12 @@ if __name__ == "__main__":
                     val_loss /= len(val_dataloader)
                     writer.add_scalar("Loss/val", val_loss.item(), n_iter)
 
-                    fcd = calculate_fcd(val_dataloader, a2l)
-                    writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
+                    try:
+                        fcd = calculate_fcd(val_dataloader, a2l)
+                        writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
+                    except Exception as e:
+                        pbar.write(f"\nError in FCD:\n{e}\n\n")
+                        fcd = -1
 
                     try:
                         loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
