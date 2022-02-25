@@ -71,8 +71,8 @@ def calculate_fcd(dataloader, model):
 
 if __name__ == "__main__":
     if not os.path.exists(encoder_checkpoint):
-        X = np.load("cache/audio2latent_preprocessed_192frames_train_lats.npy", mmap_mode="r")
-        XO = np.load("cache/audio2latent_preprocessed_192frames_train_lats_offsets.npy", mmap_mode="r")
+        X = np.load("cache/audio2latent_192frames_train_lats.npy", mmap_mode="r")
+        XO = np.mean(X, dim=(1, 2))
         B, T, N, L = X.shape
         encoder = CausalCNNEncoderClassifier(
             compared_length=96,
@@ -98,16 +98,15 @@ if __name__ == "__main__":
     with torch.inference_mode():
         ckpts = sys.argv[1:]
 
-        X = np.load("cache/audio2latent_preprocessed_192frames_val_lats.npy", mmap_mode="r")
-        XO = np.load("cache/audio2latent_preprocessed_192frames_val_lats_offsets.npy", mmap_mode="r")
-        F = np.load("cache/audio2latent_preprocessed_192frames_val_feats.npy", mmap_mode="r")
+        X = np.load("cache/audio2latent_192frames_val_lats.npy", mmap_mode="r")
+        F = np.load("cache/audio2latent_192frames_val_feats.npy", mmap_mode="r")
 
         bs = 16
         T = X.shape[1]
         real_feats = []
         for i in range(0, X.shape[0], bs):
             x = torch.from_numpy(X[i : i + bs].copy()).float()
-            xo = torch.from_numpy(XO[i : i + bs].copy()).float()
+            xo = torch.mean(x, dim=(1, 2))
             x = x - xo[:, None, None, :]
             x = x.to(device)
             x = x.flatten(2).transpose(1, 2)

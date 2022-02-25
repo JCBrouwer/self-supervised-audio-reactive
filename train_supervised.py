@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import io
 import os
 import random
 import shutil
@@ -20,6 +21,11 @@ import torch.nn.functional as F
 import torchaudio
 import torchdatasets as td
 from better_lstm import LSTM
+from ffcv.fields import BytesField, IntField, NDArrayField
+from ffcv.fields.decoders import BytesDecoder, IntDecoder, NDArrayDecoder
+from ffcv.loader import Loader, OrderOption
+from ffcv.transforms import ToTensor
+from ffcv.writer import DatasetWriter
 from npy_append_array import NpyAppendArray as NumpyArray
 from scipy import signal, stats
 from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, ConvTranspose1d, Dropout,
@@ -43,10 +49,6 @@ from ops.video import VideoWriter
 
 np.set_printoptions(precision=2, suppress=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-SR = 24575
-DUR = 8
-FPS = 24
 
 
 def info(x, label=None):
@@ -74,6 +76,7 @@ def _audio2video(
     audio_file,
     out_file,
     stylegan_file,
+    fps,
     output_size=(512, 512),
     batch_size=8,
     offset=0,
@@ -94,6 +97,7 @@ def _audio2video(
     with VideoWriter(
         output_file=out_file,
         output_size=output_size,
+        fps=fps,
         audio_file=audio_file,
         audio_offset=offset,
         audio_duration=duration,
@@ -108,13 +112,17 @@ def _audio2video(
 
 
 @torch.inference_mode()
-def audio2video(a2l, audio_file, out_file, stylegan_file, output_size=(512, 512), batch_size=8, offset=0, duration=40):
+def audio2video(
+    a2l, audio_file, out_file, stylegan_file, fps=24, output_size=(512, 512), batch_size=8, offset=0, duration=40
+):
     a2l = a2l.eval().to(device)
     audio, sr = torchaudio.load(audio_file)
-    test_features = audio2features(audio, sr)
+    test_features = audio2features(audio, sr, fps)
     test_features = test_features[24 * offset : 24 * (offset + duration)]
     test_features = test_features.unsqueeze(0).to(device)
-    _audio2video(a2l, test_features, audio_file, out_file, stylegan_file, output_size, batch_size, offset, duration)
+    _audio2video(
+        a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration
+    )
 
 
 def low_pass(audio, sr):
@@ -130,10 +138,10 @@ def high_pass(audio, sr):
 
 
 def onset_strength(audio, sr):
-    audio = rosa.effects.percussive(audio, sr, margin=4.0)
+    audio = rosa.effects.percussive(audio, margin=4.0)
 
     sig = mm.audio.signal.Signal(audio, num_channels=1, sample_rate=sr)
-    sig_frames = mm.audio.signal.FramedSignal(sig, frame_size=2048, hop_length=1024)
+    sig_frames = mm.audio.signal.FramedSignal(sig, frame_size=2048)
     stft = mm.audio.stft.ShortTimeFourierTransform(sig_frames, circular_shift=True)
     spec = mm.audio.spectrogram.Spectrogram(stft, circular_shift=True)
     filt_spec = mm.audio.spectrogram.FilteredSpectrogram(spec, num_bands=24)
@@ -158,26 +166,26 @@ def onset_strength(audio, sr):
     return onset
 
 
-def audio2features(audio, sr, clamp=True, smooth=True):
+def audio2features(audio, sr, fps, clamp=True, smooth=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
-    audio = torchaudio.transforms.Resample(sr, SR)(audio).numpy()
-
-    mfcc = rosa.feature.mfcc(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
-    chroma = rosa.feature.chroma_cens(y=rosa.effects.harmonic(audio, sr, 4.0), sr=SR, hop_length=1024).transpose(1, 0)
-    tonnetz = rosa.feature.tonnetz(y=rosa.effects.harmonic(audio, sr, 4.0), sr=SR, hop_length=1024).transpose(1, 0)
-    contrast = rosa.feature.spectral_contrast(y=audio, sr=SR, hop_length=1024).transpose(1, 0)
-    onsets = onset_strength(y=audio, sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_low = onset_strength(y=low_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_mid = onset_strength(y=mid_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
-    onsets_high = onset_strength(y=high_pass(audio, SR), sr=SR, hop_length=1024).reshape(-1, 1)
-    pulse = rosa.beat.plp(audio, SR, hop_length=1024, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1)
-    volume = rosa.feature.rms(y=audio, hop_length=1024).reshape(-1, 1)
-    flatness = rosa.feature.spectral_flatness(y=audio, hop_length=1024).reshape(-1, 1)
-
-    features = np.concatenate(
-        (mfcc, chroma, tonnetz, contrast, onsets, onsets_low, onsets_mid, onsets_high, pulse, volume, flatness), axis=1
-    )
+    audio = audio.numpy()
+    n_frames = int(len(audio) / sr * fps)
+    features = [
+        rosa.feature.mfcc(audio, sr).transpose(1, 0),
+        rosa.feature.chroma_cens(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+        rosa.feature.tonnetz(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+        rosa.feature.spectral_contrast(audio, sr).transpose(1, 0),
+        onset_strength(audio, sr).reshape(-1, 1),
+        onset_strength(low_pass(audio, sr), sr).reshape(-1, 1),
+        onset_strength(mid_pass(audio, sr), sr).reshape(-1, 1),
+        onset_strength(high_pass(audio, sr), sr).reshape(-1, 1),
+        rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1),
+        rosa.feature.rms(audio).reshape(-1, 1),
+        rosa.feature.spectral_flatness(audio).reshape(-1, 1),
+    ]
+    features = [signal.resample(f, n_frames) for f in features]
+    features = np.concatenate(features, axis=1)
     features = torch.from_numpy(features).float()
     if clamp:
         features = features.clamp(torch.quantile(features, q=0.025, dim=0), torch.quantile(features, q=0.975, dim=0))
@@ -186,9 +194,22 @@ def audio2features(audio, sr, clamp=True, smooth=True):
     return features
 
 
-class PreprocessAudioLatentDataset(Dataset):
-    def __init__(self, directory):
+def to_bytes(x: torch.Tensor) -> np.ndarray:
+    bytes = io.BytesIO()
+    np.save(bytes, x)
+    bytes.seek(0)
+    return np.frombuffer(bytes.read(), dtype=np.uint8)
+
+
+def from_bytes(byte_array: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.load(io.BytesIO(byte_array.tobytes())))
+
+
+class FullAudio2LatentFFCVPreprocessor(Dataset):
+    def __init__(self, directory, fps, return_bytes=False):
         super().__init__()
+        self.fps = fps
+        self.return_bytes = return_bytes
         self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
 
     def __len__(self):
@@ -199,88 +220,172 @@ class PreprocessAudioLatentDataset(Dataset):
         filename, _ = os.path.splitext(file)
 
         audio, sr = torchaudio.load(file)
-        features = audio2features(audio, sr)
-        features = torch.stack(  # overlapping slices of DUR seconds
-            sum(
-                [list(torch.split(features[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, DUR // 4 * FPS)],
-                [],
-            )
-        )
+        features = audio2features(audio, sr, self.fps)
 
         try:
             latents = joblib.load(f"{filename}.npy").float()
         except:
             latents = torch.from_numpy(np.load(f"{filename}.npy")).float()
-        latents = torch.stack(
-            sum(
-                [list(torch.split(latents[start:], DUR * FPS)[:-1]) for start in range(0, DUR * FPS, DUR // 4 * FPS)],
-                [],
-            )
-        )
 
-        return file, features, latents
+        if self.return_bytes:
+            return to_bytes(np.array([file])), to_bytes(audio), sr, to_bytes(features), to_bytes(latents)
+        else:
+            return file, audio, sr, features, latents
 
 
-def collate(batch):
-    return tuple(b if isinstance(b[0], str) else torch.cat(b) for b in list(map(list, zip(*batch))))
+class SlicedAudio2LatentFFCVPreprocessor(Dataset):
+    def __init__(self, datastem, split="train"):
+        super().__init__()
+        self.features = np.load(f"{datastem}_{split}_feats.npy", mmap_mode="r")
+        self.latents = np.load(f"{datastem}_{split}_lats.npy", mmap_mode="r")
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        features = self.features[index].copy()
+        latents = self.latents[index].copy()
+        residuals = latents - latents.mean((0, 1))
+        return features.astype(np.float32), residuals.astype(np.float32)
 
 
-def filename(file, name):
-    return file.replace(".npy", f"_{name}.npy")
+def get_full_length_ffcv_dataloaders(input_dir, dur, fps):
+    L = dur * fps
+    datastem = f"cache/{Path(input_dir).stem}_{L}frames"
+    full_beton = f"{datastem}_ffcv_full.beton"
+    if not os.path.exists(full_beton):
+        print("Preprocessing full length data to FFCV...")
+        DatasetWriter(
+            full_beton,
+            {
+                "filename": BytesField(),
+                "waveform": BytesField(),
+                "sr": IntField(),
+                "features": BytesField(),
+                "latents": BytesField(),
+            },
+            num_workers=24,
+            page_size=32 * 8388608,
+        ).from_indexed_dataset(FullAudio2LatentFFCVPreprocessor(input_dir, fps))
+        print("Preprocessing complete!")
+    full_loader = Loader(
+        full_beton,
+        batch_size=1,
+        num_workers=24,
+        order=OrderOption.QUASI_RANDOM,
+        pipelines={
+            "filename": [BytesDecoder()],
+            "waveform": [BytesDecoder()],
+            "sr": [IntDecoder()],
+            "features": [BytesDecoder()],
+            "latents": [BytesDecoder()],
+        },
+        os_cache=True,
+    )
+    return full_loader
 
 
-def preprocess_audio(in_dir, out_file):
-    train_feat_file, train_lat_file = filename(out_file, "train_feats"), filename(out_file, "train_lats")
-    val_feat_file, val_lat_file = filename(out_file, "val_feats"), filename(out_file, "val_lats")
-    if not os.path.exists(train_lat_file):
-        dataset = PreprocessAudioLatentDataset(in_dir)
-        train_or_val = np.random.RandomState(42).rand(len(dataset)) < 0.8
-        val_files, train_files = [], []
-        with NumpyArray(train_feat_file) as train_feats, NumpyArray(train_lat_file) as train_lats, NumpyArray(
-            val_feat_file
-        ) as val_feats, NumpyArray(val_lat_file) as val_lats:
-            for i, ((_file,), _features, _latents) in enumerate(
-                tqdm(DataLoader(dataset, num_workers=16, collate_fn=collate), desc="Preprocessing...")
-            ):
-                file, features, latents = deepcopy(_file), deepcopy(_features), deepcopy(_latents)
-                del _file, _features, _latents
-                (train_files if train_or_val[i] else val_files).append(file)
-                feats = train_feats if train_or_val[i] else val_feats
-                lats = train_lats if train_or_val[i] else val_lats
-                for feat, lat in zip(features, latents):
-                    feats.append(feat.unsqueeze(0).contiguous().numpy())
-                    lats.append(lat.unsqueeze(0).contiguous().numpy())
+def get_ffcv_dataloaders(input_dir, batch_size, dur, fps, full=False):
+    L = dur * fps
 
-        with open(filename(out_file, "train_files").replace(".npy", ".txt"), "w") as f:
-            f.write("\n".join(train_files))
-        with open(filename(out_file, "val_files").replace(".npy", ".txt"), "w") as f:
-            f.write("\n".join(val_files))
+    datastem = f"cache/{Path(input_dir).stem}_{L}frames"
+    train_beton = f"{datastem}_ffcv_train.beton"
+    val_beton = f"{datastem}_ffcv_val.beton"
+    mean_file = f"{datastem}_train_mean.npy"
+    std_file = f"{datastem}_train_std.npy"
 
-        feats_train = np.load(train_feat_file, mmap_mode="r")
-        np.save(filename(out_file, "train_feats_mean"), np.mean(feats_train, axis=(0, 1)))
-        np.save(filename(out_file, "train_feats_std"), np.std(feats_train, axis=(0, 1)))
+    if not os.path.exists(train_beton):
+        full_dataset = FullAudio2LatentFFCVPreprocessor(input_dir, fps)
+        full_loader = DataLoader(full_dataset, batch_size=1, shuffle=False, num_workers=24, prefetch_factor=1)
 
-        lats_train = np.load(train_lat_file, mmap_mode="r")
-        np.save(filename(out_file, "train_lats_offsets"), np.mean(lats_train, axis=(1, 2)))
+        train_feat_file, train_lat_file = f"{datastem}_train_feats.npy", f"{datastem}_train_lats.npy"
+        val_feat_file, val_lat_file = f"{datastem}_val_feats.npy", f"{datastem}_val_lats.npy"
+        if not os.path.exists(mean_file):
+            print("Preprocessing data for FFCV...")
+            train_or_val = np.random.RandomState(42).rand(len(full_dataset)) < 0.8
+            val_files, train_files = [], []
+            val_size, train_size = 0, 0
+            with NumpyArray(train_feat_file) as train_feats, NumpyArray(train_lat_file) as train_lats, NumpyArray(
+                val_feat_file
+            ) as val_feats, NumpyArray(val_lat_file) as val_lats:
+                for i, ((file,), _, _, features, latents) in enumerate(tqdm(full_loader, "Chunking...", smoothing=0)):
+                    features, latents = features.squeeze(), latents.squeeze()
+                    features = torch.stack(  # overlapping slices of DUR seconds
+                        sum([list(torch.split(features[start:], L)[:-1]) for start in range(0, L, L // 4)], [])
+                    )
+                    latents = torch.stack(  # overlapping slices of DUR seconds
+                        sum([list(torch.split(latents[start:], L)[:-1]) for start in range(0, L, L // 4)], [])
+                    )
+                    feature_dim, (n_ws, latent_dim) = features.shape[-1], latents.shape[2:]
+                    (train_files if train_or_val[i] else val_files).append(file)
+                    (train_feats if train_or_val[i] else val_feats).append(features.contiguous().numpy())
+                    (train_lats if train_or_val[i] else val_lats).append(latents.contiguous().numpy())
+                    if train_or_val[i]:
+                        train_size += len(features)
+                    else:
+                        val_size += len(features)
+            with open(f"{datastem}_train_files.txt", "w") as f:
+                f.write("\n".join(train_files))
+            with open(f"{datastem}_val_files.txt", "w") as f:
+                f.write("\n".join(val_files))
+            feats_train = np.load(train_feat_file, mmap_mode="r")
+            np.save(mean_file, np.mean(feats_train, axis=(0, 1)))
+            np.save(std_file, np.std(feats_train, axis=(0, 1)))
+            del feats_train
+        else:
+            train_size, _, feature_dim = np.load(train_feat_file, mmap_mode="r").shape
+            val_size, _, n_ws, latent_dim = np.load(val_lat_file, mmap_mode="r").shape
 
-        if os.path.exists(val_feat_file):
-            feats_val = np.load(val_feat_file, mmap_mode="r")
-            np.save(filename(out_file, "val_feats_mean"), np.mean(feats_val, axis=(0, 1)))
-            np.save(filename(out_file, "val_feats_std"), np.std(feats_val, axis=(0, 1)))
+        print("Preprocessing chunks to FFCV...")
+        DatasetWriter(
+            train_beton,
+            {
+                "features": NDArrayField(shape=(L, 52), dtype=np.dtype("float32")),
+                "latents": NDArrayField(shape=(L, n_ws, latent_dim), dtype=np.dtype("float32")),
+            },
+            num_workers=24,
+        ).from_indexed_dataset(SlicedAudio2LatentFFCVPreprocessor(datastem, split="train"))
+        DatasetWriter(
+            val_beton,
+            {
+                "features": NDArrayField(shape=(L, 52), dtype=np.dtype("float32")),
+                "latents": NDArrayField(shape=(L, n_ws, latent_dim), dtype=np.dtype("float32")),
+            },
+            num_workers=24,
+        ).from_indexed_dataset(SlicedAudio2LatentFFCVPreprocessor(datastem, split="val"))
+        print("Preprocessing complete!")
 
-            lats_val = np.load(val_lat_file, mmap_mode="r")
-            np.save(filename(out_file, "val_lats_offsets"), np.mean(lats_val, axis=(1, 2)))
+        print()
+        print("data summary:")
+        print("train feature sequences:", (train_size, L, feature_dim))
+        print("train latent sequences:", (train_size, L, n_ws, latent_dim))
+        print("val feature sequences:", (val_size, L, feature_dim))
+        print("val latent sequences:", (val_size, L, n_ws, latent_dim))
+        print(f"train is {int(100 * train_size / (train_size + val_size))}%")
+        print()
 
+    train_mean = np.load(mean_file)
+    train_std = np.load(std_file)
+    train_loader = Loader(
+        train_beton,
+        batch_size=batch_size,
+        num_workers=24,
+        order=OrderOption.QUASI_RANDOM,
+        pipelines={"features": [NDArrayDecoder(), ToTensor()], "latents": [NDArrayDecoder(), ToTensor()]},
+        os_cache=True,
+        drop_last=True,
+    )
+    val_loader = Loader(
+        val_beton,
+        batch_size=batch_size,
+        num_workers=24,
+        order=OrderOption.QUASI_RANDOM,
+        pipelines={"features": [NDArrayDecoder(), ToTensor()], "latents": [NDArrayDecoder(), ToTensor()]},
+        os_cache=True,
+        drop_last=True,
+    )
 
-def print_data_summary(train, val):
-    print()
-    print("data summary:")
-    print("train audio feature sequences:", train.features.shape)
-    print("train latent sequences:", train.latents.shape)
-    print("val audio feature sequences:", val.features.shape)
-    print("val latent sequences:", val.latents.shape)
-    print("train %:", int(100 * len(train) / (len(train) + len(val))))
-    print()
+    return train_mean, train_std, train_loader, val_loader
 
 
 def print_model_summary(model):
@@ -317,33 +422,6 @@ def print_model_summary(model):
         handle.remove()
     print("-" * 130)
     print("total".ljust(50), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
-
-
-class AudioLatentDataset(td.Dataset):
-    def __init__(self, file, split="train"):
-        super().__init__()
-        try:
-            self.features = np.load(file.replace(".npy", f"_{split}_feats.npy"), mmap_mode="r")
-            self.latents = np.load(file.replace(".npy", f"_{split}_lats.npy"), mmap_mode="r")
-            self.offsets = np.load(file.replace(".npy", f"_{split}_lats_offsets.npy"), mmap_mode="r")
-
-            self.mean = np.load(file.replace(".npy", f"_{split}_feats_mean.npy"))
-            self.std = np.load(file.replace(".npy", f"_{split}_feats_std.npy"))
-
-        except FileNotFoundError:
-            self.features = np.empty((0, 0, 0))
-            self.latents = np.empty((0, 0, 0, 0))
-            self.offsets = np.empty((0, 0, 0, 0))
-
-            self.mean = np.empty((0, 0, 0))
-            self.std = np.empty((0, 0, 0))
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, index):
-        residuals = self.latents[index] - self.offsets[index]
-        return torch.from_numpy(self.features[index].copy()).detach(), torch.from_numpy(residuals.copy()).detach()
 
 
 def normalize(x):
@@ -424,8 +502,16 @@ class LatentAugmenter:
         self.feat_keys = list(self.feat_idxs.keys())
         self.single_dim = -5
 
+    def __call__(self, features):
+        residuals, offsets = [], []
+        for feature in features:
+            residual, offset = self.random_patch(feature)
+            residuals.append(residual)
+            offsets.append(offset)
+        return torch.stack(residuals), torch.stack(offsets)
+
     @torch.no_grad()
-    def __call__(self, feature):
+    def random_patch(self, feature):
         latent = spline_loop_latents(
             self.ws[np.random.randint(0, self.num, np.random.randint(3, 12))].to(feature), len(feature)
         )
@@ -463,30 +549,6 @@ class LatentAugmenter:
         offset = latent.mean(dim=(0, 1), keepdim=True)
         residuals = latent - offset
         return residuals.detach(), offset.detach()
-
-
-class AugmentedLatentDataset(td.Dataset):
-    def __init__(
-        self,
-        file,
-        split="train",
-        checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt",
-        n_patches=3,
-        device=device,
-    ):
-        super().__init__()
-        self.features = np.load(file.replace(".npy", f"_{split}_feats.npy"), mmap_mode="r")
-        self.augmenter = LatentAugmenter(checkpoint, n_patches)
-        self.device = device
-
-    def __len__(self):
-        return len(self.features)
-
-    @torch.no_grad()
-    def __getitem__(self, index):
-        features = torch.from_numpy(self.features[index].copy()).float().to(self.device)
-        residuals, offsets = self.augmenter(features)
-        return features.detach().cpu(), residuals.detach().cpu()
 
 
 class Normalize(Module):
@@ -1208,21 +1270,24 @@ if __name__ == "__main__":
     parser.add_argument("--convnext", action="store_true")
 
     # Shared options
-    parser.add_argument("--n_layerwise", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
+    parser.add_argument("--n_layerwise", type=int, default=6, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--duration", type=int, default=8)
+    parser.add_argument("--fps", type=int, default=24)
 
     # Training options
-    parser.add_argument("--aug_weight", type=float, default=0.75)
+    parser.add_argument("--aug_weight", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--batch_size", type=int, default=32)
 
     args = parser.parse_args()
 
-    n_frames = int(DUR * FPS)
+    dur, fps = args.duration, args.fps
+    n_frames = dur * fps
 
     in_dir = "/home/hans/datasets/audio2latent/"
     dataset_cache = f"cache/{Path(in_dir).stem}_preprocessed_{n_frames}frames.npy"
@@ -1244,17 +1309,11 @@ if __name__ == "__main__":
     wd = args.wd
     aug_weight = args.aug_weight
 
-    preprocess_audio(in_dir, dataset_cache)
-    pklcache = "cache/ald/"
-    train_dataset = AudioLatentDataset(dataset_cache, "train").cache(td.cachers.Pickle(Path(pklcache)))
-    if aug_weight > 0:
-        aug_dataset = AugmentedLatentDataset(dataset_cache, "train")
-    val_dataset = AudioLatentDataset(dataset_cache, "val")
-    print_data_summary(train_dataset, val_dataset)
+    train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(in_dir, batch_size, dur, fps)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
     if aug_weight > 0:
-        aug_dataloader = DataLoader(aug_dataset, batch_size=batch_size, num_workers=0, shuffle=True, drop_last=True)
+        augmenter = LatentAugmenter(checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3)
+
     inputs, targets = next(iter(train_dataloader))
     feature_dim = inputs.shape[2]
     n_outputs, output_size = targets.shape[2], targets.shape[3]
@@ -1272,8 +1331,8 @@ if __name__ == "__main__":
             ]
         )
         a2l = Audio2Latent(
-            input_mean=train_dataset.mean,
-            input_std=train_dataset.std,
+            input_mean=train_mean,
+            input_std=train_std,
             backbone=backbone,
             skip_backbone=skip_backbone,
             layerwise=layerwise,
@@ -1301,8 +1360,8 @@ if __name__ == "__main__":
         a2l = Audio2Latent2(
             context=context,
             correlation=correlation,
-            input_mean=train_dataset.mean,
-            input_std=train_dataset.std,
+            input_mean=train_mean,
+            input_std=train_std,
             n_layerwise=n_layerwise,
             input_size=feature_dim,
             hidden_size=hidden_size,
@@ -1324,8 +1383,8 @@ if __name__ == "__main__":
             ]
         )
         a2l = MLP(
-            input_mean=train_dataset.mean,
-            input_std=train_dataset.std,
+            input_mean=train_mean,
+            input_std=train_std,
             in_channels=feature_dim,
             channels=hidden_size,
             out_channels=output_size,
@@ -1345,8 +1404,8 @@ if __name__ == "__main__":
             ]
         )
         a2l = ConvNeXt(
-            input_mean=train_dataset.mean,
-            input_std=train_dataset.std,
+            input_mean=train_mean,
+            input_std=train_std,
             input_size=feature_dim,
             hidden_size=hidden_size,
             output_size=output_size,
@@ -1367,7 +1426,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(comment=name)
     shutil.copy(__file__, writer.log_dir)
 
-    from time import time
+    # from time import time
 
     n_iter = 0
     n_epochs = args.epochs
@@ -1381,18 +1440,10 @@ if __name__ == "__main__":
 
         # t = time()
 
-        if aug_weight > 0:
-            dataloader = zip(train_dataloader, aug_dataloader)
-        else:
-            dataloader = train_dataloader
-
-        for batch in dataloader:
-            if aug_weight > 0:
-                (inputs, targets), (aug_inputs, aug_targets) = batch
-            else:
-                inputs, targets = batch
-
+        for inputs, targets in train_dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
+            if aug_weight > 0:
+                (inputs, aug_inputs), (targets, _) = inputs.chunk(2), targets.chunk(2)
 
             # print("data", time() - t)
             # t = time()
@@ -1401,8 +1452,9 @@ if __name__ == "__main__":
             loss = F.mse_loss(outputs, targets)
 
             if aug_weight > 0:
-                aug_inputs, aug_targets = aug_inputs.to(device), aug_targets.to(device)
+                aug_inputs = aug_inputs.to(device)
                 aug_outputs = a2l(aug_inputs)
+                aug_targets, _ = augmenter(aug_inputs)
                 aug_loss = aug_weight * F.mse_loss(aug_outputs, aug_targets)
             else:
                 aug_loss = 0
@@ -1417,46 +1469,38 @@ if __name__ == "__main__":
             aug_losses.append(aug_loss.item())
 
             n_iter += len(inputs)
-        train_loss = np.mean(losses)
-        aug_loss = np.mean(aug_losses)
 
         if (epoch + 1) % eval_interval == 0 or (epoch + 1) == n_epochs:
             with torch.inference_mode():
                 a2l.eval()
-                if len(val_dataset) > 0:
-                    val_dataloader = DataLoader(
-                        val_dataset, batch_size=batch_size, num_workers=24, shuffle=True, drop_last=True
-                    )
-                    val_loss, latent_residuals = 0, []
-                    for it, (inputs, targets) in enumerate(val_dataloader):
-                        inputs, targets = inputs.to(device), targets.to(device)
-                        outputs = a2l(inputs)
-                        latent_residuals.append(np.random.choice(outputs.cpu().numpy().flatten(), 100_000))
-                        val_loss += F.mse_loss(outputs, targets)
-                    val_loss /= len(val_dataloader)
-                    writer.add_scalar("Loss/val", val_loss.item(), n_iter)
 
-                    try:
-                        fcd = calculate_fcd(val_dataloader, a2l)
-                        writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
-                    except Exception as e:
-                        pbar.write(f"\nError in FCD:\n{e}\n\n")
-                        fcd = -1
+                val_loss, latent_residuals = 0, []
+                for it, (inputs, targets) in enumerate(val_dataloader):
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = a2l(inputs)
+                    latent_residuals.append(np.random.choice(outputs.cpu().numpy().flatten(), 100_000))
+                    val_loss += F.mse_loss(outputs, targets)
+                val_loss /= len(val_dataloader)
+                writer.add_scalar("Loss/val", val_loss.item(), n_iter)
 
-                    try:
-                        loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
-                        writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
-                    except Exception as e:
-                        pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
-                        scale = -1
+                try:
+                    fcd = calculate_fcd(val_dataloader, a2l)
+                    writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
+                except Exception as e:
+                    pbar.write(f"\nError in FCD:\n{e}\n\n")
+                    fcd = -1
 
-                else:
-                    val_loss, scale = -1, -1
+                try:
+                    loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
+                    writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
+                except Exception as e:
+                    pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
+                    scale = -1
 
             pbar.write("")
             pbar.write(f"epoch {epoch + 1}")
-            pbar.write(f"train_loss: {train_loss:.4f}")
-            pbar.write(f"aug_loss  : {aug_loss:.4f}")
+            pbar.write(f"train_loss: {np.mean(losses):.4f}")
+            pbar.write(f"aug_loss  : {np.mean(aug_losses):.4f}")
             pbar.write(f"val_loss  : {val_loss:.4f}")
             pbar.write(f"laplace_b : {scale:.4f}")
             pbar.write(f"fcd       : {fcd:.4f}")

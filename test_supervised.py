@@ -26,6 +26,9 @@ from train_supervised import (Normalize, StyleGAN2Mapper, StyleGAN2Synthesizer,
                               audio2video, device)
 # fmt:on
 
+FPS = 24
+DUR = 8
+
 
 class FullLengthAudioFeatureDataset(torch.utils.data.Dataset):
     def __init__(self, directory):
@@ -118,8 +121,8 @@ def load_a2l(path):
     sys.path = sys.path[1:]
 
     if not hasattr(a2l, "normalize"):
-        mean = np.load(f"cache/audio2latent_preprocessed_train_feats_mean.npy")
-        std = np.load(f"cache/audio2latent_preprocessed_train_feats_std.npy")
+        mean = np.load(f"cache/audio2latent_{DUR*FPS}frames_train_mean.npy")
+        std = np.load(f"cache/audio2latent_{DUR*FPS}frames_train_std.npy")
         normalize = Normalize(mean, std).to(device)
 
         def norm_hook(mod, x):
@@ -164,7 +167,7 @@ def test_output_sensitivity(checkpoint, plot=False, whole_feature=True):
 
     test_audio = "/home/hans/datasets/wavefunk/tau ceti alpha.flac"
     audio, sr = torchaudio.load(test_audio)
-    features = audio2features(audio, sr).unsqueeze(0).to(device)
+    features = audio2features(audio, sr, FPS).unsqueeze(0).to(device)
 
     norm_feats = a2l.normalize(features)
 
@@ -264,7 +267,7 @@ def feature_sensitivity(whole_feature, checkpoint):
             if rosa.get_duration(filename=test_audio) < 128:
                 continue
             audio, sr = torchaudio.load(test_audio)
-            feats = audio2features(audio, sr)
+            feats = audio2features(audio, sr, FPS)
             features.append(feats)
             if len(feats) < min_len:
                 min_len = len(feats)
@@ -492,7 +495,7 @@ def test_latent_augmenter():
     )
 
     vid_len = 20
-    fps = 24
+    fps = FPS
     vid_frames = vid_len * fps
     batch_size = 16
 
@@ -500,7 +503,7 @@ def test_latent_augmenter():
         if rosa.get_duration(filename=test_audio) <= 40 or "finow" in test_audio:
             continue
         audio, sr = torchaudio.load(test_audio)
-        feats = audio2features(audio, sr)
+        feats = audio2features(audio, sr, fps)
         start_idx = np.random.randint(0, len(feats) - vid_frames)
         feats = feats[start_idx : start_idx + vid_frames]
         residuals, offset = augmenter(feats)
@@ -572,7 +575,7 @@ if __name__ == "__main__":
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            latent_residuals = a2l(audio2features(*torchaudio.load(args.audio)).to(device).unsqueeze(0))
+            latent_residuals = a2l(audio2features(*torchaudio.load(args.audio), FPS).to(device).unsqueeze(0))
         latent_residuals = latent_residuals.flatten().cpu().numpy()
         loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
         print(f"laplace scale: {scale:.4f}")
