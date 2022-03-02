@@ -4,6 +4,8 @@
 **.npy
 cache/*
 !cache/.gitkeep
+ffcv_cache/*
+!ffcv_cache/.gitkeep
 runs/
 output/*
 !output/.gitkeep

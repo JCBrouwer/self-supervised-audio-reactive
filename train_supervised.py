@@ -32,7 +32,7 @@ from torch.nn import (GELU, GRU, AvgPool1d, Conv1d, ConvTranspose1d, Dropout,
                       Identity, LazyConv1d, LazyConvTranspose1d, LeakyReLU,
                       Linear, Module, ModuleList, Parameter, Sequential,
                       Sigmoid)
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 from torchqrnn import QRNN
@@ -172,17 +172,17 @@ def audio2features(audio, sr, fps, clamp=True, smooth=True):
     audio = audio.numpy()
     n_frames = int(len(audio) / sr * fps)
     features = [
-        rosa.feature.mfcc(audio, sr).transpose(1, 0),
-        rosa.feature.chroma_cens(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
-        rosa.feature.tonnetz(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
-        rosa.feature.spectral_contrast(audio, sr).transpose(1, 0),
+        # rosa.feature.mfcc(audio, sr).transpose(1, 0),
+        # rosa.feature.chroma_cens(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+        # rosa.feature.tonnetz(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+        # rosa.feature.spectral_contrast(audio, sr).transpose(1, 0),
         onset_strength(audio, sr).reshape(-1, 1),
         onset_strength(low_pass(audio, sr), sr).reshape(-1, 1),
         onset_strength(mid_pass(audio, sr), sr).reshape(-1, 1),
         onset_strength(high_pass(audio, sr), sr).reshape(-1, 1),
-        rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1),
-        rosa.feature.rms(audio).reshape(-1, 1),
-        rosa.feature.spectral_flatness(audio).reshape(-1, 1),
+        # rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1),
+        # rosa.feature.rms(audio).reshape(-1, 1),
+        # rosa.feature.spectral_flatness(audio).reshape(-1, 1),
     ]
     features = [signal.resample(f, n_frames) for f in features]
     features = np.concatenate(features, axis=1)
@@ -285,12 +285,14 @@ def get_full_length_ffcv_dataloaders(input_dir, dur, fps):
     return full_loader
 
 
-def get_ffcv_dataloaders(input_dir, batch_size, dur, fps, full=False):
+def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps, full=False):
     L = dur * fps
 
     datastem = f"cache/{Path(input_dir).stem}_{L}frames"
-    train_beton = f"{datastem}_ffcv_train.beton"
-    val_beton = f"{datastem}_ffcv_val.beton"
+    if synthetic:
+        datastem += "_synthetic"
+    train_beton = f"ffcv_{datastem}_ffcv_train.beton"
+    val_beton = f"ffcv_{datastem}_ffcv_val.beton"
     mean_file = f"{datastem}_train_mean.npy"
     std_file = f"{datastem}_train_std.npy"
 
@@ -488,19 +490,19 @@ class LatentAugmenter:
         self.nw = self.ws.shape[1]
         self.feat_idxs = {
             # "mfccs": (0, 20),
-            "chroma": (20, 32),
-            "tonnetz": (32, 38),
+            # "chroma": (20, 32),
+            # "tonnetz": (32, 38),
             # "contrast": (38, 45),
             "onsets": (45, 46),
             "onsets_low": (46, 47),
             "onsets_mid": (47, 48),
             "onsets_high": (48, 49),
             # "pulse": (49, 50),
-            "volume": (50, 51),
+            # "volume": (50, 51),
             # "flatness": (51, 52),
         }
         self.feat_keys = list(self.feat_idxs.keys())
-        self.single_dim = -5
+        self.single_dim = -4
 
     def __call__(self, features):
         residuals, offsets = [], []
@@ -1279,6 +1281,7 @@ if __name__ == "__main__":
 
     # Training options
     parser.add_argument("--aug_weight", type=float, default=0.5)
+    parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0)
@@ -1308,8 +1311,11 @@ if __name__ == "__main__":
     lr = args.lr
     wd = args.wd
     aug_weight = args.aug_weight
+    synthetic = args.synthetic
 
-    train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(in_dir, batch_size, dur, fps)
+    train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(
+        in_dir, synthetic, batch_size, dur, fps
+    )
 
     if aug_weight > 0:
         augmenter = LatentAugmenter(checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3)
@@ -1418,7 +1424,9 @@ if __name__ == "__main__":
     a2l(inputs.to(device))
     print_model_summary(a2l)
 
-    if aug_weight > 0:
+    if synthetic:
+        name += "_synthetic"
+    elif aug_weight > 0:
         name += "_augmented"
 
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
@@ -1438,18 +1446,18 @@ if __name__ == "__main__":
         losses, aug_losses = [], []
         a2l.train()
 
-        # t = time()
-
         for inputs, targets in train_dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
+            if synthetic:
+                pass
             if aug_weight > 0:
                 (inputs, aug_inputs), (targets, _) = inputs.chunk(2), targets.chunk(2)
 
-            # print("data", time() - t)
-            # t = time()
-
-            outputs = a2l(inputs)
-            loss = F.mse_loss(outputs, targets)
+            if not synthetic:
+                outputs = a2l(inputs)
+                loss = F.mse_loss(outputs, targets)
+            else:
+                loss = 0
 
             if aug_weight > 0:
                 aug_inputs = aug_inputs.to(device)
