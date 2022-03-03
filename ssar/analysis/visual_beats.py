@@ -25,8 +25,8 @@ import torch.multiprocessing as mp
 import torchvision as tv
 from torch.nn.functional import pad
 
-from efficient_quantile import quantile
-from flow import cart2pol, lucas_kanade_gaussian_pyramid
+from .efficient_quantile import quantile
+from .flow import cart2pol, lucas_kanade_gaussian_pyramid
 
 
 def normalize(array):

@@ -1,4 +1,4 @@
-from random_patches import *
+from .random_patches import *
 
 
 def render():

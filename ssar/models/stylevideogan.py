@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from models.stylegan2 import PixelNorm
+from .stylegan2 import PixelNorm
 
 
 class GRU(nn.Module):

@@ -6,11 +6,11 @@ import torch
 from scipy.signal import resample
 
 # fmt:off
-from random_patches import (ChromaLatents, ChromaNoise, OnsetLatents,
-                            OnsetNoise, PitchLatents, TempoLatents, TempoNoise,
-                            TonnetzLatents, TonnetzNoise, VolumeLatents,
-                            VolumeNoise, chroma, load_audio, onsets,
-                            pitch_track, tempo, tonnetz, volume)
+from .random_patches import (ChromaLatents, ChromaNoise, OnsetLatents,
+                             OnsetNoise, PitchLatents, TempoLatents,
+                             TempoNoise, TonnetzLatents, TonnetzNoise,
+                             VolumeLatents, VolumeNoise, chroma, load_audio,
+                             onsets, pitch_track, tempo, tonnetz, volume)
 
 # fmt:on
 

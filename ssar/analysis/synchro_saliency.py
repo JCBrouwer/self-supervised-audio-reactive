@@ -18,10 +18,10 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms.functional import center_crop, resize
 from tqdm import tqdm
 
-from audio_features import chroma, fourier_tempogram, hpcp, mfcc, onsets, rms, tempogram, tonnetz
-from models.slowfast import SlowFastExtractor
-from models.vggish import VggishExtractor
-from visual_beats import video_onsets
+from ..models.slowfast import SlowFastExtractor
+from ..models.vggish import VggishExtractor
+from .audio_features import chroma, fourier_tempogram, hpcp, mfcc, onsets, rms, tempogram, tonnetz
+from .visual_beats import video_onsets
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

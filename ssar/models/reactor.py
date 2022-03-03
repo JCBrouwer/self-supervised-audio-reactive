@@ -4,7 +4,7 @@ import haste_pytorch as haste
 import torch
 from torch import Tensor, nn
 
-from models.stylegan2 import PixelNorm
+from .stylegan2 import PixelNorm
 
 
 class Hidden2Style(torch.jit.ScriptModule):

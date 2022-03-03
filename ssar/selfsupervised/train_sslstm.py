@@ -14,9 +14,9 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from models.patch_contrastive import PatchContrastor, PatchSampler1d, PatchSampler2d
-from models.reactor import LSTMReactor
-from models.stylegan2 import Generator
+from ..models.patch_contrastive import PatchContrastor, PatchSampler1d, PatchSampler2d
+from ..models.reactor import LSTMReactor
+from ..models.stylegan2 import Generator
 
 SR = 24575
 DUR = 8

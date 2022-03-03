@@ -1,5 +1,4 @@
 import torch
-
 from efficient_quantile import _efficient_quantile
 
 

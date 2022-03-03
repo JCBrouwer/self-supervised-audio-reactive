@@ -11,28 +11,15 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-import os
-import shutil
 from math import log2, sqrt
-from pathlib import Path
-import joblib
 
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy import stats
-from sklearn.decomposition import PCA
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch.nn.utils import spectral_norm
-from torch.utils.tensorboard.writer import SummaryWriter
-from tqdm import tqdm
-from umap import UMAP
-from context_fid import calculate_fcd
 
-from train_supervised import LatentAugmenter, LayerwiseConv, Normalize, audio2video, get_ffcv_dataloaders
-
-from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
+from .audio2latent import LayerwiseConv, Normalize
 
 
 class SelfAttention(nn.Module):
@@ -132,16 +119,16 @@ class SelfAttention(nn.Module):
             torch.tensor object of shape (batch_size, value_features, L_in)
         """
 
-        Q = self.conv_Q(x).permute(0, 2, 1)  # Shape (batch_size, key_features, L_in)
-        K = self.conv_K(x).permute(0, 2, 1)  # Shape (batch_size, key_features, L_in)
-        V = self.conv_V(x).permute(0, 2, 1)  # Shape (batch_size, value_features, L_in)
+        Q = self.conv_Q(x).permute(0, 2, 1)  # (batch_size, L_in, key_features)
+        K = self.conv_K(x).permute(0, 2, 1)  # (batch_size, L_in, key_features)
+        V = self.conv_V(x).permute(0, 2, 1)  # (batch_size, L_in, value_features)
 
         freqs = self.pos_emb(torch.arange(x.shape[-1], device=x.device), cache_key=x.shape[-1])
         Q = apply_rotary_emb(freqs, Q)
         K = apply_rotary_emb(freqs, K)
 
-        A = (torch.matmul(Q, K.permute(0, 2, 1)) / sqrt(self.key_features)).softmax(2)  # Shape (batch_size, L_in, L_in)
-        H = torch.matmul(A, V).permute(0, 2, 1)  # Shape (batch_size, value_features, L_in)
+        A = (torch.matmul(Q, K.permute(0, 2, 1)) / sqrt(self.key_features)).softmax(2)  # (batch_size, L_in, L_in)
+        H = torch.matmul(A, V).permute(0, 2, 1)  # (batch_size, value_features, L_in)
 
         return H
 
@@ -367,6 +354,8 @@ class ProgressiveGenerator(nn.Module):
         residual_factor: float = 0.0,
         self_attention: bool = True,
         n_channels: int = 32,
+        n_epoch_per_layer: int = 1000,
+        n_epoch_fade_in_new_layer: int = 200,
     ):
         super(ProgressiveGenerator, self).__init__()
         assert log2(target_len) % 1 == 0, "target len must be an integer that is a power of 2."
@@ -378,6 +367,13 @@ class ProgressiveGenerator(nn.Module):
         self.n_features = n_features
         self.n_channels = n_channels
         self.residual_factor = residual_factor
+
+        self.depth = 0
+        self.n_stage = int(log2(target_len)) - 3
+        self.schedule = [n_epoch_per_layer * n for n in range(1, self.n_stage + 1)]
+        self.pretrain_schedule = [(k, k + n_epoch_fade_in_new_layer) for k in self.schedule]
+        self.epoch = 0
+        self.epochs = self.pretrain_schedule[-1][1] + n_epoch_per_layer
 
         self.normalize = Normalize(input_mean, input_std + 1e-8)
 
@@ -423,6 +419,32 @@ class ProgressiveGenerator(nn.Module):
             name="w2",
         )
 
+    def update_depth(self, epoch):
+        self.epoch = epoch
+        if self.n_stage > 0:
+            update_epoch = self.schedule[0]
+            if epoch > update_epoch:
+                self.depth += 1
+                self.n_stage -= 1
+                self.schedule.pop(0)
+
+    def use_residual(self):
+        if self.n_stage > 0 and len(self.pretrain_schedule) > 0:
+            start_epoch_test = self.pretrain_schedule[0][0]
+            end_epoch_test = self.pretrain_schedule[0][1]
+            if end_epoch_test > self.epoch > start_epoch_test:
+                start_epoch = self.pretrain_schedule[0][0]
+                end_epoch = self.pretrain_schedule[0][1]
+                self.pretrain_schedule.pop(0)
+        try:
+            if end_epoch >= self.epoch >= start_epoch:
+                self.residual_factor = (self.epoch - start_epoch) / (end_epoch - start_epoch)
+                return True
+            else:
+                return False
+        except Exception:
+            return False
+
     @staticmethod
     def _get_noise(time_features: torch.Tensor):
         bs = time_features.size(0)
@@ -431,7 +453,7 @@ class ProgressiveGenerator(nn.Module):
         noise = torch.cat((time_features, noise), dim=1)
         return noise
 
-    def forward(self, time_features: torch.Tensor, depth: int = None, residual: bool = False):
+    def forward(self, time_features: torch.Tensor):
         """Computes the forward
 
         Arguments:
@@ -445,18 +467,11 @@ class ProgressiveGenerator(nn.Module):
             length_out will depend on the current stage we are in. It is included between
             8 and target_len
         """
-        if depth is None:
-            depth = self.n_step - 1
-
         x = self._get_noise(self.normalize(time_features))
-
-        assert x.dim() == 3, "input must be three dimensional"
-        # assert x.size(2) == self.target_len, "third dimension of input must be equal to target_len"
-        assert depth <= self.n_step - 1, "depth is too high"
 
         reduced_x = F.avg_pool1d(x, kernel_size=2 ** (self.n_step - 1))  # Reduce x to length 8
         y = self.initial_block(reduced_x)
-        for idx, l in enumerate(self.block_list[:depth]):
+        for idx, l in enumerate(self.block_list[: self.depth]):
             y = F.interpolate(y, scale_factor=2, mode="nearest")
             previous_y = y
             tf = F.avg_pool1d(x[:, :-1, :], kernel_size=2 ** (self.n_step - 1 - (idx + 1)))  # time features reduced
@@ -464,7 +479,7 @@ class ProgressiveGenerator(nn.Module):
             y = l(y)
             last_idx = idx
 
-        if residual and depth > 0:
+        if self.use_residual() and self.depth > 0:
             l_skip = self.skip_block_list[last_idx]
             y = self.residual_factor * self.layerwise(y.permute(0, 2, 1)) + (1 - self.residual_factor) * self.layerwise(
                 l_skip(previous_y).permute(0, 2, 1)
@@ -472,7 +487,7 @@ class ProgressiveGenerator(nn.Module):
         else:
             y = self.layerwise(y.permute(0, 2, 1))
 
-        return y
+        return y.permute(0, 2, 3, 1)
 
 
 class ProgressiveGeneratorInference(nn.Module):
@@ -518,6 +533,8 @@ class ProgressiveDiscriminator(nn.Module):
         residual_factor: float = 0.0,
         self_attention: bool = True,
         n_channels: int = 32,
+        n_epoch_per_layer: int = 1000,
+        n_epoch_fade_in_new_layer: int = 200,
     ):
         super(ProgressiveDiscriminator, self).__init__()
         assert target_len >= 8, "target length should be at least of value 8"
@@ -528,6 +545,13 @@ class ProgressiveDiscriminator(nn.Module):
         self.n_step = int(log2(target_len)) - 2  # nb of step to go from 8 to target_len
         self.residual_factor = residual_factor
         self.n_channels = n_channels
+
+        self.depth = 0
+        self.n_stage = int(log2(target_len)) - 3
+        self.schedule = [n_epoch_per_layer * n for n in range(1, self.n_stage + 1)]
+        self.pretrain_schedule = [(k, k + n_epoch_fade_in_new_layer) for k in self.schedule]
+        self.epoch = 0
+        self.epochs = self.pretrain_schedule[-1][1] + n_epoch_per_layer
 
         self.normalize = Normalize(input_mean, input_std + 1e-8)
 
@@ -580,7 +604,33 @@ class ProgressiveDiscriminator(nn.Module):
 
         self.fc = spectral_norm(nn.Linear(8, 1))
 
-    def forward(self, x: torch.Tensor, tf: torch.Tensor, depth: int = None, residual: bool = False):
+    def update_depth(self, epoch):
+        self.epoch = epoch
+        if self.n_stage > 0:
+            update_epoch = self.schedule[0]
+            if epoch > update_epoch:
+                self.depth += 1
+                self.n_stage -= 1
+                self.schedule.pop(0)
+
+    def use_residual(self):
+        if self.n_stage > 0 and len(self.pretrain_schedule) > 0:
+            start_epoch_test = self.pretrain_schedule[0][0]
+            end_epoch_test = self.pretrain_schedule[0][1]
+            if end_epoch_test > self.epoch > start_epoch_test:
+                start_epoch = self.pretrain_schedule[0][0]
+                end_epoch = self.pretrain_schedule[0][1]
+                self.pretrain_schedule.pop(0)
+        try:
+            if end_epoch >= self.epoch >= start_epoch:
+                self.residual_factor = (self.epoch - start_epoch) / (end_epoch - start_epoch)
+                return True
+            else:
+                return False
+        except Exception:
+            return False
+
+    def forward(self, x: torch.Tensor, tf: torch.Tensor):
         """Computes the forward pass
 
         Arguments:
@@ -592,20 +642,13 @@ class ProgressiveDiscriminator(nn.Module):
                 the depth at which the the tensor should flow.
         """
 
-        if depth is None:
-            depth = self.n_step - 1
-
         tf = self.normalize(tf)
         x = x.reshape(x.shape[0], -1, x.shape[3])
-
-        assert x.dim() == 3, "input must be three dimensional"
-        assert x.size(2) >= 8, "third dimension of input must be greater or equal than 8"
-        assert log2(x.size(2)) % 1 == 0, "input length must be an integer that is a power of 2."
-        assert tf.size(2) == self.target_len, "length of features should be equal to target len"
 
         reduce_factor = int(log2(self.target_len)) - int(log2(x.size(2)))
         reduced_tf = F.avg_pool1d(tf, kernel_size=2 ** reduce_factor)
 
+        residual = self.use_residual()
         if residual:
             pre_reduce_tf = F.avg_pool1d(tf, kernel_size=2 ** (reduce_factor + 1))
             pre_x = F.avg_pool1d(x, kernel_size=2)
@@ -624,338 +667,3 @@ class ProgressiveDiscriminator(nn.Module):
         x = self.last_block(x)
         x = self.fc(x.squeeze(1))
         return x
-
-
-def _residual():
-    if n_stage > 0 and len(pretrain_schedule) > 0:
-        start_epoch_test = pretrain_schedule[0][0]
-        end_epoch_test = pretrain_schedule[0][1]
-        if end_epoch_test > epoch > start_epoch_test:
-            start_epoch = pretrain_schedule[0][0]
-            end_epoch = pretrain_schedule[0][1]
-            pretrain_schedule.pop(0)
-    try:
-        if end_epoch >= epoch >= start_epoch:
-            G.residual_factor = D.residual_factor = (epoch - start_epoch) / (end_epoch - start_epoch)
-            return True
-        else:
-            return False
-    except Exception:
-        return False
-
-
-def infiniter(dataloader):
-    while True:
-        for batch in dataloader:
-            yield batch
-
-
-def print_model_summary(G, D):
-    global total_params
-    total_params = 0
-    handles = []
-    for name, block in list(G.named_modules()) + list(D.named_modules()):
-
-        def hook(m, i, o, name=name):
-            global total_params
-            if len(list(m.named_modules())) == 1:
-                class_name = m.__class__.__name__
-                output_shape = (
-                    tuple(tuple(oo.shape) if not isinstance(oo, int) else oo for oo in o)
-                    if isinstance(o, tuple)
-                    else tuple(o.shape)
-                )
-                num_params = sum(p.numel() for p in m.parameters())
-                total_params += num_params
-                print(
-                    name.ljust(60),
-                    class_name.ljust(20),
-                    f"{output_shape}".ljust(40),
-                    f"{num_params/ 1000:.2f} K" if num_params > 0 else "0",
-                )
-
-        handles.append(block.register_forward_hook(hook))
-
-    print()
-    print("G summary:")
-    print("name".ljust(60), "class".ljust(20), "output shape".ljust(40), "num params")
-    print("-" * 150)
-    output = G(inputs.permute(0, 2, 1).to(device))
-    print("-" * 150)
-    print("total".ljust(60), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
-
-    print()
-    print("D summary:")
-    print("name".ljust(60), "class".ljust(20), "output shape".ljust(40), "num params")
-    print("-" * 150)
-    D(output.permute(0, 2, 3, 1), inputs.permute(0, 2, 1).to(device))
-    print("-" * 150)
-    print("total".ljust(60), f"".ljust(20), f"".ljust(40), f"{total_params/1e6:.2f} M")
-
-    for handle in handles:
-        handle.remove()
-
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    target_len = 128
-    n_channels = 32
-    depth = 0
-    n_epoch_per_layer = 600
-    n_epoch_fade_in_new_layer = 200
-    epoch_len = 128
-    ks_conv = 3
-    key_features = value_features = 32
-    pos_emb_dim = 16
-    ks_value = ks_query = ks_key = 1
-    n_layerwise = 3
-    batch_size = 128
-    lr = 5e-4
-    # aug_weight = 0.5
-    synthetic = False
-
-    fps = 24
-    dur = target_len / fps
-
-    n_stage = int(log2(target_len)) - 3
-    schedule = [n_epoch_per_layer * n for n in range(1, n_stage + 1)]
-    pretrain_schedule = [(k, k + n_epoch_fade_in_new_layer) for k in schedule]
-    epochs = pretrain_schedule[-1][1] + n_epoch_per_layer
-
-    in_dir = "/home/hans/datasets/audio2latent/"
-    dataset_cache = f"cache/{Path(in_dir).stem}_preprocessed_{target_len}frames.npy"
-    test_audio = "/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac"
-
-    train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(
-        in_dir, synthetic, batch_size, dur, fps
-    )
-    train_mean, train_std = train_mean[None, :, None], train_std[None, :, None]
-    valiter = infiniter(val_dataloader)
-    trainiter = infiniter(train_dataloader)
-
-    # if aug_weight > 0:
-    #     augmenter = LatentAugmenter(
-    #         checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3, synthetic=synthetic
-    #     )
-
-    inputs, targets = next(trainiter)
-    n_features = inputs.shape[2]
-    n_outputs, output_size = targets.shape[2], targets.shape[3]
-
-    G = ProgressiveGenerator(
-        input_mean=train_mean,
-        input_std=train_std,
-        target_len=target_len,
-        n_features=n_features,
-        n_channels=n_channels,
-        n_outputs=n_outputs,
-        n_layerwise=n_layerwise,
-        output_size=output_size,
-        ks_conv=ks_conv,
-        key_features=key_features,
-        value_features=value_features,
-        ks_value=ks_value,
-        ks_query=ks_query,
-        ks_key=ks_key,
-        pos_emb_dim=pos_emb_dim,
-        self_attention=True,
-    ).to(device)
-
-    D = ProgressiveDiscriminator(
-        input_mean=train_mean,
-        input_std=train_std,
-        target_len=target_len,
-        n_features=n_features,
-        n_channels=n_channels,
-        n_outputs=n_outputs,
-        output_size=output_size,
-        ks_conv=ks_conv,
-        key_features=key_features,
-        value_features=value_features,
-        ks_value=ks_value,
-        ks_query=ks_query,
-        ks_key=ks_key,
-        pos_emb_dim=pos_emb_dim,
-        self_attention=True,
-    ).to(device)
-
-    print_model_summary(G, D)
-
-    optimizer_g = torch.optim.Adam(G.parameters(), lr=lr, betas=(0, 0.99))
-    optimizer_d = torch.optim.Adam(D.parameters(), lr=lr, betas=(0, 0.99))
-
-    name = "_".join(["PSAGAN", f"length:{target_len}", f"hidden_size:{n_channels}", f"lr:{lr}"])
-    writer = SummaryWriter(comment=name)
-    shutil.copy(__file__, writer.log_dir)
-    shutil.copy(f"{os.path.dirname(__file__)}/train_supervised.py", writer.log_dir)
-
-    n_iter = 0
-    video_interval = 100
-    eval_interval = 20
-    pbar = tqdm(range(epochs))
-    for epoch in pbar:
-        for _ in range(epoch_len):
-
-            if n_stage > 0:  # update growth schedule
-                update_epoch = schedule[0]
-                if epoch > update_epoch:
-                    depth += 1
-                    n_stage -= 1
-                    schedule.pop(0)
-
-            G.train(), D.train()
-
-            # load data
-            features, targets = next(trainiter)
-            features, targets = features.to(device).permute(0, 2, 1), targets.to(device).permute(0, 2, 3, 1)
-            b, n, l, t = targets.size()
-
-            # Generator step
-
-            for p in D.parameters():
-                p.requires_grad = False
-
-            generated = G(features, depth=depth, residual=_residual()).permute(0, 2, 3, 1)
-
-            reduce_factor = int(log2(D.target_len)) - int(log2(generated.size(3)))
-            targets = F.avg_pool1d(targets.reshape(b, -1, t), kernel_size=2 ** reduce_factor).reshape(b, n, l, -1)
-
-            loss = D(generated, features, depth=depth, residual=_residual()) - 1
-            loss_ls = 0.5 * torch.square(loss).mean()
-
-            loss_std = torch.abs(generated.std(dim=(1, 2)) - targets.std(dim=(1, 2))).mean()
-            loss_mean = torch.abs(generated.mean(dim=(1, 2)) - targets.mean(dim=(1, 2))).mean()
-            loss_moment = loss_std + loss_mean
-
-            loss_g = loss_ls + loss_moment
-
-            optimizer_g.zero_grad()
-            loss_g.backward()
-            optimizer_g.step()
-
-            writer.add_scalar("G/loss_ls", loss_ls.item(), n_iter)
-            writer.add_scalar("G/loss_moment", loss_moment.item(), n_iter)
-
-            # Discriminator step
-
-            for p in D.parameters():
-                p.requires_grad = True
-
-            features, targets = next(trainiter)
-            features, targets = features.to(device).permute(0, 2, 1), targets.to(device).permute(0, 2, 3, 1)
-            targets = F.avg_pool1d(targets.reshape(b, -1, t), kernel_size=2 ** reduce_factor).reshape(b, n, l, -1)
-
-            with torch.no_grad():
-                generated = G(features, depth=depth, residual=_residual()).permute(0, 2, 3, 1)
-
-            preds_fake = D(generated.detach(), features, depth=depth, residual=_residual())
-            preds_real = D(targets, features, depth=depth, residual=_residual())
-            loss_fake = 0.5 * torch.square(preds_fake).mean()
-            loss_real = 0.5 * torch.square(preds_real - 1).mean()
-            loss_d = loss_real + loss_fake
-
-            optimizer_d.zero_grad()
-            loss_d.backward()
-            optimizer_d.step()
-
-            mean_fake_pred = loss_fake.mean().item()
-            mean_real_pred = loss_real.mean().item()
-            writer.add_scalar("D/mean_fake_pred", mean_fake_pred, n_iter)
-            writer.add_scalar("D/mean_real_pred", mean_real_pred, n_iter)
-            writer.add_scalar("D/loss_fake", loss_fake.item(), n_iter)
-            writer.add_scalar("D/loss_real", loss_real.item(), n_iter)
-
-            n_iter += len(features)
-
-        if (epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs:
-            with torch.inference_mode():
-                G.eval()
-
-                try:
-                    fcd = calculate_fcd(
-                        val_dataloader,
-                        lambda x: F.interpolate(
-                            G(x.permute(0, 2, 1), depth=depth, residual=False)
-                            .reshape(x.shape[0], x.shape[1], -1)
-                            .permute(0, 2, 1),
-                            scale_factor=2 ** reduce_factor,
-                        )
-                        .permute(0, 2, 1)
-                        .reshape(x.shape[0], -1, n_outputs, output_size),
-                    )
-                    writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
-                except Exception as e:
-                    pbar.write(f"\nError in FCD:\n{e}\n\n")
-                    fcd = -1
-
-                features, targets = next(valiter)
-                features, targets = features.to(device).permute(0, 2, 1), targets.to(device).permute(0, 2, 3, 1)
-                targets = F.avg_pool1d(targets.reshape(b, -1, t), kernel_size=2 ** reduce_factor).reshape(b, n, l, -1)
-
-                generated = G(features, depth=depth, residual=False).permute(0, 2, 3, 1)
-
-                try:
-                    loc, scale = stats.laplace.fit(
-                        np.random.choice(generated.cpu().numpy().flatten(), 100_000), loc=0, scale=0.1
-                    )
-                    writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
-                except Exception as e:
-                    pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
-                    scale = -1
-
-                generated_stats = (
-                    torch.cat((generated.mean((1, 2)), generated.std((1, 2)))).reshape(b, -1).cpu().numpy()
-                )
-                target_stats = torch.cat((targets.mean((1, 2)), targets.std((1, 2)))).reshape(b, -1).cpu().numpy()
-                if generated_stats.shape[1] > 48:
-                    generated_stats = PCA(n_components=48).fit_transform(generated_stats)
-                    target_stats = PCA(n_components=48).fit_transform(target_stats)
-                full_stats = np.concatenate((generated_stats, target_stats), axis=0)
-                full_umap = UMAP().fit_transform(full_stats)
-                fake_umap = full_umap[:b, :]
-                real_umap = full_umap[b:, :]
-
-                plt.plot(fake_umap[:, 0], fake_umap[:, 1], "o", label="fake samples", alpha=0.4)
-                plt.plot(real_umap[:, 0], real_umap[:, 1], "o", label="real samples", alpha=0.4)
-                plt.legend()
-                plt.savefig(f"{writer.log_dir}/umap_{epoch}.pdf")
-                plt.close()
-
-            pbar.write("")
-            pbar.write(f"epoch {epoch + 1}")
-            pbar.write(f"laplace_b : {scale:.4f}")
-            pbar.write(f"fake      : {mean_fake_pred:.4f}")
-            pbar.write(f"real      : {mean_real_pred:.4f}")
-            pbar.write(f"fcd       : {fcd:.4f}")
-            pbar.write("")
-
-        if (epoch + 1) % video_interval == 0 or (epoch + 1) == epochs:
-            checkpoint_name = f"psagan_{name}_steps{n_iter:08}_fcd{fcd:.4f}_b{scale:.4f}"
-            joblib.dump(
-                {
-                    "n_iter": n_iter,
-                    "G": G.state_dict(),
-                    "D": D.state_dict(),
-                    "G_opt": optimizer_g.state_dict(),
-                    "D_opt": optimizer_d.state_dict(),
-                },
-                f"{writer.log_dir}/{checkpoint_name}.pt",
-                compress=9,
-            )
-            audio2video(
-                a2l=lambda x: F.interpolate(
-                    G(x.permute(0, 2, 1), depth=depth, residual=False)
-                    .reshape(x.shape[0], x.shape[1], -1)
-                    .permute(0, 2, 1),
-                    scale_factor=2 ** reduce_factor,
-                )
-                .permute(0, 2, 1)
-                .reshape(x.shape[0], -1, n_outputs, output_size),
-                audio_file=test_audio,
-                out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
-                stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
-                onsets_only=synthetic,
-            )
-
-    writer.close()

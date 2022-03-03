@@ -21,8 +21,8 @@ from torch.utils.data import DataLoader
 from tsai.all import *
 from tslearn.clustering import TimeSeriesKMeans
 
-from sgw import sgw_gpu as sliced_gromov_wasserstein
-from synchro_saliency import AudioVisualFeatures
+from .sgw import sgw_gpu as sliced_gromov_wasserstein
+from .synchro_saliency import AudioVisualFeatures
 
 my_setup()
 gpu = torch.device("cuda")

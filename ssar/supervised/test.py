@@ -1,136 +1,37 @@
-# fmt:off
 import argparse
+import gc
 import importlib
 import os
 import sys
 import warnings
-from copy import copy, deepcopy
+from copy import deepcopy
 from glob import glob
+from math import log2
 from pathlib import Path
 
 import joblib
 import librosa as rosa
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 from scipy import stats
 from scipy.stats import ttest_ind
+from torch.utils.data import DataLoader, Dataset
 from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 from tqdm import tqdm
 
-from sgw import sgw_gpu
-from train_supervised import (Normalize, StyleGAN2Mapper, StyleGAN2Synthesizer,
-                              VideoWriter, _audio2video, audio2features,
-                              audio2video, device)
-# fmt:on
+from ..analysis.sgw import sgw_gpu
+from ..models.audio2latent import Normalize
+
+sys.path.append("/home/hans/code/maua/maua/")
+from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
+from ops.video import VideoWriter
 
 FPS = 24
 DUR = 8
-
-
-class FullLengthAudioFeatureDataset(torch.utils.data.Dataset):
-    def __init__(self, directory):
-        super().__init__()
-        self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
-        from train_supervised import audio2features
-
-        self.a2f = audio2features
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, index):
-        file = self.files[index]
-        filename, _ = os.path.splitext(file)
-
-        audio, sr = torchaudio.load(file)
-        features = self.a2f(audio, sr)
-
-        try:
-            latents = joblib.load(f"{filename}.npy").float()
-        except:
-            try:
-                latents = torch.from_numpy(np.load(f"{filename}.npy")).float()
-            except:
-                latents = torch.zeros(())
-
-        return features, latents
-
-
-def latent_residual_hist():
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from scipy import stats
-
-    latent_residuals = []
-    i, n = 0, 32
-    for _, targets in dataloader:
-        latent_residuals.append(targets.numpy())
-        i += 1
-        if i > n:
-            break
-    latent_residuals = np.concatenate(latent_residuals).flatten()
-    plt.figure(figsize=(16, 9))
-    plt.hist(
-        latent_residuals,
-        bins=1000,
-        label=f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})",
-        color="tab:blue",
-        alpha=0.5,
-        density=True,
-    )
-    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
-    xs = np.linspace(-2, 2, 1000)
-    plt.plot(
-        xs,
-        stats.laplace.pdf(xs, loc=loc, scale=scale),
-        label=rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})",
-        color="tab:orange",
-        alpha=0.75,
-    )
-    plt.title("Distribution of latent residuals")
-    plt.legend()
-    plt.xlim(-2, 2)
-    plt.tight_layout()
-    plt.savefig(f"plots/latent-residuals-distribution-true-{Path(dataset_cache).stem}.png")
-
-
-def load_a2l(path):
-    # HACK to import all modules that model needs from it's training code cache
-    sys.path = [os.path.dirname(path)] + sys.path
-    original_main_module = {}
-    import train_supervised
-
-    importlib.reload(train_supervised)
-    for k in train_supervised.__dict__:
-        if not k.startswith("_"):
-            try:
-                original_main_module[k] = deepcopy(getattr(sys.modules["__main__"], k))
-            except:
-                pass
-            setattr(sys.modules["__main__"], k, getattr(train_supervised, k))
-
-    a2l = joblib.load(path)["a2l"].eval().to(device)
-
-    for k in original_main_module:
-        setattr(sys.modules["__main__"], k, original_main_module[k])
-    sys.path = sys.path[1:]
-
-    if not hasattr(a2l, "normalize"):
-        mean = np.load(f"cache/audio2latent_{DUR*FPS}frames_train_mean.npy")
-        std = np.load(f"cache/audio2latent_{DUR*FPS}frames_train_std.npy")
-        normalize = Normalize(mean, std).to(device)
-
-        def norm_hook(mod, x):
-            return normalize(x[0])
-
-        a2l.register_forward_pre_hook(norm_hook)
-
-    return a2l
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 col_names = [
@@ -162,12 +63,13 @@ feature_names = [
 ]
 
 
+@torch.inference_mode()
 def test_output_sensitivity(checkpoint, plot=False, whole_feature=True):
-    a2l = load_a2l(checkpoint)
+    a2l, a2f = load_a2l(checkpoint)
 
     test_audio = "/home/hans/datasets/wavefunk/tau ceti alpha.flac"
     audio, sr = torchaudio.load(test_audio)
-    features = audio2features(audio, sr, FPS).unsqueeze(0).to(device)
+    features = a2f(audio, sr, FPS).unsqueeze(0).to(device)
 
     norm_feats = a2l.normalize(features)
 
@@ -257,7 +159,7 @@ def test_output_sensitivity(checkpoint, plot=False, whole_feature=True):
 
 @torch.inference_mode()
 def feature_sensitivity(whole_feature, checkpoint):
-    a2l = load_a2l(checkpoint)
+    a2l, a2f = load_a2l(checkpoint)
 
     cache_file = "cache/test_features.npy"
     if not os.path.exists(cache_file):
@@ -267,7 +169,7 @@ def feature_sensitivity(whole_feature, checkpoint):
             if rosa.get_duration(filename=test_audio) < 128:
                 continue
             audio, sr = torchaudio.load(test_audio)
-            feats = audio2features(audio, sr, FPS)
+            feats = a2f(audio, sr, FPS)
             features.append(feats)
             if len(feats) < min_len:
                 min_len = len(feats)
@@ -480,7 +382,8 @@ def test_new_spline():
 
 @torch.inference_mode()
 def test_latent_augmenter():
-    from train_supervised import LatentAugmenter
+    from .data import audio2features
+    from .latent_augmenter import LatentAugmenter
 
     checkpoint = "/home/hans/modelzoo/train_checks/neurout2-117.pt"
     n_patches = 3
@@ -522,27 +425,235 @@ def test_latent_augmenter():
                     video.write(frame.unsqueeze(0))
 
 
-if __name__ == "__main__":
-    # test_output_sensitivity(
-    #     "runs/Feb24_10-39-54_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented_steps00061440_fcd40.1304_b0.0425_val0.0669.pt",
-    #     True,
-    #     True,
-    # )
-    # test_output_sensitivity(
-    #     "runs/Feb24_10-39-54_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented_steps00061440_fcd40.1304_b0.0425_val0.0669.pt",
-    #     False,
-    #     False,
-    # )
-    # feature_sensitivity(
-    #     True,
-    #     "runs/Feb24_10-39-54_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented_steps00061440_fcd40.1304_b0.0425_val0.0669.pt",
-    # )
-    feature_sensitivity(
-        False,
-        "runs/Feb24_10-39-54_ubuntu94025backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented/audio2latent_backbone:gru:skipFalse_layerwise:conv:3_hidden_size:64_num_layers:8_dropout:0.2_lr:0.001_wd:0_augmented_steps00061440_fcd40.1304_b0.0425_val0.0669.pt",
-    )
-    exit()
+@torch.inference_mode()
+def latent_residual_hist(latent_residuals):
+    import matplotlib
 
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy import stats
+
+    plt.figure(figsize=(16, 9))
+    plt.hist(
+        latent_residuals,
+        bins=1000,
+        label=f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})",
+        color="tab:blue",
+        alpha=0.5,
+        density=True,
+    )
+    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
+    xs = np.linspace(-2, 2, 1000)
+    plt.plot(
+        xs,
+        stats.laplace.pdf(xs, loc=loc, scale=scale),
+        label=rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})",
+        color="tab:orange",
+        alpha=0.75,
+    )
+    plt.title("Distribution of latent residuals")
+    plt.legend()
+    plt.xlim(-2, 2)
+    plt.tight_layout()
+    plt.savefig(f"plots/latent-residuals-distribution-true.png")
+
+
+@torch.inference_mode()
+def _audio2video(
+    a2l,
+    test_features,
+    audio_file,
+    out_file,
+    stylegan_file,
+    fps,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    seed=42,
+):
+    test_latents = a2l(test_features).squeeze()
+
+    mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
+    latent_offset = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
+    del mapper
+
+    synthesizer = StyleGAN2Synthesizer(
+        model_file=stylegan_file, inference=False, output_size=output_size, strategy="stretch", layer=0
+    )
+    synthesizer.eval().to(device)
+
+    with VideoWriter(
+        output_file=out_file,
+        output_size=output_size,
+        fps=fps,
+        audio_file=audio_file,
+        audio_offset=offset,
+        audio_duration=duration,
+    ) as video:
+        for i in tqdm(range(0, len(test_latents), batch_size), unit_scale=batch_size):
+            for frame in synthesizer(latent_offset + test_latents[i : i + batch_size]).add(1).div(2):
+                video.write(frame.unsqueeze(0))
+
+    del test_features, test_latents, latent_offset, synthesizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@torch.inference_mode()
+def audio2video(
+    a2l,
+    a2f,
+    audio_file,
+    out_file,
+    stylegan_file,
+    fps=24,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    onsets_only=False,
+):
+    try:
+        a2l = a2l.eval().to(device)
+    except:
+        pass
+    audio, sr = torchaudio.load(audio_file)
+    test_features = a2f(audio, sr, fps, onsets_only=onsets_only)
+    test_features = test_features[24 * offset : 24 * (offset + duration)]
+    test_features = test_features.unsqueeze(0).to(device)
+    _audio2video(
+        a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration
+    )
+
+
+class AudioFeatures(Dataset):
+    def __init__(self, directory, a2f, dur, fps):
+        super().__init__()
+        self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
+        self.a2f = a2f
+        self.L = dur * fps
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        file = self.files[index]
+        audio, sr = torchaudio.load(file)
+        features = self.a2f(audio, sr)
+        features = torch.stack(  # overlapping slices of DUR seconds
+            sum([list(torch.split(features[start:], self.L)[:-1]) for start in range(0, self.L, self.L // 4)], [])
+        )
+        return features
+
+
+class ModuleFromFile:
+    def __init__(self, path, name) -> None:
+        self.path = path
+        self.name = name
+
+    def __enter__(self):
+        directory = os.path.dirname(self.path)
+        with open(f"{directory}/{self.name}.py", "r") as f:
+            text = f.read()
+        text = text.replace("from context_fid", "# from context_fid").replace("# #", "#")
+        with open(f"{directory}/{self.name}.py", "w") as f:
+            f.write(text)
+        sys.path = [directory] + sys.path
+        self.original_main_module = {}
+        module = importlib.import_module(self.name)
+        importlib.reload(module)
+        for k in module.__dict__:
+            if not k.startswith("_"):
+                try:
+                    self.original_main_module[k] = deepcopy(getattr(sys.modules["__main__"], k))
+                except:
+                    pass
+                setattr(sys.modules["__main__"], k, getattr(module, k))
+        return module
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        for k in self.original_main_module:
+            setattr(sys.modules["__main__"], k, self.original_main_module[k])
+        sys.path = sys.path[1:]
+
+
+@torch.inference_mode()
+def load_a2l(path):
+    # HACK to import all modules that model needs from it's training code cache
+
+    dirname = os.path.dirname(path)
+
+    if "PSAGAN" in dirname:
+        with ModuleFromFile(path, "ssar") as ssar:
+            ckpt = joblib.load(path)
+            G = ckpt["G"].eval().to(device)
+            n_out = G.layerwise.NO
+            out_size = G.layerwise.b2.shape[1] // G.layerwise.NL
+            full_len = ckpt["D"].target_length
+            a2l = (
+                lambda x: F.interpolate(
+                    G(x.permute(0, 2, 1)).reshape(x.shape[0], -1, x.shape[1]),
+                    scale_factor=2 ** int(log2(full_len) - (3 + G.depth)),
+                )
+                .permute(0, 2, 1)
+                .reshape(x.shape[0], -1, n_out, out_size)
+            )
+            a2f = ssar.supervised.data.audio2features
+
+    elif "train_supervised.py" in os.listdir(dirname):
+        with ModuleFromFile(path, "train_supervised") as module:
+            a2l = joblib.load(path)["a2l"].eval().to(device)
+
+            def a2f(x, sr, fps=24):
+                try:
+                    return module.audio2features(x, sr, fps)
+                except:
+                    try:
+                        return module.audio2features(x, sr)
+                    except:
+                        raise Exception("wat")
+
+            in_dir = "/home/hans/datasets/audio2latent/"
+            try:
+                dur = module.DUR
+            except:
+                dur = DUR
+            try:
+                fps = module.FPS
+            except:
+                fps = FPS
+
+        print(a2l.__class__.__name__, hasattr(a2l, "normalize"))
+
+        if not hasattr(a2l, "normalize"):
+            if not os.path.exists(f"{dirname}/mean.npy"):
+                feats = torch.cat(
+                    [f.squeeze() for f in tqdm(DataLoader(AudioFeatures(in_dir, a2f, dur, fps), num_workers=24))]
+                )
+                mean = torch.mean(feats)
+                std = torch.std(feats)
+                np.save(f"{dirname}/mean.npy", mean.cpu().numpy())
+                np.save(f"{dirname}/std.npy", std.cpu().numpy())
+            else:
+                mean = torch.from_numpy(np.load(f"{dirname}/mean.npy"))
+                std = torch.from_numpy(np.load(f"{dirname}/std.npy"))
+            normalize = Normalize(mean, std).to(device)
+
+            def norm_hook(mod, x):
+                return normalize(x[0])
+
+            a2l.register_forward_pre_hook(norm_hook)
+
+    else:
+        with ModuleFromFile(path, "ssar") as ssar:
+            a2l = joblib.load(path)["a2l"].eval().to(device)
+            a2f = ssar.supervised.data.audio2features
+
+    return a2l, a2f
+
+
+if __name__ == "__main__":
     current_a2v = deepcopy(audio2video)
 
     # fmt:off
@@ -553,17 +664,27 @@ if __name__ == "__main__":
     parser.add_argument("--output_size", help="output size for StyleGAN model rendering", nargs=2, default=[512, 512])
     parser.add_argument("--batch_size", help="batch size for StyleGAN model rendering", type=int, default=8)
     parser.add_argument("--offset", help="time in audio to start from in seconds", type=int, default=0)
-    parser.add_argument("--duration", help="length in seconds of video to render", type=int, default=40)
+    parser.add_argument("--duration", help="length in seconds of video to render", type=int, default=0)
     parser.add_argument("--plot", help="output distribution plot instead of only printing laplace scale", action='store_true')
+    parser.add_argument("--insense", help="test input sensitivity", action='store_true')
+    parser.add_argument("--outsense", help="test output sensitivity", action='store_true')
+    parser.add_argument("--whole_feat_sense", help="whether to use whole feature or not", action='store_true')
+    parser.add_argument("--lap_scale", help="print laplacian scale", action='store_true')
     args = parser.parse_args()
     # fmt:on
 
     with torch.inference_mode():
-        a2l = load_a2l(args.ckpt)
+        if args.insense:
+            feature_sensitivity(args.whole_feat_sense, args.ckpt)
+        if args.outsense:
+            test_output_sensitivity(args.ckpt, args.plot, args.whole_feat_sense)
+
+        a2l, a2f = load_a2l(args.ckpt)
 
         if args.duration > 0:
             current_a2v(
                 a2l=a2l,
+                a2f=a2f,
                 audio_file=args.audio,
                 out_file=f"{os.path.splitext(args.ckpt)[0]}_{Path(args.audio).stem}.mp4",
                 stylegan_file=args.stylegan,
@@ -573,12 +694,13 @@ if __name__ == "__main__":
                 duration=args.duration,
             )
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            latent_residuals = a2l(audio2features(*torchaudio.load(args.audio), FPS).to(device).unsqueeze(0))
-        latent_residuals = latent_residuals.flatten().cpu().numpy()
-        loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
-        print(f"laplace scale: {scale:.4f}")
+        if args.lap_scale:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                latent_residuals = a2l(a2f(*torchaudio.load(args.audio), FPS).to(device).unsqueeze(0))
+            latent_residuals = latent_residuals.flatten().cpu().numpy()
+            loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
+            print(f"laplace scale: {scale:.4f}")
 
         out_file = f"plots/latent-residuals-distribution-{Path(args.audio).stem}-{Path(os.path.dirname(args.ckpt)).stem}-{Path(args.ckpt).stem}.png"
         if not os.path.exists(out_file) and args.plot:

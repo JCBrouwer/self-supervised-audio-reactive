@@ -9,8 +9,8 @@ import torchaudio
 import torchvision as tv
 from tqdm import tqdm
 
-from models.reactor import LSTMReactor
-from models.stylegan2 import Generator
+from ..models.reactor import LSTMReactor
+from ..models.stylegan2 import Generator
 
 SR = 24575
 DUR = 8

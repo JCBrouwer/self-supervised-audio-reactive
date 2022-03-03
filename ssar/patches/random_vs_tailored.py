@@ -15,7 +15,7 @@ from npy_append_array import NpyAppendArray as NpArr
 from scipy.io.wavfile import write as write_wav
 from tqdm import trange
 
-from random_patches import RandomPatch
+from .random_patches import RandomPatch
 
 sys.path.append("/home/hans/code/maua-stylegan2/")
 from audioreactive import load_latents

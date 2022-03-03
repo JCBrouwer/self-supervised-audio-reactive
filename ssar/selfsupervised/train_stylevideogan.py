@@ -12,8 +12,8 @@ from torch_ema import ExponentialMovingAverage
 from torchvision.transforms import CenterCrop, Compose, Lambda, Resize
 from tqdm import tqdm
 
-from models.pixel2style2pixel import GradualStyleEncoder
-from models.stylevideogan import StyleVideoDiscriminator, StyleVideoGenerator
+from ..models.pixel2style2pixel import GradualStyleEncoder
+from ..models.stylevideogan import StyleVideoDiscriminator, StyleVideoGenerator
 
 
 @torch.inference_mode()

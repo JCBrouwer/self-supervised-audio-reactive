@@ -9,7 +9,7 @@ import torch
 import torchaudio
 from scipy import stats
 
-from usrlt import CausalCNNEncoderClassifier
+from .usrlt import CausalCNNEncoderClassifier
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 encoder_checkpoint = "cache/encoder.pt"

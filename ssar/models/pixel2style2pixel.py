@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Linear, MaxPool2d, Module, PReLU, ReLU, Sequential, Sigmoid
 
-from models.stylegan2 import EqualLinear, Generator
+from .stylegan2 import EqualLinear, Generator
 
 
 class GradualStyleBlock(Module):

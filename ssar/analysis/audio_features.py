@@ -6,7 +6,7 @@ from scipy.signal import convolve2d, spectrogram
 from scipy.sparse import coo_matrix
 from skimage.transform import resize
 
-from visual_beats import normalize, video_onsets
+from .visual_beats import normalize, video_onsets
 
 SR = 16384
 
