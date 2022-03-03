@@ -64,23 +64,22 @@ feature_names = [
 
 
 @torch.inference_mode()
-def test_output_sensitivity(checkpoint, plot=False, whole_feature=True):
+def test_output_sensitivity(checkpoint, test_audio, plot=False, whole_feature=True):
     a2l, a2f = load_a2l(checkpoint)
 
-    test_audio = "/home/hans/datasets/wavefunk/tau ceti alpha.flac"
     audio, sr = torchaudio.load(test_audio)
     features = a2f(audio, sr, FPS).unsqueeze(0).to(device)
 
     norm_feats = a2l.normalize(features)
 
-    for col in range(52):
-        print(
-            col_names[col],
-            f"{norm_feats[:, :, col].min().item():.4f}",
-            f"{norm_feats[:, :, col].mean().item():.4f}",
-            f"{norm_feats[:, :, col].max().item():.4f}",
-        )
-    print()
+    # for col in range(52):
+    #     print(
+    #         col_names[col],
+    #         f"{norm_feats[:, :, col].min().item():.4f}",
+    #         f"{norm_feats[:, :, col].mean().item():.4f}",
+    #         f"{norm_feats[:, :, col].max().item():.4f}",
+    #     )
+    # print()
 
     if plot:
         import pandas as pd
@@ -101,27 +100,27 @@ def test_output_sensitivity(checkpoint, plot=False, whole_feature=True):
         plt.close()
 
     def perturb_zero(x):
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         x[..., c_idx : c_idx + col_width] = 0
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         return x
 
     def perturb_invert(x):
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         x[..., c_idx : c_idx + col_width] *= -1
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         return x
 
     def perturb_random(x):
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         x[..., c_idx : c_idx + col_width] = torch.randn_like(x[..., c_idx : c_idx + col_width])
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         return x
 
     def perturb_scale(x):
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         x[..., c_idx : c_idx + col_width] *= 2
-        print(x.min().item(), x.mean().item(), x.max().item())
+        # print(x.min().item(), x.mean().item(), x.max().item())
         return x
 
     if whole_feature:
@@ -426,46 +425,13 @@ def test_latent_augmenter():
 
 
 @torch.inference_mode()
-def latent_residual_hist(latent_residuals):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from scipy import stats
-
-    plt.figure(figsize=(16, 9))
-    plt.hist(
-        latent_residuals,
-        bins=1000,
-        label=f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})",
-        color="tab:blue",
-        alpha=0.5,
-        density=True,
-    )
-    loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
-    xs = np.linspace(-2, 2, 1000)
-    plt.plot(
-        xs,
-        stats.laplace.pdf(xs, loc=loc, scale=scale),
-        label=rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})",
-        color="tab:orange",
-        alpha=0.75,
-    )
-    plt.title("Distribution of latent residuals")
-    plt.legend()
-    plt.xlim(-2, 2)
-    plt.tight_layout()
-    plt.savefig(f"plots/latent-residuals-distribution-true.png")
-
-
-@torch.inference_mode()
 def _audio2video(
     a2l,
     test_features,
     audio_file,
     out_file,
     stylegan_file,
-    fps,
+    fps=24,
     output_size=(512, 512),
     batch_size=8,
     offset=0,
@@ -500,6 +466,47 @@ def _audio2video(
     torch.cuda.empty_cache()
 
 
+def latent2video(
+    audio_file,
+    latent_file,
+    out_file,
+    stylegan_file,
+    fps=24,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    seed=123,
+):
+    try:
+        latents = joblib.load(latent_file).float()
+    except:
+        latents = torch.from_numpy(np.load(latent_file)).float()
+    latents = latents[int(fps * offset) : int(fps * (offset + duration))].to(device)
+    residuals = latents - latents.mean((0, 1))
+
+    mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
+    latent_offset = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
+    del mapper
+
+    synthesizer = StyleGAN2Synthesizer(
+        model_file=stylegan_file, inference=False, output_size=output_size, strategy="stretch", layer=0
+    )
+    synthesizer.eval().to(device)
+
+    with VideoWriter(
+        output_file=out_file,
+        output_size=output_size,
+        fps=fps,
+        audio_file=audio_file,
+        audio_offset=offset,
+        audio_duration=duration,
+    ) as video:
+        for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
+            for frame in synthesizer(latent_offset + residuals[i : i + batch_size]).add(1).div(2):
+                video.write(frame.unsqueeze(0))
+
+
 @torch.inference_mode()
 def audio2video(
     a2l,
@@ -513,17 +520,18 @@ def audio2video(
     offset=0,
     duration=40,
     onsets_only=False,
+    seed=42,
 ):
     try:
         a2l = a2l.eval().to(device)
     except:
         pass
     audio, sr = torchaudio.load(audio_file)
-    test_features = a2f(audio, sr, fps, onsets_only=onsets_only)
-    test_features = test_features[24 * offset : 24 * (offset + duration)]
+    test_features = a2f(audio, sr, fps)
+    test_features = test_features[int(24 * offset) : int(24 * (offset + duration))]
     test_features = test_features.unsqueeze(0).to(device)
     _audio2video(
-        a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration
+        a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration, seed
     )
 
 
@@ -624,8 +632,6 @@ def load_a2l(path):
             except:
                 fps = FPS
 
-        print(a2l.__class__.__name__, hasattr(a2l, "normalize"))
-
         if not hasattr(a2l, "normalize"):
             if not os.path.exists(f"{dirname}/mean.npy"):
                 feats = torch.cat(
@@ -658,26 +664,44 @@ if __name__ == "__main__":
 
     # fmt:off
     parser = argparse.ArgumentParser()
-    parser.add_argument("ckpt", help="path to Audio2Latent checkpoint to test")
+    parser.add_argument("--ckpt", help="path to Audio2Latent checkpoint to test", type=str, default=None)
     parser.add_argument("--audio", help="path to audio file to test with", default="/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac")
     parser.add_argument("--stylegan", help="path to StyleGAN model file to test with", default="/home/hans/modelzoo/train_checks/neurout2-117.pt")
     parser.add_argument("--output_size", help="output size for StyleGAN model rendering", nargs=2, default=[512, 512])
     parser.add_argument("--batch_size", help="batch size for StyleGAN model rendering", type=int, default=8)
-    parser.add_argument("--offset", help="time in audio to start from in seconds", type=int, default=0)
-    parser.add_argument("--duration", help="length in seconds of video to render", type=int, default=0)
+    parser.add_argument("--offset", help="time in audio to start from in seconds", type=float, default=0)
+    parser.add_argument("--duration", help="length in seconds of video to render", type=float, default=0)
     parser.add_argument("--plot", help="output distribution plot instead of only printing laplace scale", action='store_true')
     parser.add_argument("--insense", help="test input sensitivity", action='store_true')
     parser.add_argument("--outsense", help="test output sensitivity", action='store_true')
-    parser.add_argument("--whole_feat_sense", help="whether to use whole feature or not", action='store_true')
+    parser.add_argument("--whole_feat", help="whether to use whole feature or not", action='store_true')
     parser.add_argument("--lap_scale", help="print laplacian scale", action='store_true')
+    parser.add_argument("--latent_file", help="render latents from file", type=str, default=None)
     args = parser.parse_args()
     # fmt:on
 
     with torch.inference_mode():
+        if args.latent_file:
+            latent2video(
+                args.latent_file.replace(".npy", ".wav"),
+                args.latent_file,
+                f"runs/{Path(args.latent_file).stem}.mp4",
+                args.stylegan,
+                offset=args.offset,
+                duration=args.duration,
+                output_size=(1024, 1024),
+            )
+            exit(0)
+
+        if args.ckpt is None:
+            print("No checkpoint specified...")
+            exit(0)
+
         if args.insense:
-            feature_sensitivity(args.whole_feat_sense, args.ckpt)
+            feature_sensitivity(args.whole_feat, args.ckpt)
+
         if args.outsense:
-            test_output_sensitivity(args.ckpt, args.plot, args.whole_feat_sense)
+            test_output_sensitivity(args.ckpt, args.audio, args.plot, args.whole_feat)
 
         a2l, a2f = load_a2l(args.ckpt)
 
@@ -686,12 +710,13 @@ if __name__ == "__main__":
                 a2l=a2l,
                 a2f=a2f,
                 audio_file=args.audio,
-                out_file=f"{os.path.splitext(args.ckpt)[0]}_{Path(args.audio).stem}.mp4",
+                out_file=f"runs/{Path(args.ckpt).stem}_{Path(args.audio).stem}.mp4",
                 stylegan_file=args.stylegan,
                 output_size=[int(s) for s in args.output_size],
                 batch_size=args.batch_size,
                 offset=args.offset,
                 duration=args.duration,
+                seed=123,
             )
 
         if args.lap_scale:
@@ -702,17 +727,17 @@ if __name__ == "__main__":
             loc, scale = stats.laplace.fit(latent_residuals, loc=0, scale=0.1)
             print(f"laplace scale: {scale:.4f}")
 
-        out_file = f"plots/latent-residuals-distribution-{Path(args.audio).stem}-{Path(os.path.dirname(args.ckpt)).stem}-{Path(args.ckpt).stem}.png"
-        if not os.path.exists(out_file) and args.plot:
-            plt.figure(figsize=(16, 9))
-            label = f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})"
-            plt.hist(latent_residuals, bins=1000, label=label, color="tab:blue", alpha=0.5, density=True)
-            xs = np.linspace(-2, 2, 1000)
-            ys = stats.laplace.pdf(xs, loc=loc, scale=scale)
-            label = rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})"
-            plt.plot(xs, ys, label=label, color="tab:orange", alpha=0.75)
-            plt.title("Distribution of latent residuals")
-            plt.legend()
-            plt.xlim(-2, 2)
-            plt.tight_layout()
-            plt.savefig(out_file)
+            out_file = f"plots/latent-residuals-distribution-{Path(args.audio).stem}-{Path(os.path.dirname(args.ckpt)).stem}-{Path(args.ckpt).stem}.png"
+            if not os.path.exists(out_file) and args.plot:
+                plt.figure(figsize=(16, 9))
+                label = f"Histogram (min={latent_residuals.min():.2f}, mean={latent_residuals.mean():.2f}, max={latent_residuals.max():.2f})"
+                plt.hist(latent_residuals, bins=1000, label=label, color="tab:blue", alpha=0.5, density=True)
+                xs = np.linspace(-2, 2, 1000)
+                ys = stats.laplace.pdf(xs, loc=loc, scale=scale)
+                label = rf"PDF of MLE-fit Laplace($\mu$={loc:.2f}, $b$={scale:.2f})"
+                plt.plot(xs, ys, label=label, color="tab:orange", alpha=0.75)
+                plt.title("Distribution of latent residuals")
+                plt.legend()
+                plt.xlim(-2, 2)
+                plt.tight_layout()
+                plt.savefig(out_file)
