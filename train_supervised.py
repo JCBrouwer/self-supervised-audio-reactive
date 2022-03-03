@@ -113,11 +113,23 @@ def _audio2video(
 
 @torch.inference_mode()
 def audio2video(
-    a2l, audio_file, out_file, stylegan_file, fps=24, output_size=(512, 512), batch_size=8, offset=0, duration=40
+    a2l,
+    audio_file,
+    out_file,
+    stylegan_file,
+    fps=24,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    onsets_only=False,
 ):
-    a2l = a2l.eval().to(device)
+    try:
+        a2l = a2l.eval().to(device)
+    except:
+        pass
     audio, sr = torchaudio.load(audio_file)
-    test_features = audio2features(audio, sr, fps)
+    test_features = audio2features(audio, sr, fps, onsets_only=onsets_only)
     test_features = test_features[24 * offset : 24 * (offset + duration)]
     test_features = test_features.unsqueeze(0).to(device)
     _audio2video(
@@ -166,24 +178,32 @@ def onset_strength(audio, sr):
     return onset
 
 
-def audio2features(audio, sr, fps, clamp=True, smooth=True):
+def audio2features(audio, sr, fps, clamp=True, smooth=True, onsets_only=False):
     if audio.dim() == 2:
         audio = audio.mean(0)
     audio = audio.numpy()
     n_frames = int(len(audio) / sr * fps)
-    features = [
-        # rosa.feature.mfcc(audio, sr).transpose(1, 0),
-        # rosa.feature.chroma_cens(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
-        # rosa.feature.tonnetz(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
-        # rosa.feature.spectral_contrast(audio, sr).transpose(1, 0),
-        onset_strength(audio, sr).reshape(-1, 1),
-        onset_strength(low_pass(audio, sr), sr).reshape(-1, 1),
-        onset_strength(mid_pass(audio, sr), sr).reshape(-1, 1),
-        onset_strength(high_pass(audio, sr), sr).reshape(-1, 1),
-        # rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1),
-        # rosa.feature.rms(audio).reshape(-1, 1),
-        # rosa.feature.spectral_flatness(audio).reshape(-1, 1),
-    ]
+    if onsets_only:
+        features = [
+            onset_strength(audio, sr).reshape(-1, 1),
+            onset_strength(low_pass(audio, sr), sr).reshape(-1, 1),
+            onset_strength(mid_pass(audio, sr), sr).reshape(-1, 1),
+            onset_strength(high_pass(audio, sr), sr).reshape(-1, 1),
+        ]
+    else:
+        features = [
+            rosa.feature.mfcc(audio, sr).transpose(1, 0),
+            rosa.feature.chroma_cens(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+            rosa.feature.tonnetz(rosa.effects.harmonic(audio, margin=4.0), sr).transpose(1, 0),
+            rosa.feature.spectral_contrast(audio, sr).transpose(1, 0),
+            onset_strength(audio, sr).reshape(-1, 1),
+            onset_strength(low_pass(audio, sr), sr).reshape(-1, 1),
+            onset_strength(mid_pass(audio, sr), sr).reshape(-1, 1),
+            onset_strength(high_pass(audio, sr), sr).reshape(-1, 1),
+            rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180).reshape(-1, 1),
+            rosa.feature.rms(audio).reshape(-1, 1),
+            rosa.feature.spectral_flatness(audio).reshape(-1, 1),
+        ]
     features = [signal.resample(f, n_frames) for f in features]
     features = np.concatenate(features, axis=1)
     features = torch.from_numpy(features).float()
@@ -206,11 +226,12 @@ def from_bytes(byte_array: np.ndarray) -> torch.Tensor:
 
 
 class FullAudio2LatentFFCVPreprocessor(Dataset):
-    def __init__(self, directory, fps, return_bytes=False):
+    def __init__(self, directory, fps, synthetic, return_bytes=False):
         super().__init__()
         self.fps = fps
         self.return_bytes = return_bytes
         self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
+        self.synthetic = synthetic
 
     def __len__(self):
         return len(self.files)
@@ -220,7 +241,7 @@ class FullAudio2LatentFFCVPreprocessor(Dataset):
         filename, _ = os.path.splitext(file)
 
         audio, sr = torchaudio.load(file)
-        features = audio2features(audio, sr, self.fps)
+        features = audio2features(audio, sr, self.fps, onsets_only=self.synthetic)
 
         try:
             latents = joblib.load(f"{filename}.npy").float()
@@ -285,8 +306,8 @@ def get_full_length_ffcv_dataloaders(input_dir, dur, fps):
     return full_loader
 
 
-def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps, full=False):
-    L = dur * fps
+def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps):
+    L = int(dur * fps)
 
     datastem = f"cache/{Path(input_dir).stem}_{L}frames"
     if synthetic:
@@ -297,7 +318,7 @@ def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps, full=False)
     std_file = f"{datastem}_train_std.npy"
 
     if not os.path.exists(train_beton):
-        full_dataset = FullAudio2LatentFFCVPreprocessor(input_dir, fps)
+        full_dataset = FullAudio2LatentFFCVPreprocessor(input_dir, fps, synthetic)
         full_loader = DataLoader(full_dataset, batch_size=1, shuffle=False, num_workers=24, prefetch_factor=1)
 
         train_feat_file, train_lat_file = f"{datastem}_train_feats.npy", f"{datastem}_train_lats.npy"
@@ -342,7 +363,7 @@ def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps, full=False)
         DatasetWriter(
             train_beton,
             {
-                "features": NDArrayField(shape=(L, 52), dtype=np.dtype("float32")),
+                "features": NDArrayField(shape=(L, 4 if synthetic else 52), dtype=np.dtype("float32")),
                 "latents": NDArrayField(shape=(L, n_ws, latent_dim), dtype=np.dtype("float32")),
             },
             num_workers=24,
@@ -350,7 +371,7 @@ def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps, full=False)
         DatasetWriter(
             val_beton,
             {
-                "features": NDArrayField(shape=(L, 52), dtype=np.dtype("float32")),
+                "features": NDArrayField(shape=(L, 4 if synthetic else 52), dtype=np.dtype("float32")),
                 "latents": NDArrayField(shape=(L, n_ws, latent_dim), dtype=np.dtype("float32")),
             },
             num_workers=24,
@@ -482,27 +503,36 @@ def spline_loop_latents(y, size):
 
 
 class LatentAugmenter:
-    def __init__(self, checkpoint, n_patches) -> None:
+    def __init__(self, checkpoint, n_patches, synthetic) -> None:
         model = StyleGAN2Mapper(checkpoint, inference=False).eval()
         self.n_patches = n_patches
         self.num = 16384
         self.ws = model.forward(latent_z=torch.randn((self.num, 512)))
         self.nw = self.ws.shape[1]
-        self.feat_idxs = {
-            # "mfccs": (0, 20),
-            # "chroma": (20, 32),
-            # "tonnetz": (32, 38),
-            # "contrast": (38, 45),
-            "onsets": (45, 46),
-            "onsets_low": (46, 47),
-            "onsets_mid": (47, 48),
-            "onsets_high": (48, 49),
-            # "pulse": (49, 50),
-            # "volume": (50, 51),
-            # "flatness": (51, 52),
-        }
+        self.feat_idxs = (
+            {
+                "onsets": (0, 1),
+                "onsets_low": (1, 2),
+                "onsets_mid": (2, 3),
+                "onsets_high": (3, 4),
+            }
+            if synthetic
+            else {
+                # "mfccs": (0, 20),
+                "chroma": (20, 32),
+                "tonnetz": (32, 38),
+                # "contrast": (38, 45),
+                "onsets": (45, 46),
+                "onsets_low": (46, 47),
+                "onsets_mid": (47, 48),
+                "onsets_high": (48, 49),
+                # "pulse": (49, 50),
+                "volume": (50, 51),
+                # "flatness": (51, 52),
+            }
+        )
         self.feat_keys = list(self.feat_idxs.keys())
-        self.single_dim = -4
+        self.single_dim = -4 if synthetic else -5
 
     def __call__(self, features):
         residuals, offsets = [], []
@@ -1318,7 +1348,9 @@ if __name__ == "__main__":
     )
 
     if aug_weight > 0:
-        augmenter = LatentAugmenter(checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3)
+        augmenter = LatentAugmenter(
+            checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3, synthetic=synthetic
+        )
 
     inputs, targets = next(iter(train_dataloader))
     feature_dim = inputs.shape[2]
@@ -1457,7 +1489,7 @@ if __name__ == "__main__":
                 outputs = a2l(inputs)
                 loss = F.mse_loss(outputs, targets)
             else:
-                loss = 0
+                loss = torch.zeros(())
 
             if aug_weight > 0:
                 aug_inputs = aug_inputs.to(device)
@@ -1465,7 +1497,7 @@ if __name__ == "__main__":
                 aug_targets, _ = augmenter(aug_inputs)
                 aug_loss = aug_weight * F.mse_loss(aug_outputs, aug_targets)
             else:
-                aug_loss = 0
+                aug_loss = torch.zeros(())
 
             optimizer.zero_grad()
             (loss + aug_loss).backward()
@@ -1524,6 +1556,7 @@ if __name__ == "__main__":
                 audio_file=test_audio,
                 out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
                 stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
+                onsets_only=synthetic,
             )
 
     writer.close()
