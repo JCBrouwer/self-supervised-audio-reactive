@@ -155,7 +155,6 @@ def raw_hpcp(
     norm_frames=False,
     final_thr=0.0,
 ):
-
     # spectrogram
     Y, k, f, t = stft(y, sr, win_size=win_size, hop_size=hop_size, window=window, precision=precision)
 

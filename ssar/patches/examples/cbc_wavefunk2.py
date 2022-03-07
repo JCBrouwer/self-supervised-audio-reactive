@@ -3,21 +3,24 @@ import time
 
 time_taken = time.time()
 
-import gc
-import json
 import os
+import gc
+import sys
 import uuid
-
-import generate
-import librosa as rosa
-import madmom as mm
-import matplotlib.pyplot as plt
+import json
 import numpy as np
-import render
-import scipy.signal as signal
 import torch as th
+import madmom as mm
+import librosa as rosa
+import scipy.signal as signal
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
+from scipy.io.wavfile import write as write_wav
+
+sys.path.append("/home/hans/code/audioreac/")
+import render
+import generate
 
 th.set_grad_enabled(False)
 plt.rcParams["axes.facecolor"] = "black"
@@ -26,7 +29,7 @@ VERBOSE = False
 
 os.environ["MIX"] = "wavefunk_cbc2020mix5"
 os.environ["CKPT"] = "neurout2-006"
-# VERBOSE = True
+os.environ["RENDER"] = "False"
 
 
 def info(arr):
@@ -100,20 +103,17 @@ def plot_spectra(spectra, chroma=False):
 
 if __name__ == "__main__":
     checkpoint = f"/home/hans/modelzoo/{os.environ['CKPT']}.pt"
-    size = 1920
+    size = 1024
     batch_size = 18
     noise_scales = 6
 
     file_root = os.environ["MIX"]
-    main_audio_file = f"../../datasets/{file_root}.wav"
+    main_audio_file = f"/home/hans/datasets/cantbecancelled/{file_root}.wav"
     metadata_file = f"workspace/{main_audio_file.split('/')[-1].split('.')[0]}_metadata.json"
-    intro_file = f"workspace/{file_root}_intro_latents.npy"
-    drop_file = f"workspace/{file_root}_drop_latents.npy"
-    high_noise_mod_file = f"workspace/{file_root}_high_noise_mod.npy"
-    low_noise_mod_file = f"workspace/{file_root}_low_noise_mod.npy"
-
-    latent_file = f"workspace/{file_root}_latents.npy"
-    noise_file = f"workspace/{file_root}_noise.npy"
+    intro_file = f"workspace/wavefunk_cbc2020mix5_intro_latents.npy"
+    drop_file = f"workspace/wavefunk_cbc2020mix5_drop_latents.npy"
+    latent_file = "/home/hans/datasets/audio2latent/Wavefunk @ CBC - {title}.npy"
+    noise_file = "/home/hans/datasets/audio2latent/Wavefunk @ CBC - {title} - Noise {width}.npy"
 
     bpm = None
 
@@ -133,16 +133,28 @@ if __name__ == "__main__":
     else:
         audio, sr = rosa.load(main_audio_file)
         onset = rosa.onset.onset_strength(audio, sr=sr)
-        bpm = rosa.beat.tempo(onset_envelope=onset, sr=sr)[0]
-        bpm = np.round(bpm * 10.0) / 10.0
 
         total_frames = len(onset)
-        raw_tracks = [["0:00", bpm]]
+        raw_tracks = [
+            ["0:00", 86, "IMANU - Pulse"],
+            ["1:30", 86, "Kursa - Tahoe"],
+            ["3:20", 172, "Chee - Martyrdom"],
+            ["5:05", 86, "Rawtekk & Audeka - Extinction"],
+            ["7:00", 86, "Maztek & Disprove - Bad Body"],
+            ["8:30", 86, "Holographic - Gargoyles"],
+            ["10:00", 86, "Wavefunk - Notochord"],
+            ["11:50", 172, "Halogenix & IMANU - Technoid"],
+            ["14:50", 86, "Tekel - Communion"],
+            ["17:15", 172, "Culprate - Helter (Phace Remix)"],
+            ["19:20", 86, "Wavefunk - The Golden Tune"],
+            ["23:35", 172, "Noisia - Could This Be"],
+            ["26:20", 172, "HYQXYZ - Suspended In Mid Air"],
+        ]
 
         with open(metadata_file, "w") as outfile:
-            json.dump({"bpm": bpm, "total_frames": total_frames, "tracks": raw_tracks}, outfile)
+            json.dump({"bpm": 86, "total_frames": total_frames, "tracks": raw_tracks}, outfile)
 
-    fps = 30
+    fps = 24
     if fps is None:
         fps = total_frames / rosa.get_duration(filename=main_audio_file)
     smf = fps / 43.066666
@@ -150,14 +162,15 @@ if __name__ == "__main__":
     num_frames = int(round(duration * fps))
 
     # preprocess track times --> frame indexes
-    tracks = []
-    for t, (t_time, t_bpm) in enumerate(raw_tracks):
+    titles, tracks = [], []
+    for t, (t_time, t_bpm, title) in enumerate(raw_tracks):
         start_time = int(t_time.split(":")[0]) * 60 + int(t_time.split(":")[1])
         if t + 1 < len(raw_tracks):
             stop_time = int(raw_tracks[t + 1][0].split(":")[0]) * 60 + int(raw_tracks[t + 1][0].split(":")[1])
 
         else:
             stop_time = rosa.get_duration(filename=main_audio_file)
+
         # if not (stop_time > offset and start_time < offset + duration):
         #     continue
         # else:
@@ -169,6 +182,9 @@ if __name__ == "__main__":
             start_time = offset
         elif stop_time > offset + duration:
             stop_time = offset + duration
+
+        audio, sr = rosa.load(main_audio_file, offset=start_time, duration=stop_time - start_time)
+        # write_wav(f"/home/hans/datasets/audio2latent/Wavefunk @ CBC - {title}.wav", sr, audio)
 
         fac = 1.0 / duration * num_frames
 
@@ -184,6 +200,7 @@ if __name__ == "__main__":
                 int(round(stop_time * fac)) - start_frame,
             ]
         )
+        titles.append(title)
         # print(
         #     t,
         #     t_bpm,
@@ -238,6 +255,7 @@ if __name__ == "__main__":
         json.dump(prms, outfile)
 
     # %%
+    print(eval(os.environ["RENDER"]))
     if not eval(os.environ["RENDER"]):
 
         # %%
@@ -345,7 +363,7 @@ if __name__ == "__main__":
         drop_selection = th.from_numpy(np.load(drop_file))
 
         # %%
-        for t, t_bpm, t_dur, t_start, t_stop in tracks:
+        for title, (t, t_bpm, t_dur, t_start, t_stop) in zip(titles, tracks):
             # print(t, t_bpm, t_dur, t_start, t_stop)
             if t_start < 0:
                 continue
@@ -500,6 +518,8 @@ if __name__ == "__main__":
                 latents[:, color_layer:, :] * 3 / 5 + color_latents[[t], color_layer:, :] * 2 / 5
             )
 
+            np.save(f"/home/hans/datasets/audio2latent/Wavefunk @ CBC - {title}.npy", latents)
+
             full_latents.append(latents)
 
             # %%
@@ -559,7 +579,7 @@ if __name__ == "__main__":
         high_noise_mod = gaussian_filter(high_noise_mod, [3.5 * smf, 0, 0, 0]).astype(np.float32)
         low_noise_mod = gaussian_filter(low_noise_mod, [2.5 * smf, 0, 0, 0]).astype(np.float32)
 
-        np.save(latent_file, latents.numpy().astype(np.float32))
+        # np.save(latent_file.format(title=title), latents.numpy().astype(np.float32))
 
         print()
         info(latents)
@@ -581,7 +601,8 @@ if __name__ == "__main__":
 
         # calculate noise values
         for ns in range(0, 9):
-            if ns >= noise_scales:
+            if 2 ** ns * min_w > 32:
+                # if ns >= noise_scales:
                 continue
 
             high_noise = F.interpolate(noise_noisy, size=(2 ** ns * min_h, 2 ** ns * min_w)).cpu().numpy()
@@ -597,13 +618,18 @@ if __name__ == "__main__":
                 noise_scale[idx : idx + loop_len] += (1 - low_noise_mod[idx : idx + loop_len]) * base_noise[:len_ns]
 
             info(noise_scale)
-            np.save(noise_file.replace(".npy", f"{ns}.npy"), noise_scale)
+            offset = 0
+            for title, lats in zip(titles, full_latents):
+                print(title, 2 ** ns * min_w, len(lats))
+                np.save(noise_file.format(title=title, width=2 ** ns * min_w), noise_scale[offset : offset + len(lats)])
+                offset += len(lats)
             del noise_scale, high_noise, low_noise, base_noise, len_ns
             gc.collect()
 
     # %%
     else:
         # %%
+        exit()
         print("loading latents...")
         latents = th.from_numpy(np.load(latent_file))
 

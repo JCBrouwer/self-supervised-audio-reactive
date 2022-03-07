@@ -1,3 +1,6 @@
+import matplotlib
+
+matplotlib.use("Agg")
 import argparse
 import gc
 import importlib
@@ -18,6 +21,7 @@ import torch.nn.functional as F
 import torchaudio
 from scipy import stats
 from scipy.stats import ttest_ind
+from ssar.supervised.data import audio2features
 from torch.utils.data import DataLoader, Dataset
 from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 from tqdm import tqdm
@@ -39,65 +43,122 @@ col_names = [
     *[f"chroma_{i}" for i in range(12)],
     *[f"tonnetz_{i}" for i in range(6)],
     *[f"contrast_{i}" for i in range(7)],
+    "flatness",
     "onsets",
     "onsets_low",
     "onsets_mid",
     "onsets_high",
     "pulse",
-    "volume",
-    "flatness",
+    "harmonic_rms",
+    "harmonic_rms_low",
+    "harmonic_rms_mid",
+    "harmonic_rms_high",
+    "rms",
+    "rms_low",
+    "rms_mid",
+    "rms_high",
 ]
 feature_names = [
     "mfcc",
     "chroma",
     "tonnetz",
     "contrast",
+    "flatness",
     "onsets",
     "onsets_low",
     "onsets_mid",
     "onsets_high",
     "pulse",
-    "volume",
-    "flatness",
+    "harmonic_rms",
+    "harmonic_rms_low",
+    "harmonic_rms_low",
+    "harmonic_rms_low",
+    "rms",
+    "rms_low",
+    "rms_low",
+    "rms_low",
     "all",
 ]
 
 
+def feature_plots(in_dir, test_audio):
+    a2f = lambda x, sr: audio2features(x, sr, fps=24)
+
+    full_mean_file, full_std_file = Path(in_dir) / "full_mean.npy", Path(in_dir) / "full_std.npy"
+    if not os.path.exists(full_mean_file):
+        features = torch.cat([f.squeeze() for f in tqdm(DataLoader(AudioFeatures(in_dir, a2f, 8, 24), num_workers=24))])
+        print(features.shape, "\n")
+
+        print("raw")
+        for col in range(features.shape[-1]):
+            print(
+                col_names[col],
+                f"{features[:, :, col].min().item():.4f}",
+                f"{features[:, :, col].mean().item():.4f}",
+                f"{features[:, :, col].max().item():.4f}",
+            )
+        print()
+
+        full_mean = features.mean((0, 1))
+        full_std = features.std((0, 1))
+        np.save(full_mean_file, full_mean)
+        np.save(full_std_file, full_std)
+        norm_feats = (features - full_mean) / full_std
+
+        print("normalized")
+        for col in range(features.shape[-1]):
+            print(
+                col_names[col],
+                f"{norm_feats[:, :, col].min().item():.4f}",
+                f"{norm_feats[:, :, col].mean().item():.4f}",
+                f"{norm_feats[:, :, col].max().item():.4f}",
+            )
+        print()
+    else:
+        full_mean = np.load(full_mean_file)
+        full_std = np.load(full_std_file)
+
+    audio, sr = torchaudio.load(test_audio)
+    features = a2f(audio, sr)
+    norm_feats = (features - full_mean) / full_std
+
+    import pandas as pd
+
+    df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=col_names)
+
+    for col in df.columns:
+        plt.plot(df[col].values, label=col)
+    plt.savefig("output/norm_feats_all.pdf")
+    plt.close()
+
+    fig, ax = plt.subplots(features.shape[-1], 1, figsize=(8, 128))
+    for c, col in enumerate(df.columns):
+        ax[c].plot(df[col])
+        ax[c].set_ylabel(col)
+    plt.tight_layout()
+    plt.savefig("output/norm_feat_by_feat.pdf")
+    plt.close()
+
+    for col in df.columns:
+        plt.plot(df[col].values[1000:1500], label=col)
+    plt.savefig("output/norm_feats_all_snippet.pdf")
+    plt.close()
+
+    fig, ax = plt.subplots(features.shape[-1], 1, figsize=(8, 128))
+    for c, col in enumerate(df.columns):
+        ax[c].plot(df[col][1000:1500])
+        ax[c].set_ylabel(col)
+    plt.tight_layout()
+    plt.savefig("output/norm_feat_by_feat_snippet.pdf")
+    plt.close()
+
+
 @torch.inference_mode()
-def test_output_sensitivity(checkpoint, test_audio, plot=False, whole_feature=True):
+def test_output_sensitivity(checkpoint, test_audio, whole_feature=True):
     a2l, a2f = load_a2l(checkpoint)
 
     audio, sr = torchaudio.load(test_audio)
     features = a2f(audio, sr, FPS).unsqueeze(0).to(device)
-
-    norm_feats = a2l.normalize(features)
-
-    # for col in range(52):
-    #     print(
-    #         col_names[col],
-    #         f"{norm_feats[:, :, col].min().item():.4f}",
-    #         f"{norm_feats[:, :, col].mean().item():.4f}",
-    #         f"{norm_feats[:, :, col].max().item():.4f}",
-    #     )
-    # print()
-
-    if plot:
-        import pandas as pd
-
-        df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=col_names)
-
-        for col in df.columns:
-            plt.plot(df[col].values, label=col)
-        plt.savefig("output/a2l_norm_feats_all.pdf")
-        plt.close()
-
-        fig, ax = plt.subplots(52, 1, figsize=(8, 64))
-        for c, col in enumerate(df.columns):
-            ax[c].plot(df[col])
-            ax[c].set_ylabel(col)
-        plt.tight_layout()
-        plt.savefig("output/a2l_norm_feat_by_feat.pdf")
-        plt.close()
 
     def perturb_zero(x):
         # print(x.min().item(), x.mean().item(), x.max().item())
@@ -427,7 +488,7 @@ def test_latent_augmenter():
 @torch.inference_mode()
 def _audio2video(
     a2l,
-    test_features,
+    features,
     audio_file,
     out_file,
     stylegan_file,
@@ -438,55 +499,16 @@ def _audio2video(
     duration=40,
     seed=42,
 ):
-    test_latents = a2l(test_features).squeeze()
+    outputs = a2l(features)
+    if isinstance(outputs, list):
+        residuals, noise1, noise2, noise3, noise4 = outputs
+    else:
+        residuals = outputs
+        noise1 = noise2 = noise3 = noise4 = None
+    residuals = residuals.squeeze()
 
     mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
-    latent_offset = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
-    del mapper
-
-    synthesizer = StyleGAN2Synthesizer(
-        model_file=stylegan_file, inference=False, output_size=output_size, strategy="stretch", layer=0
-    )
-    synthesizer.eval().to(device)
-
-    with VideoWriter(
-        output_file=out_file,
-        output_size=output_size,
-        fps=fps,
-        audio_file=audio_file,
-        audio_offset=offset,
-        audio_duration=duration,
-    ) as video:
-        for i in tqdm(range(0, len(test_latents), batch_size), unit_scale=batch_size):
-            for frame in synthesizer(latent_offset + test_latents[i : i + batch_size]).add(1).div(2):
-                video.write(frame.unsqueeze(0))
-
-    del test_features, test_latents, latent_offset, synthesizer
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def latent2video(
-    audio_file,
-    latent_file,
-    out_file,
-    stylegan_file,
-    fps=24,
-    output_size=(512, 512),
-    batch_size=8,
-    offset=0,
-    duration=40,
-    seed=123,
-):
-    try:
-        latents = joblib.load(latent_file).float()
-    except:
-        latents = torch.from_numpy(np.load(latent_file)).float()
-    latents = latents[int(fps * offset) : int(fps * (offset + duration))].to(device)
-    residuals = latents - latents.mean((0, 1))
-
-    mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
-    latent_offset = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
+    base_latent = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
     del mapper
 
     synthesizer = StyleGAN2Synthesizer(
@@ -503,7 +525,86 @@ def latent2video(
         audio_duration=duration,
     ) as video:
         for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
-            for frame in synthesizer(latent_offset + residuals[i : i + batch_size]).add(1).div(2):
+            for frame in (
+                synthesizer(
+                    latents=base_latent + residuals[i : i + batch_size],
+                    noise1=noise1[i : i + batch_size, None],
+                    noise2=noise2[i : i + batch_size, None],
+                    noise3=noise2[i : i + batch_size, None],
+                    noise4=noise3[i : i + batch_size, None],
+                    noise5=noise3[i : i + batch_size, None],
+                    noise6=noise4[i : i + batch_size, None],
+                    noise7=noise4[i : i + batch_size, None],
+                )
+                .add(1)
+                .div(2)
+            ):
+                video.write(frame.unsqueeze(0))
+
+    del features, residuals, base_latent, synthesizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def load_npy(file):
+    try:
+        return joblib.load(file).float()
+    except:
+        return torch.from_numpy(np.load(file)).float()
+
+
+def latent2video(
+    audio_file,
+    latent_file,
+    out_file,
+    stylegan_file,
+    fps=24,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    seed=123,
+):
+    start_frame, end_frame = int(fps * offset), int(fps * (offset + duration))
+    latents = load_npy(latent_file)[start_frame:end_frame].to(device)
+    residuals = latents - latents.mean((0, 1))
+    noise1 = load_npy(latent_file.replace(".npy", " - Noise 4.npy"))[start_frame:end_frame].to(device)
+    noise2 = load_npy(latent_file.replace(".npy", " - Noise 8.npy"))[start_frame:end_frame].to(device)
+    noise3 = load_npy(latent_file.replace(".npy", " - Noise 16.npy"))[start_frame:end_frame].to(device)
+    noise4 = load_npy(latent_file.replace(".npy", " - Noise 32.npy"))[start_frame:end_frame].to(device)
+
+    mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
+    base_latent = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
+    del mapper
+
+    synthesizer = StyleGAN2Synthesizer(
+        model_file=stylegan_file, inference=False, output_size=output_size, strategy="stretch", layer=0
+    )
+    synthesizer.eval().to(device)
+
+    with VideoWriter(
+        output_file=out_file,
+        output_size=output_size,
+        fps=fps,
+        audio_file=audio_file,
+        audio_offset=offset,
+        audio_duration=duration,
+    ) as video:
+        for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
+            for frame in (
+                synthesizer(
+                    latents=base_latent + residuals[i : i + batch_size],
+                    noise1=noise1[i : i + batch_size],
+                    noise2=noise2[i : i + batch_size],
+                    noise3=noise2[i : i + batch_size],
+                    noise4=noise3[i : i + batch_size],
+                    noise5=noise3[i : i + batch_size],
+                    noise6=noise4[i : i + batch_size],
+                    noise7=noise4[i : i + batch_size],
+                )
+                .add(1)
+                .div(2)
+            ):
                 video.write(frame.unsqueeze(0))
 
 
@@ -677,6 +778,7 @@ if __name__ == "__main__":
     parser.add_argument("--whole_feat", help="whether to use whole feature or not", action='store_true')
     parser.add_argument("--lap_scale", help="print laplacian scale", action='store_true')
     parser.add_argument("--latent_file", help="render latents from file", type=str, default=None)
+    parser.add_argument("--seed", help="random seed for base latent vector", type=int, default=123)
     args = parser.parse_args()
     # fmt:on
 
@@ -690,8 +792,12 @@ if __name__ == "__main__":
                 offset=args.offset,
                 duration=args.duration,
                 output_size=(1024, 1024),
+                seed=args.seed,
             )
             exit(0)
+
+        if args.plot:
+            feature_plots("/home/hans/datasets/audio2latent/", args.audio)
 
         if args.ckpt is None:
             print("No checkpoint specified...")
@@ -701,7 +807,7 @@ if __name__ == "__main__":
             feature_sensitivity(args.whole_feat, args.ckpt)
 
         if args.outsense:
-            test_output_sensitivity(args.ckpt, args.audio, args.plot, args.whole_feat)
+            test_output_sensitivity(args.ckpt, args.audio, args.whole_feat)
 
         a2l, a2f = load_a2l(args.ckpt)
 
@@ -716,7 +822,7 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 offset=args.offset,
                 duration=args.duration,
-                seed=123,
+                seed=args.seed,
             )
 
         if args.lap_scale:

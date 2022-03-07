@@ -1,12 +1,10 @@
 import os
 import sys
-from glob import glob
 from pathlib import Path
 
 import joblib
 import numpy as np
 import torch
-import torchaudio
 from scipy import stats
 
 from .usrlt import CausalCNNEncoderClassifier
@@ -63,6 +61,8 @@ def calculate_fcd(dataloader, model):
         real_feats.append(encoder(l).cpu())
 
         lf = model(f.to(device)).flatten(2).transpose(1, 2)
+        if isinstance(lf, list):
+            lf = lf[0]
         fake_feats.append(encoder(lf).cpu())
     real_feats, fake_feats = torch.cat(real_feats), torch.cat(fake_feats)
 

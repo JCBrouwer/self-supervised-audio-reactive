@@ -314,8 +314,9 @@ track_info = [
     },
 ]
 
-track_id_start = int(os.environ["START"])
-track_id_end = int(os.environ["END"])
+
+track_id_start = 0  # int(os.environ["START"])
+track_id_end = 31  # int(os.environ["END"])
 
 uuid = str(uuid.uuid4())[:6]
 if track_id_start == track_id_end:
@@ -349,6 +350,7 @@ def get_latents(selection, args):
     all_latents = []
     for track, next_track in zip(track_info, track_info[1:]):
         title, start, end, latent, vibe = track["title"], track["start"], track["end"], track["latent"], track["vibe"]
+        print("latents", title)
         start_time = max(start, vid_start)
         end_time = min(next_track["start"], vid_end)
         start_frame = int((start_time * FPS))
@@ -365,14 +367,14 @@ def get_latents(selection, args):
         phrase_frames = int((16 * 4 * (60 / 172) * FPS))
         num_phrases = int(math.ceil(1.01 * num_bars / 16))
 
-        print(
-            f"{title.ljust(40)}   frames: {start_frame} -> {end_frame}   duration: {end_time - start_time:.2f} sec   bars: {num_bars:.1f} in {num_phrases} phrases   transition: {trans} frames"
-        )
-        write_wav(
-            f"/home/hans/datasets/audio2latent/Wavefunk @ Donderslag II - {title}.wav",
-            args.sr,
-            args.audio[int(start_time * args.sr) : int(end * args.sr)],
-        )
+        # print(
+        #     f"{title.ljust(40)}   frames: {start_frame} -> {end_frame}   duration: {end_time - start_time:.2f} sec   bars: {num_bars:.1f} in {num_phrases} phrases   transition: {trans} frames"
+        # )
+        # write_wav(
+        #     f"/home/hans/datasets/audio2latent/Wavefunk @ Donderslag II - {title}.wav",
+        #     args.sr,
+        #     args.audio[int(start_time * args.sr) : int(end * args.sr)],
+        # )
 
         if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_ba_onsets.npy"):
             drums, args.sr = rosa.load(
@@ -523,8 +525,6 @@ def get_latents(selection, args):
         #     all_latents.append(transition_latents)
         print(f"latent length: {len(torch.cat(all_latents))}")
 
-    exit(0)
-
     all_latents = torch.cat(all_latents).float()
     all_latents = ar.gaussian_filter(all_latents, 3, causal=0.2)
 
@@ -532,12 +532,13 @@ def get_latents(selection, args):
 
 
 def get_noise(height, width, scale, num_scales, args):
-    if width > 128:
+    if width > 32:
         return None
 
     all_noise = []
     for track, next_track in zip(track_info, track_info[1:]):
         title, start, end, latent, vibe = track["title"], track["start"], track["end"], track["latent"], track["vibe"]
+        print("noise", title)
         start_time = max(start, vid_start)
         end_time = min(next_track["start"], vid_end)
         start_frame = int((start_time * FPS))
@@ -549,7 +550,8 @@ def get_noise(height, width, scale, num_scales, args):
         start_frame -= int(vid_start * FPS)
         end_frame -= int(vid_start * FPS)
 
-        if not os.path.exists(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy"):
+        noise_file = f"/home/hans/datasets/audio2latent/Wavefunk @ Donderslag II - {title} - Noise {width}.npy"
+        if not os.path.exists(noise_file):
             # lo_onsets = track_info[track["id"]]["lo_onsets"][:, None, None, None]
             # hi_onsets = track_info[track["id"]]["hi_onsets"][:, None, None, None]
             ba_onsets = track_info[track["id"]]["ba_onsets"][:, None, None, None]
@@ -581,30 +583,30 @@ def get_noise(height, width, scale, num_scales, args):
             noise = 1 / 2 * noise + 1 / 2 * noise_norm
             noise *= noise_factor
 
-            np.save(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy", noise.numpy())
+            np.save(noise_file, ar.gaussian_filter(noise, 3, causal=0.2).numpy())
         else:
-            noise = torch.from_numpy(np.load(f"workspace/{title.replace(' ','').lower()}_noise_{scale}.npy")).float()
+            noise = torch.from_numpy(np.load(noise_file)).float()
 
-        all_noise.append(ar.gaussian_filter(noise, 3, causal=0.2))
+        all_noise.append(noise)
 
     all_noise = torch.cat(all_noise)
 
-    for track, next_track in zip(track_info[1:], track_info[2:]):
-        title, start, end, latent, vibe = track["title"], track["start"], track["end"], track["latent"], track["vibe"]
-        start_time = max(start, vid_start)
-        end_time = min(next_track["start"], vid_end)
-        start_frame = int((start_time * FPS))
-        end_frame = int((end_time * FPS))
-        trans = int((end_time - track["end"]) * FPS)
-        if end_frame <= int(vid_start * FPS) or start_frame >= int(vid_end * FPS):
-            continue
-        track_frames = end_frame - start_frame
-        start_frame -= int(vid_start * FPS)
-        end_frame -= int(vid_start * FPS)
+    # for track, next_track in zip(track_info[1:], track_info[2:]):
+    #     title, start, end, latent, vibe = track["title"], track["start"], track["end"], track["latent"], track["vibe"]
+    #     start_time = max(start, vid_start)
+    #     end_time = min(next_track["start"], vid_end)
+    #     start_frame = int((start_time * FPS))
+    #     end_frame = int((end_time * FPS))
+    #     trans = int((end_time - track["end"]) * FPS)
+    #     if end_frame <= int(vid_start * FPS) or start_frame >= int(vid_end * FPS):
+    #         continue
+    #     track_frames = end_frame - start_frame
+    #     start_frame -= int(vid_start * FPS)
+    #     end_frame -= int(vid_start * FPS)
 
-        all_noise[start_frame - FPS : start_frame + FPS] = ar.gaussian_filter(
-            all_noise[start_frame - 3 * FPS : start_frame + 3 * FPS], 5, causal=0.2
-        )[2 * args.fps : -2 * args.fps]
+    #     all_noise[start_frame - FPS : start_frame + FPS] = ar.gaussian_filter(
+    #         all_noise[start_frame - 3 * FPS : start_frame + 3 * FPS], 5, causal=0.2
+    #     )[2 * args.fps : -2 * args.fps]
 
     return all_noise[2:vid_frames]
 
