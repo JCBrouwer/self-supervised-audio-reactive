@@ -39,7 +39,7 @@ def normalize(x):
     return y
 
 
-def gaussian_filter(x, sigma, mode="replicate"):
+def gaussian_filter(x, sigma, mode="circular", causal=0.1):
     dim = len(x.shape)
     n_frames = x.shape[0]
     while len(x.shape) < 3:
@@ -50,7 +50,7 @@ def gaussian_filter(x, sigma, mode="replicate"):
 
     kernel = torch.arange(-radius, radius + 1, dtype=torch.float32, device=x.device)
     kernel = torch.exp(-0.5 / sigma ** 2 * kernel ** 2)
-    kernel[radius + 1 :] *= 0.25  # make kernel less responsive to future information
+    kernel[radius + 1 :] *= causal  # make kernel less responsive to future information
     kernel = kernel / kernel.sum()
     kernel = kernel.view(1, 1, len(kernel)).repeat(channels, 1, 1)
 

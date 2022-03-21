@@ -126,16 +126,27 @@ def spectral_flux(gram):
 # @torch.jit.script
 def onset_envelope(flux):
     u = torch.sum(0.5 * (flux + torch.abs(flux)), dim=1)
-    u = torch.clamp(u, 0, torch.quantile(u, 0.97))
+    u = torch.clamp(u, torch.quantile(u, 0.025), torch.quantile(u, 0.975))
     u /= u.max()
     return u
 
 
+from time import time
+
+
 def video_onsets(video):
+    t = time()
     flow = optical_flow_cpu(video)
+    print("flow", time() - t)
+    t = time()
     gram = directogram(flow)
+    print("gram", time() - t)
+    t = time()
     flux = spectral_flux(gram)
+    print("flux", time() - t)
+    t = time()
     onset = onset_envelope(flux)
+    print("onset", time() - t)
     return onset
 
 
