@@ -99,8 +99,10 @@ def median_filter_2d(
     return x
 
 
-@torch.jit.script
-def directogram(flow, bins: int = 32):
+from time import time
+
+# @torch.jit.script
+def directogram(flow, bins: int = 8):
     bin_width = 256 // bins
     angle_bins = torch.linspace(0, 255, bins, device=flow.device, dtype=torch.uint8)[None, None, None, :]
     flow = flow.mul(255).to(torch.uint8)
@@ -113,6 +115,7 @@ def directogram(flow, bins: int = 32):
         for bin in range(bins):
             dg[t, bin] = torch.sum(flow[t, 0][bin_idxs[t] == bin])
     dg = dg.float() / 255.0
+
     dg = median_filter_2d(dg[None, None]).squeeze()
 
     return dg
@@ -127,26 +130,16 @@ def spectral_flux(gram):
 def onset_envelope(flux):
     u = torch.sum(0.5 * (flux + torch.abs(flux)), dim=1)
     u = torch.clamp(u, torch.quantile(u, 0.025), torch.quantile(u, 0.975))
+    u -= u.min()
     u /= u.max()
     return u
 
 
-from time import time
-
-
 def video_onsets(video):
-    t = time()
     flow = optical_flow_cpu(video)
-    print("flow", time() - t)
-    t = time()
     gram = directogram(flow)
-    print("gram", time() - t)
-    t = time()
     flux = spectral_flux(gram)
-    print("flux", time() - t)
-    t = time()
     onset = onset_envelope(flux)
-    print("onset", time() - t)
     return onset
 
 

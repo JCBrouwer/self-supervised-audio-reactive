@@ -39,7 +39,7 @@ def normalize(x):
     return y
 
 
-def gaussian_filter(x, sigma, mode="circular", causal=0.1):
+def gaussian_filter(x, sigma, mode="circular", causal=1):
     dim = len(x.shape)
     n_frames = x.shape[0]
     while len(x.shape) < 3:
