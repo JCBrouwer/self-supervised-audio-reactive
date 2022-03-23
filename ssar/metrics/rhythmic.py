@@ -47,8 +47,8 @@ def percentile_clip(signal, percent):
     if len(signal.shape) < 2:
         signal = signal.unsqueeze(1)
     for sig in signal.unbind(1):
-        locs = torch.arange(0, sig.shape[0])
-        peaks = torch.ones(sig.shape, dtype=bool)
+        locs = torch.arange(0, sig.shape[0], device=sig.device)
+        peaks = torch.ones(sig.shape, dtype=bool, device=sig.device)
         main = sig.take(locs)
 
         plus = sig.take((locs + 1).clamp(0, sig.shape[0] - 1))
@@ -253,25 +253,30 @@ def compare_rhythmic_reactivity_metrics(rhythmic_file="/home/hans/datasets/audio
 
 
 def rhythmic_reactivity(audio, sr, video, fps):
+    dev = audio.device
     if audio.dim() == 2:
         audio = audio.mean(0)
 
-    audio, sr = ta.functional.resample(audio, sr, fps * 1024).numpy(), fps * 1024
-    audio = rosa.effects.percussive(audio, margin=8.0)
+    if round(sr) != round(fps * 1024):
+        audio, sr = ta.functional.resample(audio, sr, round(fps * 1024)), round(fps * 1024)
+    perc = rosa.effects.percussive(audio.cpu().numpy(), margin=8.0)
 
     def postprocess(x, q=0.025):
         x = gaussian_filter(x, fps / 12, causal=0)
         x = percentile_clip(x, (1 - q) * 100)
         x = torch.clamp(x, torch.quantile(x, 4 * q, dim=0).item(), 1)
         x = gaussian_filter(x, fps / 24)
-        return x
+        return x / x.norm(p=2)
 
-    audio_env = rosa.onset.onset_strength(audio, sr, hop_length=1024)
-    audio_env = torch.from_numpy(audio_env)
+    audio_env = rosa.onset.onset_strength(perc, sr, hop_length=1024)
+    audio_env = torch.from_numpy(audio_env).to(dev)
     audio_env = postprocess(audio_env)
 
     video_env = torch.diff(video, dim=0, append=video[[-1]]).abs().sum(dim=(1, 2, 3))
     video_env = postprocess(video_env)
+
+    audio_env = audio_env[: min(len(audio_env), len(video_env))]
+    video_env = video_env[: min(len(audio_env), len(video_env))]
 
     similarity = audio_env @ video_env
     return similarity

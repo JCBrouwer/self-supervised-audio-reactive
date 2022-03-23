@@ -5,16 +5,16 @@ import torch
 def rank_ordinal(a):
     arr = torch.flatten(a)
     sorter = torch.argsort(arr)
-    inv = torch.empty(sorter.numel(), dtype=torch.long)
-    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long)
+    inv = torch.empty(sorter.numel(), dtype=torch.long, device=a.device)
+    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long, device=a.device)
     return inv + 1
 
 
 def rank_max(a):
     arr = torch.flatten(a)
     sorter = torch.argsort(arr)
-    inv = torch.empty(sorter.numel(), dtype=torch.long)
-    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long)
+    inv = torch.empty(sorter.numel(), dtype=torch.long, device=a.device)
+    inv[sorter] = torch.arange(sorter.numel(), dtype=torch.long, device=a.device)
     arr = arr[sorter]
     obs = torch.cat((torch.ones((1)).to(arr), (arr[1:] != arr[:-1]))).to(torch.long)
     dense = torch.cumsum(obs, 0)[inv]
@@ -24,11 +24,11 @@ def rank_max(a):
 
 def rank(x):
     len_x = len(x)
-    randomized_indices = np.random.choice(np.arange(len_x), len_x, replace=False)
+    randomized_indices = torch.randperm(len_x, device=x.device)
     randomized = x[randomized_indices]
     rankdata = rank_ordinal(randomized)
     randomized_indices_order = torch.argsort(randomized_indices)
-    unrandomized_indices = torch.arange(len_x)[randomized_indices_order]
+    unrandomized_indices = torch.arange(len_x, device=x.device)[randomized_indices_order]
     return rankdata[unrandomized_indices]
 
 
