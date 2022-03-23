@@ -181,11 +181,15 @@ def corrcoef(target, pred):
     return (pred_n * target_n).sum()
 
 
-def spearman(target, pred, regularization="l2", regularization_strength=0.01):
-    pred = torchsort.soft_rank(
-        pred.unsqueeze(0), regularization=regularization, regularization_strength=regularization_strength
-    ).squeeze()
-    return corrcoef(target, pred / pred.shape[-1])
+def correlation(target, pred, regularization="l2", regularization_strength=0.01, spearman=False):
+    if spearman:
+        pred = (
+            torchsort.soft_rank(
+                pred.unsqueeze(0), regularization=regularization, regularization_strength=regularization_strength
+            ).squeeze()
+            / pred.shape[-1]
+        )
+    return corrcoef(target, pred)
 
 
 def chromatic_reactivity(audio, sr, video, fps):
@@ -225,7 +229,7 @@ def chromatic_reactivity(audio, sr, video, fps):
     # plt.show()
 
     triuy, triux = torch.triu_indices(len(chroma_ac), len(chroma_ac), 1).unbind(0)
-    similarity = spearman(chroma_ac[triuy, triux], vhist_ac[triuy, triux])
+    similarity = correlation(chroma_ac[triuy, triux], vhist_ac[triuy, triux])
     return similarity
 
 

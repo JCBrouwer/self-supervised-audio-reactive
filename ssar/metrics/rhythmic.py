@@ -8,8 +8,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchaudio as ta
+import triton
+import triton.language as tl
 from dtaidistance import dtw
-from torch.nn.functional import mse_loss
+from torch.nn.functional import conv1d, mse_loss, pad
 from torchvision.transforms.functional import resize
 from tqdm import tqdm
 
@@ -252,6 +254,76 @@ def compare_rhythmic_reactivity_metrics(rhythmic_file="/home/hans/datasets/audio
         plt.savefig(SSAR_DIR + f"/output/wishlist_rhythmic_reactivity_{transname}.pdf")
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_stages=5, num_warps=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=5, num_warps=2),
+    ],
+    key=["M", "N"],
+)
+@triton.jit
+def absdiff_kernel(in_ptr, out_ptr, M, N, stride_m, stride_n, **meta):
+    """Compute absolute difference between consecutive elements along first axis of a matrix, reducing second axis"""
+    # extract meta-parameters
+    BLOCK_M = meta["BLOCK_M"]
+    BLOCK_N = meta["BLOCK_N"]
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    a_ptrs = in_ptr + (offs_m[:, None] * stride_m + offs_n[None, :] * stride_n)
+    b_ptrs = in_ptr + ((offs_m[:, None] + 1) * stride_m + offs_n[None, :] * stride_n)
+    mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
+    a = tl.load(a_ptrs, mask=mask, other=0.0)
+    b = tl.load(b_ptrs, mask=mask, other=0.0)
+    out = tl.sum(tl.abs(b - a), axis=1)
+    tl.atomic_add(out_ptr, out, mask=mask)
+
+
+def absdiff(x):
+    x = x.view(len(x), -1)
+    n_timestamps, n_elements = x.shape
+    y = torch.zeros((1,), device=x.device, dtype=x.dtype)
+    grid = lambda meta: (triton.cdiv(n_timestamps, meta["BLOCK_M"]), triton.cdiv(n_elements, meta["BLOCK_N"]))
+    absdiff_kernel[grid](x, y, n_timestamps, n_elements, x.stride(0), x.stride(1))
+    return torch.cat((y, y[[-1]]))
+
+
+def diff_conv1d(x, mode="replicate"):
+    dim = len(x.shape)
+    while len(x.shape) < 3:
+        x = x[:, None]
+
+    channels = x.shape[1] * x.shape[2]
+    kernel = torch.tensor([-1, 1]).view(1, 1, -1).repeat(channels, 1, 1)
+
+    if dim == 4:
+        t, c, h, w = x.shape
+        x = x.view(t, c * h, w)
+    x = x.transpose(0, 2)
+
+    print(x.shape)
+    x = conv1d(x, weight=kernel, groups=channels)
+    print(x.shape)
+
+    x = x.transpose(0, 2)
+    if dim == 4:
+        x = x.view(t - 1, c, h, w)
+
+    if len(x.shape) > dim:
+        x = x.squeeze()
+
+    return torch.cat((t, t[[-1]]))
+
+
 def rhythmic_reactivity(audio, sr, video, fps):
     dev = audio.device
     if audio.dim() == 2:
@@ -272,7 +344,8 @@ def rhythmic_reactivity(audio, sr, video, fps):
     audio_env = torch.from_numpy(audio_env).to(dev)
     audio_env = postprocess(audio_env)
 
-    video_env = torch.diff(video, dim=0, append=video[[-1]]).abs().sum(dim=(1, 2, 3))
+    # video_env = absdiff(video)
+    video_env = diff_conv1d(video).abs_().sum((1, 2, 3))
     video_env = postprocess(video_env)
 
     audio_env = audio_env[: min(len(audio_env), len(video_env))]
