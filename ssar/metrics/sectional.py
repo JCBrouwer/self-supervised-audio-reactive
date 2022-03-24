@@ -11,7 +11,7 @@ de.bridge.set_bridge("torch")
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        for video_file in shuffle(glob("/home/hans/datasets/audiovisual/maua/Cosmic Tuba Remix.mp4")):
+        for video_file in shuffle(glob("/home/hans/datasets/audiovisual/maua/*")):
             print("loading:", video_file)
             t = time()
             v = de.VideoReader(video_file)

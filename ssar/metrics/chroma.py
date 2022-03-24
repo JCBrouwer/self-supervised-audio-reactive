@@ -1,3 +1,4 @@
+import enum
 import os
 import sys
 
@@ -22,7 +23,7 @@ sys.path.append(SSAR_DIR + "/../maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2
 from ops.video import write_video
 
-COLORS = ["tab:blue", "tab:green", "tab:orange", "tab:purple"]
+COLORS = ["tab:blue", "tab:green", "tab:orange", "tab:purple", "tab:red"]
 
 
 def my_chromagram(audio, sr):
@@ -215,23 +216,115 @@ def chromatic_reactivity(audio, sr, video, fps):
     chroma_ac = chroma @ chroma.T
     vhist_ac = vhist @ vhist.T
 
-    # fig, ax = plt.subplots(1, 3, figsize=(18, 6))
-    # ax[0].imshow(chroma_ac.cpu())
-    # ax[0].axis("off")
-    # ax[0].set_title("Chroma Autocorrelation")
-    # ax[1].imshow(vhist_ac.cpu())
-    # ax[1].axis("off")
-    # ax[1].set_title("Video Color Histogram Autocorrelation")
-    # ax[2].imshow((chroma_ac - vhist_ac).abs().cpu())
-    # ax[2].axis("off")
-    # ax[2].set_title("Absolute Difference")
-    # plt.tight_layout()
-    # plt.show()
-
     triuy, triux = torch.triu_indices(len(chroma_ac), len(chroma_ac), 1).unbind(0)
     similarity = correlation(chroma_ac[triuy, triux], vhist_ac[triuy, triux])
     return similarity
 
 
+def compare_chroma_reactivity_metrics(
+    chroma_file="/home/hans/datasets/audiovisual/wishlist/spiruen-melodic1.flac", fps=24
+):
+    audio, sr = ta.load(chroma_file)
+    audio, sr = ta.functional.resample(audio, sr, 1024 * fps).mean(0).numpy(), 1024 * fps
+    real_chroma = my_chromagram(audio, sr)
+    real_chroma /= real_chroma.sum(1, keepdim=True)
+    real_chroma = real_chroma.cuda()
+
+    G = StyleGAN2(SSAR_DIR + "/cache/RobertAGonzalves-MachineRay2-AbstractArt-188.pkl").eval().cuda()
+
+    @torch.inference_mode()
+    def get_inputs(chroma):
+        ws = G.mapper(torch.randn((12, 512), device="cuda"))
+        latents = torch.einsum("TC,CNL->TNL", chroma, ws)
+        latents = gaussian_filter(latents, fps / 24)
+
+        noise = gaussian_filter(torch.randn((len(chroma), 1, 32, 32), device="cuda"), 3 * fps)
+        noise /= noise.std()
+
+        return latents, noise
+
+    @torch.inference_mode()
+    def get_video(latents, noise):
+        inputs = {"latents": latents, **G.synthesizer.make_noise_pyramid(noise)}
+        resize_fn = lambda x: resize(x, size=128, antialias=True)
+        video = torch.cat([frames.cpu() for frames in G.render(inputs=inputs, batch_size=32, postprocess_fn=resize_fn)])
+        return video
+
+    n_trials = 30
+
+    def get_chroma_vhist():
+        video = get_video(*get_inputs(real_chroma))
+        vhist = torch.stack([torch.cat([torch.histc(channel, bins=32) for channel in frame]) for frame in video])
+        vhist = vhist / vhist.norm(p=2, dim=1, keepdim=True)
+        return vhist
+
+    cache_file = "cache/chroma_vhists.npz"
+    if not os.path.exists(cache_file):
+        vhists = torch.stack([get_chroma_vhist() for _ in tqdm(range(n_trials))])
+        np.savez(cache_file, vhists=vhists.cpu().numpy())
+    else:
+        with np.load(cache_file) as data:
+            vhists = torch.from_numpy(data["vhists"])
+    vhists = vhists.cuda()
+
+    def permute_percentage_of_frames(envs, strength):
+        res = envs.clone()
+        num_envs, len_env, _ = res.shape
+        num_permute = round(len_env * strength)
+        if num_permute > 0:
+            for e in range(num_envs):
+                to_idxs = np.random.permutation(len_env)[:num_permute]
+                from_idxs = np.random.permutation(num_permute)
+                res[e, to_idxs] = res[e, to_idxs[from_idxs]]
+        return res
+
+    def emphasize(envs, strength, cutoff=0.5):
+        return envs * (1 + torch.tanh(strength * (envs - cutoff)))
+
+    transforms = {
+        "emphasize": (emphasize, np.linspace(0.01, 5, 60)),
+        "power": (lambda envs, strength: envs ** strength, np.linspace(0.01, 5, 60)),
+        "scale": (lambda envs, strength: strength * envs, np.linspace(-1, 5, 60)),
+        "offset": (lambda envs, strength: torch.roll(envs, strength), np.arange(-100, 100)),
+        "permute": (permute_percentage_of_frames, np.linspace(0, 1, 60)),
+    }
+
+    with tqdm(total=2 * sum([len(s) for _, (_, s) in transforms.items()]) * len(vhists)) as pbar:
+
+        def corr(chroma, vhist, spearman):
+            chroma = chroma[: min(len(chroma), len(vhist))]
+            vhist = vhist[: min(len(chroma), len(vhist))]
+
+            chroma_ac = chroma @ chroma.T
+            vhist_ac = vhist @ vhist.T
+
+            triuy, triux = torch.triu_indices(len(chroma_ac), len(chroma_ac), 1).unbind(0)
+            similarity = correlation(chroma_ac[triuy, triux], vhist_ac[triuy, triux], spearman=spearman)
+
+            pbar.update()
+
+            return similarity.cpu().numpy()
+
+        fig, ax = plt.subplots(len(transforms), 2, figsize=(8, 3 * len(transforms)))
+        for j, spearman in enumerate([False, True]):
+            for i, (transname, (transform, strengths)) in enumerate(transforms.items()):
+                ds = np.array(
+                    [
+                        [corr(real_chroma, transformed_vhist, spearman) for transformed_vhist in transform(vhists, s)]
+                        for s in strengths
+                    ]
+                )
+                mu, sig = ds.mean(1), ds.std(1)
+                ax[i, j].plot(strengths, mu, color=COLORS[i], linewidth=0.75)
+                ax[i, j].fill_between(strengths, mu - sig, mu + sig, color=COLORS[i], alpha=0.3)
+                ax[i, j].set_xlabel(transname)
+        ax[0, 0].set_title("correlation")
+        ax[0, 1].set_title("spearman correlation")
+        plt.suptitle("chromatic reactivity sensitivity")
+        plt.tight_layout()
+        plt.savefig(SSAR_DIR + f"/output/wishlist_chroma_reactivity_sensitivity.pdf")
+
+
 if __name__ == "__main__":
-    chroma_metric_analysis()
+    # chroma_metric_analysis()
+    compare_chroma_reactivity_metrics()
