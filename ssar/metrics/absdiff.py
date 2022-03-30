@@ -1,98 +1,11 @@
 from math import ceil
+from time import time
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 from torch.nn.functional import conv1d
-
-
-def absdiff_kernel_test(T=27, E=53, stride_xt=53, stride_xe=1, stride_yt=1, BLOCK_T=8, BLOCK_E=8):
-    x = torch.arange(T * E) + torch.rand(T * E)
-    print(x.numpy())
-    y = torch.zeros(T)
-    x_ptr, y_ptr = 0, 0
-    for t in range(ceil(T / BLOCK_T)):
-        for e in range(ceil(E / BLOCK_E)):
-            t_idxs = t * BLOCK_T + torch.arange(0, BLOCK_T)
-            e_idxs = e * BLOCK_E + torch.arange(0, BLOCK_E)
-
-            x_idx_t = x_ptr + (t_idxs[:, None] * stride_xt + e_idxs[None, :] * stride_xe)
-            mask_t = (t_idxs < T)[:, None] & (e_idxs < E)[None, :]
-            print(x_idx_t.numpy())
-            if not mask_t.all():
-                print(mask_t.numpy())
-                x_idx_t = x_idx_t.clamp(0, T * E - 1)
-
-            x_idx_t1 = x_ptr + ((t_idxs[:, None] + 1) * stride_xt + e_idxs[None, :] * stride_xe)
-            mask_t1 = ((t_idxs + 1) < T)[:, None] & (e_idxs < E)[None, :]
-            print(x_idx_t1.numpy())
-            if not mask_t1.all():
-                print(mask_t1.numpy())
-                x_idx_t1 = x_idx_t1.clamp(0, T * E - 1)
-
-            x_t = x[x_idx_t]
-            print(x_t.numpy())
-            x_t[~mask_t] = 0.0
-
-            x_t1 = x[x_idx_t1]
-            print(x_idx_t1.numpy())
-            x_t1[~mask_t1] = 0.0
-
-            y_t = torch.sum(torch.abs(x_t1 - x_t), axis=1)
-            print(y_t.numpy())
-
-            y_idxs = y_ptr + t_idxs * stride_yt
-            y_idxs = y_idxs.clamp(0, T)
-            skip = y_idxs != T
-            y_idxs = y_idxs[skip]
-            y[y_idxs] = y_t[skip]
-    print(y[: T + 3].numpy())
-    print(torch.diff(x[: T * E].reshape(T, E), dim=0).abs_().sum(1).numpy())
-
-
-np.set_printoptions(precision=1, linewidth=200)
-absdiff_kernel_test()
-exit()
-
-
-@triton.jit
-def absdiff_kernel(x_ptr, y_ptr, T, E, stride_xt, stride_xe, stride_yt, **meta):
-    """Compute absolute difference between consecutive elements along time axis of a matrix, reducing element axis"""
-    BLOCK_T, BLOCK_E = meta["BLOCK_T"], meta["BLOCK_E"]
-    t_idxs = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    e_idxs = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
-
-    x_idx_t = x_ptr + (t_idxs[:, None] * stride_xt + e_idxs[None, :] * stride_xe)
-    mask_t = (t_idxs < T)[:, None] & (e_idxs < E)[None, :]
-
-    x_idx_t1 = x_ptr + ((t_idxs[:, None] + 1) * stride_xt + e_idxs[None, :] * stride_xe)
-    mask_t1 = ((t_idxs + 1) < T)[:, None] & (e_idxs < E)[None, :]
-
-    x_t = tl.load(x_idx_t, mask=mask_t, other=0.0)
-    x_t1 = tl.load(x_idx_t1, mask=mask_t1, other=0.0)
-
-    y_t = tl.sum(tl.abs(x_t1 - x_t), axis=1)
-
-    tl.atomic_add(y_ptr + t_idxs * stride_yt, y_t, mask=(t_idxs + 1) < T)
-
-
-from time import time
-
-
-def absdiff(x):
-    x = x.view(len(x), -1)
-    n_timestamps, n_elements = x.shape
-    print(n_timestamps, n_elements)
-    y = torch.zeros(len(x), device=x.device, dtype=x.dtype)
-    print(y.shape)
-    grid = lambda meta: (triton.cdiv(n_timestamps, meta["BLOCK_T"]), triton.cdiv(n_elements, meta["BLOCK_E"]))
-    print(x.stride(), y.stride())
-    t = time()
-    absdiff_kernel[grid](x, y, n_timestamps, n_elements, x.stride(0), x.stride(1), y.stride(0), BLOCK_T=32, BLOCK_E=32)
-    torch.cuda.synchronize()
-    print(time() - t)
-    return y
 
 
 def diff_conv1d(x, mode="replicate"):
@@ -118,3 +31,117 @@ def diff_conv1d(x, mode="replicate"):
         x = x.squeeze()
 
     return torch.cat((t, t[[-1]]))
+
+
+def absdiff_kernel_pytorch(x, BLOCK_T=32, BLOCK_E=32):
+    x = x.view(len(x), -1)
+    T, E = x.shape
+    stride_xt, stride_xe = x.stride()
+    x = x.flatten()
+
+    y = torch.zeros(T, device=x.device)
+    stride_yt = y.stride(0)
+
+    x_ptr, y_ptr = 0, 0
+
+    for t in range(ceil(T / BLOCK_T)):
+        for e in range(ceil(E / BLOCK_E)):
+
+            t_idxs = t * BLOCK_T + torch.arange(0, BLOCK_T)
+            e_idxs = e * BLOCK_E + torch.arange(0, BLOCK_E)
+
+            x_idx_t = x_ptr + (t_idxs[:, None] * stride_xt + e_idxs[None, :] * stride_xe)
+            mask_t = (t_idxs < T)[:, None] & (e_idxs < E)[None, :]
+            if not mask_t.all():
+                x_idx_t = x_idx_t.clamp(0, T * E - 1)
+
+            x_idx_t1 = x_ptr + ((t_idxs[:, None] + 1) * stride_xt + e_idxs[None, :] * stride_xe)
+            mask_t1 = ((t_idxs + 1) < T)[:, None] & (e_idxs < E)[None, :]
+            if not mask_t1.all():
+                x_idx_t1 = x_idx_t1.clamp(0, T * E - 1)
+
+            x_t = x[x_idx_t]
+            x_t[~mask_t] = 0.0
+
+            x_t1 = x[x_idx_t1]
+            x_t1[~mask_t1] = 0.0
+
+            y_t = torch.sum(torch.abs(x_t1 - x_t), axis=1)
+
+            y_idxs = y_ptr + t_idxs * stride_yt
+
+            if (y_idxs > T - 1).any():
+                y_idxs = y_idxs.clamp(0, T - 1)
+                skip = y_idxs != T - 1
+                y_idxs = y_idxs[skip]
+                y_t = y_t[skip]
+
+            y[y_idxs] += y_t
+
+    y[-1] = y[-2]
+    return y
+
+
+@triton.jit
+def absdiff_kernel(x_ptr, y_ptr, T, E, stride_xt, stride_xe, stride_yt, **meta):
+    """Compute absolute difference between consecutive elements along time axis of a matrix, reducing element axis"""
+    BLOCK_T, BLOCK_E = meta["BLOCK_T"], meta["BLOCK_E"]
+    t, e = tl.program_id(0), tl.program_id(1)
+    t_idxs = t * BLOCK_T + tl.arange(0, BLOCK_T)
+    e_idxs = e * BLOCK_E + tl.arange(0, BLOCK_E)
+
+    x_idx_t = x_ptr + (t_idxs[:, None] * stride_xt + e_idxs[None, :] * stride_xe)
+    mask_t = (t_idxs < T)[:, None] & (e_idxs < E)[None, :]
+
+    x_idx_t1 = x_ptr + ((t_idxs[:, None] + 1) * stride_xt + e_idxs[None, :] * stride_xe)
+    mask_t1 = ((t_idxs + 1) < T)[:, None] & (e_idxs < E)[None, :]
+
+    x_t = tl.load(x_idx_t, mask=mask_t, other=0.0)
+    x_t1 = tl.load(x_idx_t1, mask=mask_t1, other=0.0)
+
+    y_t = tl.sum(tl.abs(x_t1 - x_t), axis=1)
+
+    y_idxs = y_ptr + t_idxs * stride_yt
+
+    tl.atomic_add(y_idxs, y_t, mask=(t_idxs + 1) < T)
+
+
+def absdiff(x):
+    x = x.view(len(x), -1)
+    n_timestamps, n_elements = x.shape
+    y = torch.zeros(len(x), device=x.device, dtype=x.dtype)
+    grid = lambda meta: (triton.cdiv(n_timestamps, meta["BLOCK_T"]), triton.cdiv(n_elements, meta["BLOCK_E"]))
+    absdiff_kernel[grid](x, y, n_timestamps, n_elements, x.stride(0), x.stride(1), y.stride(0), BLOCK_T=32, BLOCK_E=32)
+    y[-1] = y[-2]
+    return y
+
+
+if __name__ == "__main__":
+    np.set_printoptions(precision=1, linewidth=200)
+
+    T, C, H, W = 472, 3, 64, 128
+    x = torch.randn((T, C, H, W), device="cuda")
+    y = torch.randn(T, device="cuda")
+
+    pt = torch.diff(x, dim=0).abs().sum((1, 2, 3))
+    pt = torch.cat((pt, pt[[-1]]))
+
+    t = time()
+    for _ in range(20):
+        eff = absdiff_kernel_pytorch(x)
+        torch.cuda.synchronize()
+    print((time() - t) / 20, "s")
+
+    rel_diff = (pt - eff).abs().div(torch.maximum(pt, eff))
+    print("relative differences", rel_diff.min().item(), rel_diff.mean().item(), rel_diff.max().item())
+    assert torch.allclose(pt, eff, rtol=2e-4)
+
+    t = time()
+    for _ in range(20):
+        trt = absdiff(x)
+        torch.cuda.synchronize()
+    print((time() - t) / 20, "s")
+
+    rel_diff = (pt - trt).abs().div(torch.maximum(pt, trt))
+    print("relative differences", rel_diff.min().item(), rel_diff.mean().item(), rel_diff.max().item())
+    assert torch.allclose(pt, trt)
