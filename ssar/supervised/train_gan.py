@@ -108,7 +108,6 @@ if __name__ == "__main__":
     batch_size = 128
     lr = 5e-4
     # aug_weight = 0.5
-    synthetic = False
 
     fps = 24
     dur = target_len / fps
@@ -118,7 +117,7 @@ if __name__ == "__main__":
     test_audio = "/home/hans/datasets/wavefunk/Ouroboromorphism_49_89.flac"
 
     train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(
-        in_dir, synthetic, batch_size, dur, fps
+        in_dir, batch_size, dur, fps
     )
     train_mean, train_std = train_mean[None, :, None], train_std[None, :, None]
     valiter = infiniter(val_dataloader)
@@ -126,7 +125,7 @@ if __name__ == "__main__":
 
     # if aug_weight > 0:
     #     augmenter = LatentAugmenter(
-    #         checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3, synthetic=synthetic
+    #         checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3
     #     )
 
     inputs, targets = next(trainiter)
@@ -331,7 +330,6 @@ if __name__ == "__main__":
                 audio_file=test_audio,
                 out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
                 stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
-                onsets_only=synthetic,
             )
 
     writer.close()

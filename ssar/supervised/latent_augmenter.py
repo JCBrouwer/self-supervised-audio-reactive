@@ -21,36 +21,40 @@ def spline_loop_latents(y, size):
 
 
 class LatentAugmenter:
-    def __init__(self, checkpoint, n_patches, synthetic) -> None:
+    def __init__(self, checkpoint, n_patches) -> None:
         model = StyleGAN2Mapper(checkpoint, inference=False).eval()
         self.n_patches = n_patches
         self.num = 16384
         self.ws = model.forward(latent_z=torch.randn((self.num, 512)))
         self.nw = self.ws.shape[1]
-        self.feat_idxs = (
-            {
-                "onsets": (0, 1),
-                "onsets_low": (1, 2),
-                "onsets_mid": (2, 3),
-                "onsets_high": (3, 4),
-            }
-            if synthetic
-            else {
-                # "mfccs": (0, 20),
-                "chroma": (20, 32),
-                "tonnetz": (32, 38),
-                # "contrast": (38, 45),
-                "onsets": (45, 46),
-                "onsets_low": (46, 47),
-                "onsets_mid": (47, 48),
-                "onsets_high": (48, 49),
-                # "pulse": (49, 50),
-                "volume": (50, 51),
-                # "flatness": (51, 52),
-            }
-        )
+        self.feat_idxs = {
+            # "mfccs": (0, 20),
+            "chroma": (20, 32),
+            "chroma": (20, 32),
+            "chroma": (20, 32),
+            "chroma": (20, 32),
+            "tonnetz": (32, 38),
+            "tonnetz": (32, 38),
+            "tonnetz": (32, 38),
+            "tonnetz": (32, 38),
+            # "contrast": (38, 45),
+            # "flatness": (45, 46),
+            "onsets": (46, 47),
+            "onsets_low": (47, 48),
+            "onsets_mid": (48, 49),
+            "onsets_high": (49, 50),
+            # "pulse": (50, 51),
+            "volume": (51, 52),
+            "volume_low": (52, 53),
+            "volume_mid": (53, 54),
+            "volume_high": (54, 55),
+            "volume_long": (55, 56),
+            "volume_low_long": (56, 57),
+            "volume_mid_long": (57, 58),
+            "volume_high_long": (58, 59),
+        }
         self.feat_keys = list(self.feat_idxs.keys())
-        self.single_dim = -4 if synthetic else -5
+        self.single_dim = -12
 
     def __call__(self, features):
         residuals, offsets = [], []

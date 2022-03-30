@@ -86,7 +86,6 @@ if __name__ == "__main__":
 
     # Training options
     parser.add_argument("--aug_weight", type=float, default=0.5)
-    parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--wd", type=float, default=0)
@@ -116,15 +115,14 @@ if __name__ == "__main__":
     lr = args.lr
     wd = args.wd
     aug_weight = args.aug_weight
-    synthetic = args.synthetic
 
     train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(
-        in_dir, synthetic, batch_size, dur, fps
+        in_dir, batch_size, dur, fps
     )
 
     if aug_weight > 0:
         augmenter = LatentAugmenter(
-            checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3, synthetic=synthetic
+            checkpoint="/home/hans/modelzoo/train_checks/neurout2-117.pt", n_patches=3
         )
 
     inputs, targets = next(iter(train_dataloader))
@@ -231,9 +229,7 @@ if __name__ == "__main__":
     a2l(inputs.to(device))
     print_model_summary(a2l)
 
-    if synthetic:
-        name += "_synthetic"
-    elif aug_weight > 0:
+    if aug_weight > 0:
         name += "_augmented"
 
     optimizer = torch.optim.AdamW(a2l.parameters(), lr=lr, weight_decay=wd)
@@ -255,16 +251,11 @@ if __name__ == "__main__":
 
         for inputs, targets in train_dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
-            if synthetic:
-                pass
             if aug_weight > 0:
                 (inputs, aug_inputs), (targets, _) = inputs.chunk(2), targets.chunk(2)
 
-            if not synthetic:
-                outputs = a2l(inputs)
-                loss = F.mse_loss(outputs, targets)
-            else:
-                loss = torch.zeros(())
+            outputs = a2l(inputs)
+            loss = F.mse_loss(outputs, targets)
 
             if aug_weight > 0:
                 aug_inputs = aug_inputs.to(device)
@@ -332,7 +323,6 @@ if __name__ == "__main__":
                 audio_file=test_audio,
                 out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
                 stylegan_file="/home/hans/modelzoo/train_checks/neurout2-117.pt",
-                onsets_only=synthetic,
             )
 
     writer.close()

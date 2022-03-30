@@ -84,45 +84,37 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def audio2features(audio, sr, fps, clamp=True, smooth=True, onsets_only=False):
+def audio2features(audio, sr, fps, clamp=True, smooth=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
+    audio = audio.cpu()
     audio = torchaudio.transforms.Resample(sr, 24575)(audio).numpy()
     sr = 24575
     harmonic, percussive = rosa.effects.hpss(audio, margin=8.0)
-    if onsets_only:
-        multi_features = []
-        single_features = [
-            rosa.onset.onset_strength(percussive, sr, hop_length=1024),
-            rosa.onset.onset_strength(low_pass(percussive, sr), sr, hop_length=1024),
-            rosa.onset.onset_strength(mid_pass(percussive, sr), sr, hop_length=1024),
-            rosa.onset.onset_strength(high_pass(percussive, sr), sr, hop_length=1024),
-        ]
-    else:
-        # fmt:off
-        multi_features = [
-            ndi.gaussian_filter(rosa.feature.mfcc(audio, sr, hop_length=1024), [0, 10]),
-            ndi.gaussian_filter(rosa.feature.chroma_cens(harmonic, sr, hop_length=1024), [0, 10]),
-            ndi.gaussian_filter(rosa.feature.tonnetz(harmonic, sr, hop_length=1024), [0, 10]),
-            ndi.gaussian_filter(rosa.feature.spectral_contrast(audio, sr, hop_length=1024), [0, 10]),
-        ]
-        single_features = [
-            ndi.gaussian_filter(rosa.feature.spectral_flatness(audio, hop_length=1024), [0, 10]),
-            rosa.onset.onset_strength(percussive, sr, hop_length=1024),
-            rosa.onset.onset_strength(low_pass(percussive, sr), sr, hop_length=1024),
-            rosa.onset.onset_strength(mid_pass(percussive, sr), sr, hop_length=1024),
-            rosa.onset.onset_strength(high_pass(percussive, sr), sr, hop_length=1024),
-            rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180, hop_length=1024),
-            rosa.feature.rms(harmonic, sr, hop_length=1024),
-            rosa.feature.rms(low_pass(harmonic, sr), sr, hop_length=1024),
-            rosa.feature.rms(mid_pass(harmonic, sr), sr, hop_length=1024),
-            rosa.feature.rms(high_pass(harmonic, sr), sr, hop_length=1024),
-            sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(audio, hop_length=1024), [0, 10])) * 10 - 5),
-            sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(low_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
-            sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(mid_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
-            sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(high_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
-        ]
-        # fmt:on
+    # fmt:off
+    multi_features = [
+        ndi.gaussian_filter(rosa.feature.mfcc(audio, sr, hop_length=1024), [0, 10]),
+        ndi.gaussian_filter(rosa.feature.chroma_cens(harmonic, sr, hop_length=1024), [0, 10]),
+        ndi.gaussian_filter(rosa.feature.tonnetz(harmonic, sr, hop_length=1024), [0, 10]),
+        ndi.gaussian_filter(rosa.feature.spectral_contrast(audio, sr, hop_length=1024), [0, 10]),
+    ]
+    single_features = [
+        ndi.gaussian_filter(rosa.feature.spectral_flatness(audio, hop_length=1024), [0, 10]),
+        rosa.onset.onset_strength(percussive, sr, hop_length=1024),
+        rosa.onset.onset_strength(low_pass(percussive, sr), sr, hop_length=1024),
+        rosa.onset.onset_strength(mid_pass(percussive, sr), sr, hop_length=1024),
+        rosa.onset.onset_strength(high_pass(percussive, sr), sr, hop_length=1024),
+        rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180, hop_length=1024),
+        rosa.feature.rms(harmonic, sr, hop_length=1024),
+        rosa.feature.rms(low_pass(harmonic, sr), sr, hop_length=1024),
+        rosa.feature.rms(mid_pass(harmonic, sr), sr, hop_length=1024),
+        rosa.feature.rms(high_pass(harmonic, sr), sr, hop_length=1024),
+        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(audio, hop_length=1024), [0, 10])) * 10 - 5),
+        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(low_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
+        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(mid_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
+        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(high_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
+    ]
+    # fmt:on
     features = [mf.transpose(1, 0) for mf in multi_features] + [sf.reshape(-1, 1) for sf in single_features]
     features = np.concatenate(features, axis=1)
     features = torch.from_numpy(features).float()
@@ -152,12 +144,11 @@ def load_npy(file):
 
 
 class FullAudio2LatentFFCVPreprocessor(Dataset):
-    def __init__(self, directory, fps, synthetic, return_bytes=False):
+    def __init__(self, directory, fps, return_bytes=False):
         super().__init__()
         self.fps = fps
         self.return_bytes = return_bytes
         self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
-        self.synthetic = synthetic
 
     def __len__(self):
         return len(self.files)
@@ -167,7 +158,7 @@ class FullAudio2LatentFFCVPreprocessor(Dataset):
         filename, _ = os.path.splitext(file)
 
         audio, sr = torchaudio.load(file)
-        features = audio2features(audio, sr, self.fps, onsets_only=self.synthetic)
+        features = audio2features(audio, sr, self.fps)
 
         latents = load_npy(f"{filename}.npy")
 
@@ -261,19 +252,17 @@ def overlapping_slices(tensor, length):
 
 
 # fmt: off
-def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps):
+def get_ffcv_dataloaders(input_dir, batch_size, dur, fps):
     L = int(dur * fps)
 
     datastem = f"cache/{Path(input_dir).stem}_{L}frames"
-    if synthetic:
-        datastem += "_synthetic"
     train_beton = f"ffcv_{datastem}_ffcv_train.beton"
     val_beton = f"ffcv_{datastem}_ffcv_val.beton"
     mean_file = f"{datastem}_train_mean.npy"
     std_file = f"{datastem}_train_std.npy"
 
     if not os.path.exists(train_beton):
-        full_dataset = FullAudio2LatentFFCVPreprocessor(input_dir, fps, synthetic)
+        full_dataset = FullAudio2LatentFFCVPreprocessor(input_dir, fps)
         full_loader = DataLoader(full_dataset, batch_size=1, shuffle=False, num_workers=24, prefetch_factor=1)
 
         train_feat_file, train_lat_file = f"{datastem}_train_feats.npy", f"{datastem}_train_lats.npy"
@@ -328,7 +317,7 @@ def get_ffcv_dataloaders(input_dir, synthetic, batch_size, dur, fps):
 
         print("Preprocessing chunks to FFCV...")
         fields = {
-            "features": NDArrayField(shape=(L, 4 if synthetic else 59), dtype=np.dtype("float32")),
+            "features": NDArrayField(shape=(L, 59), dtype=np.dtype("float32")),
             "latents": NDArrayField(shape=(L, n_ws, latent_dim), dtype=np.dtype("float32")),
             "noise4": NDArrayField(shape=(L, 4, 4), dtype=np.dtype("float32")),
             "noise8": NDArrayField(shape=(L, 8, 8), dtype=np.dtype("float32")),

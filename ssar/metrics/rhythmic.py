@@ -80,11 +80,11 @@ def my_audio_onsets(audio, sr):
     perc = rosa.effects.percussive(audio, margin=8.0)
     ons = rosa.onset.onset_strength(perc, sr, hop_length=1024)
     ons = torch.from_numpy(ons)
-    ons = gaussian_filter(ons, 2 * F, causal=0)
+    ons = gaussian_filter(ons, 2 * sr / 1024 / 24, causal=0)
     ons = percentile_clip(ons, (1 - Q) * 100)
     ons = torch.clamp(ons, torch.quantile(ons, 4 * Q, dim=0).item(), 1)
     ons[ons > 0.75] *= 2
-    ons = gaussian_filter(ons, F)
+    ons = gaussian_filter(ons, sr / 1024 / 24)
     return normalize(ons)
 
 
