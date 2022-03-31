@@ -5,20 +5,8 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from kornia.color.hsv import rgb_to_hsv
-from torch.nn.functional import pad
-
-
-@torch.jit.script
-def normalize(array):
-    array = array - array.min()
-    array = array / array.max()
-    return array
-
-
-def standardize(array):
-    result = torch.clamp(array, quantile(array, 0.25), quantile(array, 0.75) + 1e-10)
-    result = normalize(result)
-    return result
+from ssar.analysis.efficient_quantile import quantile
+from ssar.features.processing import cart2pol, median_filter_2d, normalize, onset_envelope, spectral_flux, standardize
 
 
 @torch.jit.script
@@ -73,6 +61,7 @@ def absdiff(video, stride=64):
 
 @torch.jit.script
 def fft(video, stride=64):
+    _, _, h, w = video.shape
     y = []
     for i in range(0, len(video), stride):
         y_part = torch.fft.rfft2(video[i : i + stride + 1], norm="forward")[..., : h // 2, : w // 2]
@@ -117,17 +106,7 @@ def adaptive_frequency_power(video, k=10):
     return spec[:, max_var_freqs].sum(1)
 
 
-def cart2pol(x, y):
-    if isinstance(x, np.ndarray):
-        rho = np.sqrt(np.square(x) + np.square(y))
-        phi = np.arctan2(y, x)
-    else:
-        rho = torch.sqrt(torch.square(x) + torch.square(y))
-        phi = torch.atan2(y, x)
-    return rho, phi
-
-
-def optical_flow_cpu_worker(prev_next):
+def _optical_flow_cpu_worker(prev_next):
     i, (prev, next) = prev_next
     prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
     next_gray = cv2.cvtColor(next, cv2.COLOR_RGB2GRAY)
@@ -153,22 +132,12 @@ def optical_flow_cpu(video):
     video = video.cpu().numpy()
     flow = []
     with mp.Pool(mp.cpu_count()) as pool:
-        flow = [torch.from_numpy(f) for f in pool.map(optical_flow_cpu_worker, list(enumerate(zip(video, video[1:]))))]
+        flow = [torch.from_numpy(f) for f in pool.map(_optical_flow_cpu_worker, list(enumerate(zip(video, video[1:]))))]
     flow = torch.stack(flow)
     flow = torch.cat((flow[[0]], flow))
     flow[:, 0] = standardize(flow[:, 0])
     flow[:, 1] = normalize(flow[:, 1])
     return flow.to(dev)
-
-
-@torch.jit.script
-def median_filter_2d(
-    x, k: Tuple[int, int] = (3, 3), s: Tuple[int, int] = (1, 1), p: Tuple[int, int, int, int] = (1, 1, 1, 1)
-):
-    x = pad(x, p, mode="reflect")
-    x = x.unfold(2, k[0], s[0]).unfold(3, k[1], s[1])
-    x = x.contiguous().view(x.size()[:4] + (-1,)).median(dim=-1)[0]
-    return x
 
 
 @torch.jit.script
@@ -191,20 +160,6 @@ def directogram(flow, bins: int = 8):
     return dg
 
 
-@torch.jit.script
-def spectral_flux(spec):
-    return torch.diff(spec, dim=0, append=torch.zeros((1, spec.shape[1]), device=spec.device))
-
-
-@torch.jit.script
-def onset_envelope(flux):
-    u = torch.sum(0.5 * (flux + torch.abs(flux)), dim=1)
-    u = torch.clamp(u, torch.quantile(u, 0.025), torch.quantile(u, 0.975))
-    u -= u.min()
-    u /= u.max()
-    return u
-
-
 def video_flow_onsets(video):
     flow = optical_flow_cpu(video.permute(0, 2, 3, 1).cpu())
     spec = directogram(flow)
@@ -220,36 +175,34 @@ def video_spectral_onsets(video):
     return onset
 
 
-if __name__ == "__main__":
-    with torch.inference_mode():
-        from glob import glob
-        from pathlib import Path
+# if __name__ == "__main__":
+#     with torch.inference_mode():
+#         from glob import glob
+#         from pathlib import Path
 
-        import cv2
-        import decord as de
-        import matplotlib.pyplot as plt
-        from ssar.analysis.efficient_quantile import quantile
-        from ssar.supervised.data import normalize
+#         import cv2
+#         import decord as de
+#         import matplotlib.pyplot as plt
 
-        de.bridge.set_bridge("torch")
+#         de.bridge.set_bridge("torch")
 
-        for vfile in glob("/home/hans/datasets/audiovisual/maua256/*"):
-            v = de.VideoReader(vfile)
-            video = v[:]
-            video = video.permute(0, 3, 1, 2).div(255).cuda()
-            t, c, h, w = video.shape
-            print("\n", Path(vfile).stem, video.shape)
+#         for vfile in glob("/home/hans/datasets/audiovisual/maua256/*"):
+#             v = de.VideoReader(vfile)
+#             video = v[:]
+#             video = video.permute(0, 3, 1, 2).div(255).cuda()
+#             t, c, h, w = video.shape
+#             print("\n", Path(vfile).stem, video.shape)
 
-            try:
-                freqs = video_spectrogram(video)
+#             try:
+#                 freqs = video_spectrogram(video)
 
-                fig, ax = plt.subplots(4, 1, figsize=(16, 10))
-                ax[0].imshow(normalize(freqs).T.numpy()[::-1])
-                ax[0].axis("off")
-                ax[1].plot(adaptive_frequency_power(video))
-                ax[2].plot(video_flow_onsets(video))
-                ax[3].plot(video_spectral_onsets(video))
-                plt.tight_layout()
-                plt.show()
-            except Exception as e:
-                print(e)
+#                 fig, ax = plt.subplots(4, 1, figsize=(16, 10))
+#                 ax[0].imshow(normalize(freqs).T.numpy()[::-1])
+#                 ax[0].axis("off")
+#                 ax[1].plot(adaptive_frequency_power(video))
+#                 ax[2].plot(video_flow_onsets(video))
+#                 ax[3].plot(video_spectral_onsets(video))
+#                 plt.tight_layout()
+#                 plt.show()
+#             except Exception as e:
+#                 print(e)
