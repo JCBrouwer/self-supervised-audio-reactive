@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch.nn.functional import pad
 
@@ -35,7 +36,7 @@ def piptrack(
     center=True,
     pad_mode="reflect",
 ):
-    S = spectrogram(y=y, n_fft=n_fft, hop_length=hop_length, window=window, center=center, pad_mode=pad_mode)
+    S = spectrogram(y, n_fft=n_fft, hop_length=hop_length, window=window, center=center, pad_mode=pad_mode)
 
     # Make sure we're dealing with magnitudes
     S = torch.abs(S)
@@ -44,7 +45,7 @@ def piptrack(
     fmin = max(fmin, 0)
     fmax = min(fmax, float(sr) / 2)
 
-    fft_freqs = torch.linspace(0, float(sr) / 2, int(1 + n_fft // 2))
+    fft_freqs = torch.linspace(0, float(sr) / 2, int(1 + n_fft // 2), device=y.device)
 
     # Do the parabolic interpolation everywhere,
     # then figure out where the peaks are
@@ -58,8 +59,8 @@ def piptrack(
     shift = avg / (shift + (torch.abs(shift) < torch.finfo(shift.dtype).tiny))
 
     # Pad back up to the same shape as S
-    avg = pad(avg, ([1, 1, 0, 0]), mode="constant")
-    shift = pad(shift, ([1, 1, 0, 0]), mode="constant")
+    avg = pad(avg, ([0, 0, 1, 1]), mode="constant")
+    shift = pad(shift, ([0, 0, 1, 1]), mode="constant")
 
     dskew = 0.5 * avg * shift
 
@@ -72,9 +73,7 @@ def piptrack(
 
     ref_value = threshold * torch.max(S, axis=0).values
 
-    print(S.shape, freq_mask.shape)
     idx = torch.argwhere(freq_mask & localmax(S * (S > ref_value)))
-    print(idx.shape)
 
     # Store pitch and magnitude
     pitches[idx[:, 0], idx[:, 1]] = (idx[:, 0] + shift[idx[:, 0], idx[:, 1]]) * float(sr) / n_fft
@@ -106,16 +105,16 @@ def pitch_tuning(frequencies, resolution=0.01, bins_per_octave=12):
         return 0.0
 
     # Compute the residual relative to the number of bins
-    residual = torch.mod(bins_per_octave * hz_to_octs(frequencies), 1.0)
+    residual = (bins_per_octave * hz_to_octs(frequencies)) % 1.0
 
     # Are we on the wrong side of the semitone?
     # A residual of 0.95 is more likely to be a deviation of -0.05
     # from the next tone up.
     residual[residual >= 0.5] -= 1.0
 
-    bins = torch.linspace(-0.5, 0.5, int(torch.ceil(1.0 / resolution)) + 1)
-
-    counts, tuning = torch.histogram(residual, bins)
+    bins = int(np.ceil(1.0 / resolution))
+    counts = torch.histc(residual, bins=bins, min=-0.5, max=0.5)
+    tuning = torch.linspace(-0.5, 0.5, bins + 1, device=frequencies.device)
 
     # return the histogram peak
     return tuning[torch.argmax(counts)]

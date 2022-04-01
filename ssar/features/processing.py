@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from ssar.analysis.efficient_quantile import quantile
 from torch.nn.functional import conv1d, pad
+from torchaudio.functional import contrast, highpass_biquad, lowpass_biquad
 
 
 def gaussian_filter(x, sigma, mode="circular", causal=1):
@@ -127,3 +128,19 @@ def clamp_lower_percentile(signal, percentile):
 
 def emphasize(envs, strength, cutoff=0.5):
     return envs * (1 + torch.tanh(strength * (envs - cutoff)))
+
+
+def low_pass(audio, sr):
+    return lowpass_biquad(audio, sr, 200)
+
+
+def mid_pass(audio, sr):
+    return low_pass(high_pass(audio, sr), sr)
+
+
+def high_pass(audio, sr):
+    return highpass_biquad(audio, sr, 2000)
+
+
+def contrast_enhance(audio, sr, strength=75):
+    return contrast(audio, sr, strength)

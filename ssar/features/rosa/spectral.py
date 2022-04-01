@@ -1,39 +1,62 @@
 import numpy as np
 import torch
-from torch.nn.functional import conv1d
+from torch.nn.functional import conv1d, pad
+from torchcubicspline import natural_cubic_spline_coeffs
 
 from ..processing import median_filter_2d
-from .convert import cq_to_chroma, hz_to_mel, mel_to_hz
+from .convert import cq_to_chroma, hz_to_mel, mel_to_hz, power_to_db
+from .helpers import sync_agg
+
+
 
 
 def stft(
     y, n_fft=2048, hop_length=1024, center=True, window=torch.hann_window, pad_mode="reflect", return_complex=True
 ):
-    print(y.shape, y.dtype)
-    y_stft = torch.stft(
+    return torch.stft(
         y,
         n_fft=n_fft,
         hop_length=hop_length,
-        window=window(n_fft).to(y),
         center=center,
+        window=window(n_fft, device=y.device) if window is not None else None,
         pad_mode=pad_mode,
         return_complex=return_complex,
     )
-    print(y_stft.shape, y_stft.dtype)
-    return y_stft
 
 
-def istft(y_stft, n_fft=2048, hop_length=1024, center=True, window=torch.hann_window, return_complex=True, length=None):
-    print(y_stft.shape, y_stft.dtype)
+def istft(spec, n_fft=2048, hop_length=1024, center=True, window=torch.hann_window, length=None):
     return torch.istft(
-        y_stft,
+        spec,
         n_fft=n_fft,
         hop_length=hop_length,
-        window=window(n_fft).to(y_stft),
         center=center,
-        return_complex=return_complex,
+        window=window(n_fft, device=spec.device) if window is not None else None,
         length=length,
     )
+
+
+def dct(x, norm=None):
+    x_shape = x.shape
+    N = x_shape[-1]
+    x = x.contiguous().view(-1, N)
+
+    v = torch.cat([x[:, ::2], x[:, 1::2].flip([1])], dim=1)
+
+    Vc = torch.view_as_real(torch.fft.fft(v, dim=1))
+
+    k = -torch.arange(N, dtype=x.dtype, device=x.device)[None, :] * np.pi / (2 * N)
+    W_r = torch.cos(k)
+    W_i = torch.sin(k)
+
+    V = Vc[:, :, 0] * W_r - Vc[:, :, 1] * W_i
+
+    if norm == "ortho":
+        V[:, 0] /= np.sqrt(N) * 2
+        V[:, 1:] /= np.sqrt(N / 2) * 2
+
+    V = 2 * V.view(*x_shape)
+
+    return V
 
 
 def spectrogram(y, n_fft=2048, hop_length=1024, power=1, window=torch.hann_window, center=True, pad_mode="reflect"):
@@ -45,30 +68,30 @@ def melspectrogram(
     y, sr, n_fft=2048, hop_length=1024, window=torch.hann_window, center=True, pad_mode="reflect", power=2.0, fmax=None
 ):
     S = spectrogram(y, n_fft=n_fft, hop_length=hop_length, power=power, window=window, center=center, pad_mode=pad_mode)
-    mel_basis = mel(sr, n_fft, fmax=fmax)
+    mel_basis = mel(sr, n_fft, fmax=fmax, device=S.device)
     return mel_basis @ S
 
 
-def mel_frequencies(n_mels=128, fmin=0.0, fmax=11025.0, htk=False):
+def mel_frequencies(n_mels=128, fmin=0.0, fmax=11025.0, htk=False, device="cpu"):
     # 'Center freqs' of mel bands - uniformly spaced between limits
-    min_mel = hz_to_mel(fmin, htk=htk)
-    max_mel = hz_to_mel(fmax, htk=htk)
-    mels = torch.linspace(min_mel, max_mel, n_mels)
+    min_mel = hz_to_mel(fmin, htk=htk, device=device)
+    max_mel = hz_to_mel(fmax, htk=htk, device=device)
+    mels = torch.linspace(min_mel, max_mel, n_mels, device=device)
     return mel_to_hz(mels, htk=htk)
 
 
-def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False, dtype=torch.float):
+def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False, dtype=torch.float, device="cpu"):
     if fmax is None:
         fmax = float(sr) / 2
 
     n_mels = int(n_mels)
-    weights = torch.zeros((n_mels, int(1 + n_fft // 2)), dtype=dtype)
+    weights = torch.zeros((n_mels, int(1 + n_fft // 2)), dtype=dtype, device=device)
 
     # Center freqs of each FFT bin
-    fftfreqs = torch.linspace(0, float(sr) / 2, int(1 + n_fft // 2))
+    fftfreqs = torch.linspace(0, float(sr) / 2, int(1 + n_fft // 2), device=device)
 
     # 'Center freqs' of mel bands - uniformly spaced between limits
-    mel_f = mel_frequencies(n_mels + 2, fmin=fmin, fmax=fmax, htk=htk)
+    mel_f = mel_frequencies(n_mels + 2, fmin=fmin, fmax=fmax, htk=htk, device=device)
 
     fdiff = torch.diff(mel_f)
 
@@ -140,43 +163,79 @@ def hpss(S, ks=31, power=2.0, margin=1.0):
     return ((S * mask_harm) * phase, (S * mask_perc) * phase)
 
 
-from .constantq import cqt
+with torch.no_grad():
+    QUANT_STEPS = [0.4, 0.2, 0.1, 0.05]  # from librosa.feature.spectral.chroma_cens
+    Q_STEP = 0.25
+    QUANT_WEIGHTS = [Q_STEP, Q_STEP, Q_STEP, Q_STEP]
 
-
-def chroma_cqt(
-    y,
-    sr,
-    hop_length=1024,
-    fmin=None,
-    threshold=0.0,
-    tuning=None,
-    n_chroma=12,
-    n_octaves=7,
-    window=torch.hann_window,
-    bins_per_octave=36,
-):
-
-    # Build the CQT if we don't have one already
-    C = torch.abs(
-        cqt(
-            y,
-            sr=sr,
-            hop_length=hop_length,
-            fmin=fmin,
-            n_bins=n_octaves * bins_per_octave,
-            bins_per_octave=bins_per_octave,
-            tuning=tuning,
+    p1, p2, p3, p4 = np.diff(list(reversed(QUANT_STEPS + [0])))
+    xs = [
+        torch.linspace(-0.1, 0.025, 101)[:-1],
+        torch.linspace(0.025, p1, 11)[:-1],
+        torch.linspace(p1, p1 + p2, 11)[:-1],
+        torch.linspace(p1 + p2, p1 + p2 + p3, 11)[:-1],
+        torch.linspace(p1 + p2 + p3, 0.5, 11)[:-1],
+        torch.linspace(0.5, 1.1, 100),
+    ]
+    ys = torch.cat(
+        (
+            0.5 * torch.ones(len(xs[0])),
+            xs[1] / p1,
+            (xs[2] - p1) / p2 + 1,
+            (xs[3] - p1 - p2) / p3 + 2,
+            (xs[4] - p1 - p2 - p3) / p4 + 3,
+            4.5 * torch.ones(len(xs[5])),
         )
     )
+    xs = torch.cat(xs)
+    COEFFS = natural_cubic_spline_coeffs(xs, ys.reshape(1, -1, 1))  # pre-calculate spline coefficients
 
-    # Map to chroma
-    cq_to_chr = cq_to_chroma(C.shape[0], bins_per_octave=bins_per_octave, n_chroma=n_chroma, fmin=fmin, window=window)
-    chroma = cq_to_chr.dot(C)
 
-    if threshold is not None:
-        chroma[chroma < threshold] = 0.0
+def spline_eval(t, coeffs):
+    y, a, b, c, d = (c.to(t.device) for c in coeffs)
+    maxlen = b.size(-2) - 1
+    index = torch.bucketize(t.detach(), y) - 1
+    index = index.clamp(0, maxlen)  # clamp because t may go outside of [t[0], t[-1]]
+    # this is fine will never access the last element of y; this is correct behaviour
+    fractional_part = t - y[index]
+    fractional_part = fractional_part.unsqueeze(-1)
+    inner = c[..., index, :] + d[..., index, :] * fractional_part
+    inner = b[..., index, :] + inner * fractional_part
+    return a[..., index, :] + inner * fractional_part
 
-    return chroma
+
+def r(w):
+    return (w - 0.5) - torch.floor(w - 0.5) - 0.5
+
+
+def m(alpha):
+    return 1 / (1 + np.exp(-alpha)) - 0.5
+
+
+def step_function(w, h=Q_STEP, alpha=20):  # alpha controls smoothness of step transition
+    return h * (torch.floor(w - 0.5) + 1 / (2 * m(alpha)) * 1 / (1 + torch.exp(-2 * alpha * r(w))))
+
+
+def spline_quantize(chroma):
+    spline_mapped = torch.stack([spline_eval(c, COEFFS).squeeze() for c in chroma])
+    return step_function(spline_mapped)
+
+
+def test_spline_quantization():
+    import matplotlib.pyplot as plt
+
+    xt = torch.linspace(-1, 2, 1000)
+    yt = spline_eval(xt).squeeze()
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    ax[0].plot(xs, ys, color="tab:blue", alpha=0.5, label="original")
+    ax[0].plot(xt, yt, color="tab:orange", alpha=0.5, label="spline approx")
+    ax[0].set_xlim(-0.1, 1.1)
+    ax[0].legend()
+    ax[1].plot(xt, step_function(yt))
+    ax[1].set_xlim(-0.1, 0.6)
+    plt.tight_layout()
+    plt.show()
 
 
 def chroma_cens(
@@ -202,22 +261,67 @@ def chroma_cens(
         n_chroma=n_chroma,
         n_octaves=n_octaves,
         window=window,
+        norm=False,
     )
     chroma = chroma / torch.norm(chroma, p=1, dim=0)  # L1-Normalization
 
-    QUANT_STEPS = [0.4, 0.2, 0.1, 0.05]  # Quantize amplitudes
-    QUANT_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
+    # - 0.05     --> 0
+    # 0.05 - 0.1 --> 0.25
+    # 0.1 - 0.2  --> 0.5
+    # 0.2 - 0.4  --> 0.75
+    # 0.4 +      --> 1.0
+    chroma_quant = spline_quantize(chroma)
 
-    chroma_quant = torch.zeros_like(chroma)
-
-    for cur_quant_step_idx, cur_quant_step in enumerate(QUANT_STEPS):
-        chroma_quant += (chroma > cur_quant_step) * QUANT_WEIGHTS[cur_quant_step_idx]
-
-    if win_len_smooth:
-        win = smoothing_window(win_len_smooth + 2)
+    if win_len_smooth:  # Apply temporal smoothing
+        win = smoothing_window(win_len_smooth + 2, device=chroma_quant.device)
         win /= torch.sum(win)
-        cens = conv1d(chroma_quant.unsqueeze(0), win, padding="same").squeeze(0)  # Apply temporal smoothing
+        cens = conv1d(chroma_quant.unsqueeze(0), win.tile(12, 1, 1), groups=chroma.shape[0], padding="same").squeeze(0)
     else:
         cens = chroma_quant
 
     return cens / torch.norm(cens, p=2, dim=0)  # L2-Normalization
+
+
+from .constantq import cqt
+
+
+def chroma_cqt(
+    y,
+    sr,
+    hop_length=1024,
+    fmin=None,
+    threshold=0.0,
+    tuning=None,
+    n_chroma=12,
+    n_octaves=7,
+    window=None,
+    bins_per_octave=36,
+    norm=True,
+):
+
+    # Build the CQT if we don't have one already
+    C = torch.abs(
+        cqt(
+            y,
+            sr=sr,
+            hop_length=hop_length,
+            fmin=fmin,
+            n_bins=n_octaves * bins_per_octave,
+            bins_per_octave=bins_per_octave,
+            tuning=tuning,
+        )
+    )
+
+    # Map to chroma
+    cq_to_chr = cq_to_chroma(
+        C.shape[0], C.device, bins_per_octave=bins_per_octave, n_chroma=n_chroma, fmin=fmin, window=window
+    )
+    chroma = cq_to_chr @ C
+
+    if threshold is not None:
+        chroma[chroma < threshold] = 0.0
+
+    if norm:
+        chroma = chroma / chroma.max()
+
+    return chroma

@@ -12,8 +12,8 @@ def power_to_db(magnitude, ref_value=torch.ones(()), amin=torch.tensor(1e-10), t
     return log_spec
 
 
-def hz_to_mel(frequencies, htk=False):
-    frequencies = torch.tensor(frequencies)
+def hz_to_mel(frequencies, htk=False, device="cpu"):
+    frequencies = torch.tensor(frequencies, device=device)
 
     if htk:
         return 2595.0 * torch.log10(1.0 + frequencies / 700.0)
@@ -42,8 +42,6 @@ def hz_to_mel(frequencies, htk=False):
 
 
 def mel_to_hz(mels, htk=False):
-    mels = torch.tensor(mels)
-
     if htk:
         return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
 
@@ -70,6 +68,7 @@ def mel_to_hz(mels, htk=False):
 
 def cq_to_chroma(
     n_input,
+    device,
     bins_per_octave=12,
     n_chroma=12,
     fmin=None,
@@ -84,20 +83,19 @@ def cq_to_chroma(
         fmin = note_to_hz("C1")
 
     # Tile the identity to merge fractional bins
-    cq_to_ch = torch.repeat(torch.eye(n_chroma), n_merge, axis=1)
+    cq_to_ch = torch.repeat_interleave(torch.eye(n_chroma, device=device), round(n_merge), dim=1)
 
     # Roll it left to center on the target bin
-    cq_to_ch = torch.roll(cq_to_ch, -int(n_merge // 2), axis=1)
+    cq_to_ch = torch.roll(cq_to_ch, -int(n_merge // 2), dims=1)
 
     # How many octaves are we repeating?
-    n_octaves = torch.ceil(torch.float(n_input) / bins_per_octave)
+    n_octaves = np.ceil(float(n_input) / bins_per_octave)
 
     # Repeat and trim
-    cq_to_ch = torch.tile(cq_to_ch, int(n_octaves))[:, :n_input]
+    cq_to_ch = torch.tile(cq_to_ch, (1, int(n_octaves)))[:, :n_input]
 
-    # What's the note number of the first bin in the CQT?
-    # midi uses 12 bins per octave here
-    midi_0 = torch.mod(hz_to_midi(fmin), 12)
+    # What's the note number of the first bin in the CQT? midi uses 12 bins per octave here
+    midi_0 = hz_to_midi(fmin) % 12
 
     if base_c:
         # rotate to C
@@ -111,10 +109,10 @@ def cq_to_chroma(
     roll = int(torch.round(roll * (n_chroma / 12.0)))
 
     # Apply the roll
-    cq_to_ch = torch.roll(cq_to_ch, roll, axis=0).astype(dtype)
+    cq_to_ch = torch.roll(cq_to_ch, roll, dims=0).to(dtype)
 
     if window is not None:
-        cq_to_ch = conv2d(cq_to_ch, torch.atleast_2d(window), padding="same")
+        cq_to_ch = conv2d(cq_to_ch, window, padding="same")
 
     return cq_to_ch
 
@@ -129,4 +127,4 @@ def hz_to_midi(frequencies):
 
 
 def note_to_hz(note):
-    return torch.tensor(rosa.core.convert.note_to_hz(note))
+    return torch.tensor(rosa.core.convert.note_to_hz(note)).float()

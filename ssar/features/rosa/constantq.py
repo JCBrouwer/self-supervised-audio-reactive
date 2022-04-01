@@ -10,9 +10,7 @@ from .spectral import stft
 HANN_BANDWIDTH = 1.50018310546875
 
 
-def cqt(
-    y, sr, hop_length=1024, fmin=None, n_bins=84, bins_per_octave=12, tuning=0.0, filter_scale=1, norm=1, sparsity=0.01
-):
+def cqt(y, sr, hop_length=1024, fmin=None, n_bins=84, bins_per_octave=12, tuning=0.0, filter_scale=1, sparsity=0.01):
     # CQT is the special case of VQT with gamma=0
     return vqt(
         y=y,
@@ -24,7 +22,6 @@ def cqt(
         bins_per_octave=bins_per_octave,
         tuning=tuning,
         filter_scale=filter_scale,
-        norm=norm,
         sparsity=sparsity,
     )
 
@@ -39,7 +36,6 @@ def vqt(
     bins_per_octave=12,
     tuning=0.0,
     filter_scale=1,
-    norm=1,
     sparsity=0.01,
 ):
     # How many octaves are we dealing with?
@@ -86,28 +82,22 @@ def vqt(
     for i in range(n_octaves):
         # Resample (except first time)
         if i > 0:
-            if len(my_y) < 2:
-                raise Exception(
-                    "Input signal length={} is too short for " "{:d}-octave CQT/VQT".format(len_orig, n_octaves)
-                )
-
-            my_y = resample(my_y, my_sr, my_sr / 2, res_type="kaiser_window")
-
+            my_y = resample(my_y, my_sr, my_sr / 2, resampling_method="kaiser_window")
+            my_y *= np.sqrt(2)  # rescale signal to keep approximately equal total energy
             my_sr /= 2.0
             my_hop //= 2
 
         fft_basis, n_fft, _ = __cqt_filter_fft(
-            my_sr,
-            fmin_t * 2.0 ** -i,
-            n_filters,
-            bins_per_octave,
-            filter_scale,
-            norm,
-            sparsity,
+            sr=my_sr,
+            fmin=fmin_t * 2.0 ** -i,
+            n_bins=n_filters,
+            bins_per_octave=bins_per_octave,
+            filter_scale=filter_scale,
+            sparsity=sparsity,
             gamma=gamma,
         )
         # Re-scale the filters to compensate for downsampling
-        fft_basis[:] *= np.sqrt(2 ** i)
+        fft_basis *= np.sqrt(2 ** i)
 
         # Compute the vqt filter response and append to the stack
         vqt_resp.append(__cqt_response(my_y, n_fft, my_hop, fft_basis))
@@ -127,27 +117,14 @@ def vqt(
     return V
 
 
-def __cqt_filter_fft(
-    sr,
-    fmin,
-    n_bins,
-    bins_per_octave,
-    filter_scale,
-    norm,
-    sparsity,
-    hop_length=None,
-    window=torch.hann_window,
-    gamma=0.0,
-):
+def __cqt_filter_fft(sr, fmin, n_bins, bins_per_octave, filter_scale, sparsity, hop_length=None, gamma=0.0):
     basis, lengths = constant_q(
         sr,
         fmin=fmin,
         n_bins=n_bins,
         bins_per_octave=bins_per_octave,
         filter_scale=filter_scale,
-        norm=norm,
         pad_fft=True,
-        window=window,
         gamma=gamma,
     )
 
@@ -173,33 +150,34 @@ def sparsify_rows(x, quantile=0.01):
     mags = torch.abs(x)
     norms = torch.sum(mags, axis=1, keepdims=True)
 
-    mag_sort = torch.sort(mags, axis=1)
+    mag_sort = torch.sort(mags, axis=1).values
     cumulative_mag = torch.cumsum(mag_sort / norms, axis=1)
 
-    threshold_idx = torch.argmin(cumulative_mag < quantile, axis=1)
+    threshold_idx = torch.argmin((cumulative_mag < quantile).to(torch.uint8), axis=1)
 
     idxs, vals = [], []
     for i, j in enumerate(threshold_idx):
-        idx = torch.where(mags[i] >= mag_sort[i, j])
-        idxs.append(torch.cartesian_prod(torch.tensor([i]), idx.nonzero()))
+        idx = torch.where(mags[i] >= mag_sort[i, j])[0]
+        idxs.append(torch.cartesian_prod(torch.tensor([i], device=idx.device), idx))
         vals.append(x[i, idx])
 
-    return torch.sparse_coo_tensor(torch.cat(idxs), torch.cat(vals), size=x.shape, dtype=x.dtype, device=x.device)
+    return torch.sparse_coo_tensor(
+        torch.cat(idxs).permute(1, 0), torch.cat(vals), size=x.shape, dtype=x.dtype, device=x.device
+    )
 
 
 def __trim_stack(cqt_resp, n_bins):
     """Helper function to trim and stack a collection of CQT responses"""
 
     max_col = min(c_i.shape[-1] for c_i in cqt_resp)
-    cqt_out = torch.empty((n_bins, max_col), order="F")
+    cqt_out = torch.empty((n_bins, max_col), dtype=cqt_resp[0].dtype, device=cqt_resp[0].device)
 
     # Copy per-octave data into output array
     end = n_bins
     for c_i in cqt_resp:
         # By default, take the whole octave
         n_oct = c_i.shape[0]
-        # If the whole octave is more than we can fit,
-        # take the highest bins from c_i
+        # If the whole octave is more than we can fit, take the highest bins from c_i
         if end < n_oct:
             cqt_out[:end] = c_i[-end:, :max_col]
         else:
@@ -232,14 +210,14 @@ def __num_two_factors(x):
 
 def cqt_frequencies(n_bins, fmin, bins_per_octave=12, tuning=0.0):
     correction = 2.0 ** (float(tuning) / bins_per_octave)
-    frequencies = 2.0 ** (torch.arange(0, n_bins, dtype=float) / bins_per_octave)
+    frequencies = 2.0 ** (torch.arange(0, n_bins, dtype=torch.float, device=fmin.device) / bins_per_octave)
     return correction * fmin * frequencies
 
 
 def constant_q_lengths(sr, fmin, n_bins=84, bins_per_octave=12, filter_scale=1, gamma=0):
     alpha = 2.0 ** (1.0 / bins_per_octave) - 1.0
     Q = float(filter_scale) / alpha
-    freq = fmin * (2.0 ** (torch.arange(n_bins, dtype=float) / bins_per_octave))  # Compute the frequencies
+    freq = fmin * (2.0 ** (torch.arange(n_bins, dtype=torch.float, device=fmin.device) / bins_per_octave))
     lengths = Q * sr / (freq + gamma / alpha)  # Convert frequencies to filter lengths
     return lengths
 
@@ -252,7 +230,6 @@ def constant_q(
     filter_scale=1,
     pad_fft=True,
     gamma=0,
-    **kwargs,
 ):
     if fmin is None:
         fmin = note_to_hz("C1")
@@ -262,14 +239,17 @@ def constant_q(
         sr, fmin, n_bins=n_bins, bins_per_octave=bins_per_octave, filter_scale=filter_scale, gamma=gamma
     )
 
-    freqs = fmin * (2.0 ** (torch.arange(n_bins, dtype=float) / bins_per_octave))
+    freqs = fmin * (2.0 ** (torch.arange(n_bins, dtype=torch.float, device=fmin.device) / bins_per_octave))
 
     # Build the filters
     filters = []
     for ilen, freq in zip(lengths, freqs):
         # Build the filter: note, length will be ceil(ilen)
-        sig = torch.exp(torch.arange(-ilen // 2, ilen // 2, dtype=float) * 1j * 2 * torch.pi * freq / sr)
-        sig = sig * torch.hann_window(len(sig))  # Apply the windowing function
+        ilen2 = torch.div(ilen, 2, rounding_mode="floor")
+        sig = torch.exp(
+            torch.arange(-ilen2, ilen2, dtype=torch.float, device=freqs.device) * 1j * 2 * torch.pi * freq / sr
+        )
+        sig = sig * torch.hann_window(len(sig), device=sig.device)  # Apply the windowing function
         sig = sig / sig.norm(p=1, dim=0)  # Normalize
         filters.append(sig)
 
@@ -280,14 +260,12 @@ def constant_q(
     else:
         max_len = int(torch.ceil(max_len))
 
-    filters = torch.tensor([pad_center(filt, max_len, **kwargs) for filt in filters])
+    filters = torch.stack([pad_center(filt, max_len) for filt in filters])
 
-    return filters, torch.tensor(lengths)
+    return filters, lengths
 
 
-def pad_center(data, size, axis=-1, **kwargs):
+def pad_center(data, size, axis=-1):
     n = data.shape[axis]
     lpad = int((size - n) // 2)
-    lengths = [(0, 0)] * data.ndim
-    lengths[axis] = (lpad, int(size - n - lpad))
-    return pad(data, lengths, mode="constant")
+    return pad(data, (lpad, int(size - n - lpad)), mode="constant")

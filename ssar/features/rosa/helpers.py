@@ -1,5 +1,4 @@
 import torch
-from torch.nn.functional import pad
 
 
 def sync_agg(data, slices, aggregate=torch.mean, axis=-1):
