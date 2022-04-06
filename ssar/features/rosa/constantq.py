@@ -189,7 +189,7 @@ def __trim_stack(cqt_resp, n_bins):
 
 
 def __cqt_response(y, n_fft, hop_length, fft_basis, mode="reflect"):
-    D = stft(y, n_fft=n_fft, hop_length=hop_length, window=None, pad_mode=mode)
+    D = stft(y, n_fft=n_fft, hop_length=hop_length, window=None, pad_mode=mode)[:, :-1]
     return fft_basis.mm(D)
 
 

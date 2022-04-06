@@ -11,8 +11,8 @@ import torch
 import torchaudio as ta
 import torchvision as tv
 from einops import rearrange
-from ssar.metrics.chroma import chromatic_reactivity, my_chromagram
-from ssar.metrics.rhythmic import my_audio_onsets, rhythmic_reactivity
+from ssar.metrics.chroma import my_chromagram
+from ssar.metrics.rhythmic import my_audio_onsets
 from ssar.supervised.data import audio2features, gaussian_filter
 from ssar.supervised.latent_augmenter import LatentAugmenter, spline_loop_latents
 from torch.nn.functional import interpolate
@@ -30,7 +30,7 @@ G = StyleGAN2(ckpt)
 G = G.eval().cuda()
 LA = LatentAugmenter(ckpt, n_patches=5)
 FPS = 24
-DUR = 24
+DUR = 12
 N = DUR * FPS
 SR = 1024 * FPS
 
@@ -101,6 +101,31 @@ def high_onset_correlation():
     return audio, sr, get_video(latents, noise), FPS
 
 
+def high_both_correlation():
+    audio, sr = get_random_audio()
+
+    chroma = my_chromagram(audio.cpu().numpy(), sr).cuda()
+    chroma /= chroma.sum(1, keepdim=True)
+
+    ons = my_audio_onsets(audio.cpu().numpy(), sr).squeeze().cuda()
+
+    ws = G.mapper(torch.randn((14, 512), device="cuda"))
+
+    latents = (
+        torch.einsum("TC,CNL->TNL", chroma[:12], ws)
+        + ws[[13]] * ons.reshape(-1, 1, 1)
+        + ws[[14]] * (1 - ons.reshape(-1, 1, 1))
+    ) / 2
+
+    latents = gaussian_filter(latents, FPS / 24)
+
+    noise = gaussian_filter(torch.randn((len(ons), 1, 64, 64), device="cuda"), 3 * FPS / 24)
+    noise /= noise.std()
+    noise *= ons.reshape(-1, 1, 1, 1)
+
+    return audio, sr, get_video(latents, noise), FPS
+
+
 def test_set_correlation():
     video_file = random.choice(glob("/home/hans/datasets/audiovisual/maua256/*"))
     v = de.VideoReader(video_file)
@@ -124,24 +149,23 @@ def test_set_correlation():
 
 
 if __name__ == "__main__":
-    od = "output/maua_correlation_test"
-    with torch.inference_mode(), tqdm(total=250) as progress:
-        for i in range(60):
+    od = "output/maua_correlation_test2"
+    with torch.inference_mode(), tqdm(total=6 * 120) as progress:
+        for i in range(120):
             for correlation in [
                 low_correlation,
                 medium_correlation,
+                test_set_correlation,
                 high_chroma_correlation,
                 high_onset_correlation,
-                test_set_correlation,
+                high_both_correlation,
             ]:
                 try:
                     t = time()
                     audio, sr, video, fps = correlation()
                     audio, video = audio.cpu(), video.cpu()
-                    cr = chromatic_reactivity(audio, sr, video, fps)
-                    rr = rhythmic_reactivity(audio, sr, video, fps)
                     audio, video = ta.functional.resample(audio, SR, 22050).unsqueeze(0), video.permute(0, 2, 3, 1)
-                    file = f"{od}/{correlation.__name__}_{str(uuid4())[:6]}_chroma={cr:.4f}_rhythmic={rr:.4f}.mp4"
+                    file = f"{od}/{correlation.__name__}_{str(uuid4())[:6]}.mp4"
                     tv.io.write_video(file, video.mul(255), fps, audio_array=audio, audio_fps=22050, audio_codec="aac")
                 except:
                     progress.write(f"\nError: {correlation.__name__}")

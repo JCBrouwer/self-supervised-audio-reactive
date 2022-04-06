@@ -38,23 +38,17 @@ def fourier_tempogram(
     return stft(onset_envelope, n_fft=win_length, hop_length=1, center=center, window=window)
 
 
-def plp(
-    y,
-    sr,
-    hop_length=1024,
-    win_length=1024,
-    tempo_min=60,
-    tempo_max=180,
-):
+def plp(y, sr, hop_length=1024, win_length=1024, tempo_min=60, tempo_max=180):
     onset_envelope = onset_strength(
         y=y, sr=sr, hop_length=hop_length, aggregate=lambda *args, **kwargs: torch.median(*args, **kwargs).values
     )
 
     # Step 2: get the fourier tempogram
-    ftgram = fourier_tempogram(onset_envelope=onset_envelope, sr=sr, hop_length=hop_length, win_length=win_length)
+    max_win_len = min(len(onset_envelope), win_length)
+    ftgram = fourier_tempogram(onset_envelope=onset_envelope, sr=sr, hop_length=hop_length, win_length=max_win_len)
 
     # Step 3: pin to the feasible tempo range
-    tempo_frequencies = fourier_tempo_frequencies(sr=sr, hop_length=hop_length, win_length=win_length, device=y.device)
+    tempo_frequencies = fourier_tempo_frequencies(sr=sr, hop_length=hop_length, win_length=max_win_len, device=y.device)
 
     if tempo_min is not None:
         ftgram[tempo_frequencies < tempo_min] = 0
@@ -72,7 +66,7 @@ def plp(
     ftgram = ftgram / (torch.finfo(ftgram.dtype).tiny ** 0.5 + absmaxabs)
 
     # Step 5: invert the Fourier tempogram to get the pulse
-    pulse = istft(ftgram, n_fft=win_length, hop_length=1, length=len(onset_envelope))
+    pulse = istft(ftgram, n_fft=max_win_len, hop_length=1, length=len(onset_envelope))
 
     # Step 6: retain only the positive part of the pulse cycle
     pulse = torch.clamp(pulse, torch.zeros((), device=pulse.device), pulse.max())

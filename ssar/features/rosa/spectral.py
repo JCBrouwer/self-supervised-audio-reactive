@@ -1,13 +1,10 @@
 import numpy as np
 import torch
-from torch.nn.functional import conv1d, pad
+from torch.nn.functional import conv1d
 from torchcubicspline import natural_cubic_spline_coeffs
 
 from ..processing import median_filter_2d
-from .convert import cq_to_chroma, hz_to_mel, mel_to_hz, power_to_db
-from .helpers import sync_agg
-
-
+from .convert import cq_to_chroma, hz_to_mel, mel_to_hz
 
 
 def stft(
@@ -60,7 +57,8 @@ def dct(x, norm=None):
 
 
 def spectrogram(y, n_fft=2048, hop_length=1024, power=1, window=torch.hann_window, center=True, pad_mode="reflect"):
-    S = torch.abs(stft(y, n_fft=n_fft, hop_length=hop_length, center=center, window=window, pad_mode=pad_mode)) ** power
+    y_stft = stft(y, n_fft=n_fft, hop_length=hop_length, center=center, window=window, pad_mode=pad_mode)[:, :-1]
+    S = torch.abs(y_stft) ** power
     return S
 
 
@@ -196,7 +194,7 @@ def spline_eval(t, coeffs):
     maxlen = b.size(-2) - 1
     index = torch.bucketize(t.detach(), y) - 1
     index = index.clamp(0, maxlen)  # clamp because t may go outside of [t[0], t[-1]]
-    # this is fine will never access the last element of y; this is correct behaviour
+    # this is fine. we'll never access the last element of y. this is correct behaviour
     fractional_part = t - y[index]
     fractional_part = fractional_part.unsqueeze(-1)
     inner = c[..., index, :] + d[..., index, :] * fractional_part

@@ -48,7 +48,7 @@ def gaussian_filter(x, sigma, mode="circular", causal=1):
     return x
 
 
-@torch.jit.script
+# @torch.jit.script
 def normalize(array):
     array = array - array.min()
     array = array / array.max()
@@ -84,15 +84,15 @@ def median_filter_2d(
     return x
 
 
-@torch.jit.script
+# @torch.jit.script
 def spectral_flux(spec):
     return torch.diff(spec, dim=0, append=torch.zeros((1, spec.shape[1]), device=spec.device))
 
 
-@torch.jit.script
+# @torch.jit.script
 def onset_envelope(flux):
     u = torch.sum(0.5 * (flux + torch.abs(flux)), dim=1)
-    u = torch.clamp(u, torch.quantile(u, 0.025), torch.quantile(u, 0.975))
+    u = torch.clamp(u, quantile(u, 0.025), quantile(u, 0.975))
     u -= u.min()
     u /= u.max()
     return u

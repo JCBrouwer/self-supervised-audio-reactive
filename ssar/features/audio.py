@@ -25,27 +25,27 @@ def percussive(audio, margin=8.0):
 
 
 def onsets(audio, sr):
-    return onset_strength(percussive(audio), sr)
-
-
-def chromagram(audio, sr):
-    return chroma_cens(harmonic(audio), sr)
+    return onset_strength(percussive(audio), sr).unsqueeze(-1)
 
 
 def rms(y, sr, frame_length=2048, hop_length=1024, center=True, pad_mode="reflect"):
     if center:
         p = int(frame_length // 2)
         y = pad(y.unsqueeze(0), (p, p), mode=pad_mode).squeeze()
-    x = y.unfold(0, frame_length, hop_length)
+    x = y.unfold(0, frame_length, hop_length)[:-1]
     power = torch.mean(torch.abs(x) ** 2, dim=1)
-    return torch.sqrt(power)
+    return torch.sqrt(power).unsqueeze(-1)
 
 
 def drop_strength(audio, sr):
-    return torch.sigmoid(normalize(gaussian_filter(rms(audio, sr), 10)) * 10 - 5)
+    return torch.sigmoid(normalize(gaussian_filter(rms(audio, sr), 10)) * 10 - 5).unsqueeze(-1)
 
 
-def tonnetz(y, sr, chroma_fn=chromagram):
+def chromagram(audio, sr):
+    return chroma_cens(harmonic(audio), sr).T
+
+
+def tonnetz(y, sr, chroma_fn=lambda a, sr: chromagram(a, sr).T):
     chroma = chroma_fn(y, sr)
     dim_map = torch.linspace(0, 12, chroma.shape[0], device=y.device)  # Generate Transformation matrix
     scale = torch.tensor([7.0 / 6, 7.0 / 6, 3.0 / 2, 3.0 / 2, 2.0 / 3, 2.0 / 3], device=y.device)
@@ -53,7 +53,8 @@ def tonnetz(y, sr, chroma_fn=chromagram):
     V[::2] -= 0.5  # Even rows compute sin()
     R = torch.tensor([1, 1, 1, 1, 0.5, 0.5], device=y.device)  # Fifths  # Minor  # Major
     phi = R[:, None] * torch.cos(torch.pi * V)
-    return phi @ (chroma / chroma.norm(p=1, dim=0))
+    ton = phi @ (chroma / chroma.norm(p=1, dim=0))
+    return ton.T
 
 
 def mfcc(y, sr, n_mfcc=20, norm=False, **kwargs):
@@ -61,11 +62,11 @@ def mfcc(y, sr, n_mfcc=20, norm=False, **kwargs):
     M = dct(S.permute(1, 0), norm="ortho").permute(1, 0)[:n_mfcc]
     if norm == True:
         M = M / M.norm(p=2)
-    return M
+    return M.T
 
 
 def pulse(audio, sr):
-    return plp(percussive(audio), sr)
+    return plp(percussive(audio), sr).unsqueeze(-1)
 
 
 def spectral_contrast(
@@ -117,9 +118,9 @@ def spectral_contrast(
         peak[k] = torch.mean(sortedr[-idx:], dim=0)
 
     if linear:
-        return peak - valley
+        return (peak - valley).T
     else:
-        return power_to_db(peak) - power_to_db(valley)
+        return (power_to_db(peak) - power_to_db(valley)).T
 
 
 def spectral_flatness(
@@ -127,9 +128,9 @@ def spectral_flatness(
 ):
     S = spectrogram(y=y, n_fft=n_fft, hop_length=hop_length, power=1.0, window=window, center=center, pad_mode=pad_mode)
     S_thresh = torch.maximum(torch.tensor(amin, device=y.device), S ** power)
-    gmean = torch.exp(torch.mean(torch.log(S_thresh), axis=0, keepdims=True))
-    amean = torch.mean(S_thresh, axis=0, keepdims=True)
-    return gmean / amean
+    gmean = torch.exp(torch.mean(torch.log(S_thresh), axis=0))
+    amean = torch.mean(S_thresh, axis=0)
+    return (gmean / amean).unsqueeze(-1)
 
 
 if __name__ == "__main__":
@@ -148,11 +149,11 @@ if __name__ == "__main__":
     features = [
         ("onsets", partial(rosa.onset.onset_strength, hop_length=1024), onset_strength, onsets, "plot"),
         ("rms", partial(rosa.feature.rms, hop_length=1024), rms, drop_strength, "plot"),
-        ("chroma", partial(rosa.feature.chroma_cens, hop_length=1024), chroma_cens, chromagram, "chroma"),
-        ("tonnetz", partial(rosa.feature.tonnetz, hop_length=1024), partial(tonnetz, chroma_fn=chroma_cqt), tonnetz, "tonnetz"),
-        ("mfcc", partial(rosa.feature.mfcc, hop_length=1024), mfcc, mfcc, None),
+        ("chroma", partial(rosa.feature.chroma_cens, hop_length=1024), chroma_cens, lambda a,sr: chromagram(a, sr).T, "chroma"),
+        ("tonnetz", partial(rosa.feature.tonnetz, hop_length=1024), lambda a, sr : tonnetz(a, sr, chroma_fn=chroma_cqt).T, lambda a, sr : tonnetz(a, sr).T, "tonnetz"),
+        ("mfcc", partial(rosa.feature.mfcc, hop_length=1024), lambda a,sr: mfcc(a,sr).T, lambda a,sr: mfcc(a,sr).T, None),
         ("pulse", partial(rosa.beat.plp, win_length=1024, tempo_min=60, tempo_max=180, hop_length=1024), plp, pulse, "plot"),
-        ("contrast", partial(rosa.feature.spectral_contrast, hop_length=1024), spectral_contrast, spectral_contrast, None),
+        ("contrast", partial(rosa.feature.spectral_contrast, hop_length=1024), lambda a,sr: spectral_contrast(a,sr).T, lambda a,sr: spectral_contrast(a,sr).T, None),
         ("flatness", lambda y, s: rosa.feature.spectral_flatness(y, hop_length=1024), spectral_flatness, spectral_flatness, 'plot'),
     ]
     # fmt:on
@@ -205,5 +206,5 @@ if __name__ == "__main__":
     ax[0, 0].set_ylabel("numpy")
     ax[1, 0].set_ylabel("torch")
     ax[2, 0].set_ylabel("noice")
-    plt.tight_layout()
-    plt.show()
+    plt.savefig("output/rosa_torch_audio_feature_comparison.pdf")
+    plt.close()
