@@ -42,13 +42,11 @@ def vqt(
     n_octaves = int(np.ceil(float(n_bins) / bins_per_octave))
     n_filters = min(bins_per_octave, n_bins)
 
-    len_orig = len(y)
-
     # Relative difference in frequency between any two consecutive bands
     alpha = 2.0 ** (1.0 / bins_per_octave) - 1
 
     if fmin is None:
-        fmin = note_to_hz("C1")  # C1 by default
+        fmin = note_to_hz("C1").to(y)  # C1 by default
 
     if tuning is None:
         tuning = estimate_tuning(y=y, sr=sr, bins_per_octave=bins_per_octave)
@@ -80,7 +78,7 @@ def vqt(
 
     # Iterate down the octaves
     for i in range(n_octaves):
-        # Resample (except first time)
+        # Resample (except first time
         if i > 0:
             my_y = resample(my_y, my_sr, my_sr / 2, resampling_method="kaiser_window")
             my_y *= np.sqrt(2)  # rescale signal to keep approximately equal total energy

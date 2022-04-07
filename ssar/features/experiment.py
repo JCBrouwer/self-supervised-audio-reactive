@@ -77,7 +77,7 @@ class AudioVisualDataset(Dataset):
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        data_dir = "output/maua_correlation_test/"
+        data_dir = "output/maua_correlation_test2/"
 
         low = sorted(glob(f"{data_dir}/low*"))
         medium = sorted(glob(f"{data_dir}/medium*"))
@@ -129,13 +129,13 @@ if __name__ == "__main__":
 
         df.to_csv("output/audiovisual_correlations2.csv")
         df = pd.read_csv("output/audiovisual_correlations2.csv", index_col=0)
-        grouped = df.groupby("group").agg(["mean", "std"])
+        grouped = df.groupby("group").agg(["median", "std"])
 
         stats = []
         for col in grouped.columns[::2]:
             name, _ = col
             af, vf = name.split("_X_")
-            means = grouped[(name, "mean")]
+            means = grouped[(name, "median")]
             stds = grouped[(name, "std")]
             for group in ["low", "medium", "test", "hions", "hichr", "hibot"]:
                 group_name = (
@@ -146,7 +146,9 @@ if __name__ == "__main__":
                     .replace("hichr", "Pure chroma patch (high correlation)")
                     .replace("hibot", "Onset & chroma patch (high correlation)")
                 )
-                stats.append({"audio": af, "video": vf, "group": group_name, "mean": means[group], "std": stds[group]})
+                stats.append(
+                    {"audio": af, "video": vf, "group": group_name, "median": means[group], "std": stds[group]}
+                )
         stats = pd.DataFrame(stats)
         print(stats)
 
@@ -162,12 +164,12 @@ if __name__ == "__main__":
             g.ax_marg_y.cla()
             g.ax_marg_x.cla()
             sns.heatmap(
-                data=groupstats["mean"].values.reshape(V, A).T,
+                data=groupstats["median"].values.reshape(V, A).T,
                 ax=g.ax_joint,
                 cbar=False,
                 cmap=hot,
                 vmin=0,
-                vmax=stats["mean"].max(),
+                vmax=stats["median"].max(),
             )
 
             make_axes_locatable(g.ax_marg_x).append_axes("left", size="10%", pad="20%").axis("off")
@@ -175,8 +177,8 @@ if __name__ == "__main__":
             g.fig.colorbar(g.ax_joint.get_children()[1], cax=cax)
             cax.yaxis.set_ticks_position("left")
 
-            audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["mean"].mean().values
-            video_feature_marginals = groupstats.groupby(["video"], sort=False)["mean"].mean().values
+            audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["median"].mean().values
+            video_feature_marginals = groupstats.groupby(["video"], sort=False)["median"].mean().values
             g.ax_marg_y.barh(np.arange(0.5, A), audio_feature_marginals, color=hot(audio_feature_marginals))
             g.ax_marg_x.bar(np.arange(0.5, V), video_feature_marginals, color=hot(video_feature_marginals))
 
