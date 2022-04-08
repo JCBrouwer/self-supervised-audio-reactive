@@ -25,7 +25,7 @@ def percussive(audio, margin=8.0):
 
 
 def onsets(audio, sr):
-    return onset_strength(percussive(audio), sr).unsqueeze(-1)
+    return normalize(onset_strength(percussive(audio), sr).unsqueeze(-1))
 
 
 def rms(y, sr, frame_length=2048, hop_length=1024, center=True, pad_mode="reflect"):

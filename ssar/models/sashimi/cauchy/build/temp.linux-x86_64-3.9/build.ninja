@@ -1,0 +1,29 @@
+ninja_required_version = 1.3
+cxx = /home/jcbgb/anaconda3/envs/ssar/bin/x86_64-conda_cos6-linux-gnu-c++
+nvcc = /home/jcbgb/anaconda3/envs/ssar/bin/nvcc
+
+cflags = -Wno-unused-result -Wsign-compare -DNDEBUG -O2 -Wall -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/jcbgb/anaconda3/envs/ssar/include -I/home/jcbgb/anaconda3/envs/ssar/include -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/jcbgb/anaconda3/envs/ssar/include -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/jcbgb/anaconda3/envs/ssar/include -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/jcbgb/anaconda3/envs/ssar/include -fPIC -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/TH -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/THC -I/home/jcbgb/anaconda3/envs/ssar/include -I/home/jcbgb/anaconda3/envs/ssar/include/python3.9 -c
+post_cflags = -g -march=native -funroll-loops -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=cauchy_mult -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++14
+cuda_cflags = -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/TH -I/home/jcbgb/anaconda3/envs/ssar/lib/python3.9/site-packages/torch/include/THC -I/home/jcbgb/anaconda3/envs/ssar/include -I/home/jcbgb/anaconda3/envs/ssar/include/python3.9 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O2 -lineinfo --use_fast_math -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=cauchy_mult -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_61,code=compute_61 -gencode=arch=compute_61,code=sm_61 -ccbin /home/jcbgb/anaconda3/envs/ssar/bin/x86_64-conda_cos6-linux-gnu-cc -std=c++14
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc  $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+build /home/hans/code/selfsupervisedaudioreactive/ssar/models/sashimi/cauchy/build/temp.linux-x86_64-3.9/cauchy.o: compile /home/hans/code/selfsupervisedaudioreactive/ssar/models/sashimi/cauchy/cauchy.cpp
+build /home/hans/code/selfsupervisedaudioreactive/ssar/models/sashimi/cauchy/build/temp.linux-x86_64-3.9/cauchy_cuda.o: cuda_compile /home/hans/code/selfsupervisedaudioreactive/ssar/models/sashimi/cauchy/cauchy_cuda.cu
+
+
+
+
+
