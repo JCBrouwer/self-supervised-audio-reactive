@@ -7,7 +7,7 @@ from torch.nn.functional import conv1d, pad
 from torchaudio.functional import contrast, highpass_biquad, lowpass_biquad
 
 
-def gaussian_filter(x, sigma, mode="circular", causal=1):
+def gaussian_filter(x, sigma, mode: str = "circular", causal: float = 1):
     dim = len(x.shape)
     n_frames = x.shape[0]
     while len(x.shape) < 3:
@@ -18,7 +18,7 @@ def gaussian_filter(x, sigma, mode="circular", causal=1):
 
     kernel = torch.arange(-radius, radius + 1, dtype=torch.float32, device=x.device)
     kernel = torch.exp(-0.5 / sigma ** 2 * kernel ** 2)
-    kernel[radius + 1 :] *= causal  # make kernel less responsive to future information
+    # kernel[radius + 1 :] = kernel[radius + 1 :] * causal  # make kernel less responsive to future information
     kernel = kernel / kernel.sum()
     kernel = kernel.view(1, 1, len(kernel)).repeat(channels, 1, 1)
 
@@ -99,47 +99,55 @@ def onset_envelope(flux):
 
 
 def clamp_peaks_percentile(signal, percent):
-    result = []
     if len(signal.shape) < 2:
         signal = signal.unsqueeze(1)
+
+    result = []
     for sig in signal.unbind(1):
         locs = torch.arange(0, sig.shape[0], device=sig.device)
         peaks = torch.ones(sig.shape, dtype=bool, device=sig.device)
-        main = sig.take(locs)
 
-        plus = sig.take((locs + 1).clamp(0, sig.shape[0] - 1))
-        minus = sig.take((locs - 1).clamp(0, sig.shape[0] - 1))
+        main = sig[locs]
+        plus = sig[(locs + 1).clamp(0, sig.shape[0] - 1)]
+        minus = sig[(locs - 1).clamp(0, sig.shape[0] - 1)]
+
         peaks &= torch.gt(main, plus)
         peaks &= torch.gt(main, minus)
 
-        sig = sig.clamp(0, torch.quantile(sig[peaks], percent / 100))
-        sig /= sig.max()
+        sig = torch.clamp(sig, None, torch.quantile(sig[peaks], percent / 100))
+
         result.append(sig)
+
     return torch.stack(result, dim=1)
 
 
 def clamp_upper_percentile(signal, percentile):
-    return torch.clamp(signal, 0, torch.quantile(signal, percentile / 100, dim=0).item())
+    return torch.clamp(signal, None, torch.quantile(signal, percentile / 100, dim=0))
 
 
 def clamp_lower_percentile(signal, percentile):
-    return torch.clamp(signal, torch.quantile(signal, percentile / 100, dim=0).item(), 1)
+    return torch.clamp(signal, torch.quantile(signal, percentile / 100, dim=0), None)
 
 
-def emphasize(envs, strength, cutoff=0.5):
-    return envs * (1 + torch.tanh(strength * (envs - cutoff)))
+def emphasize(envs, strength, percentile):
+    min = envs.min(dim=0).values
+    x = envs - min
+    max = x.max(dim=0).values
+    x = x / max
+    x = x * (1 + torch.tanh(strength * (x - torch.quantile(x, q=percentile / 100, dim=0))))
+    return (x * max) + min
 
 
-def low_pass(audio, sr):
-    return lowpass_biquad(audio, sr, 200)
+def low_pass(audio, sr, fmax=200):
+    return lowpass_biquad(audio, sr, fmax)
 
 
-def mid_pass(audio, sr):
-    return low_pass(high_pass(audio, sr), sr)
+def mid_pass(audio, sr, fmin=200, fmax=4000):
+    return low_pass(high_pass(audio, sr, fmax), sr, fmin)
 
 
-def high_pass(audio, sr):
-    return highpass_biquad(audio, sr, 2000)
+def high_pass(audio, sr, fmin=4000):
+    return highpass_biquad(audio, sr, fmin)
 
 
 def contrast_enhance(audio, sr, strength=75):

@@ -172,7 +172,7 @@ def high_chroma_correlation():
 
     chroma = chromagram(audio, sr)
     chroma = gaussian_filter(chroma, FPS / 24)
-    chroma = emphasize(chroma, strength=3, cutoff=0.75)
+    chroma = emphasize(chroma, strength=3, percentile=75)
     chroma /= chroma.sum(1, keepdim=True)
 
     ws = G.mapper(torch.randn((12, 512), device="cuda"))
@@ -192,7 +192,7 @@ def high_onset_correlation():
 
     ons = onsets(audio, sr).squeeze()
     ons = gaussian_filter(ons, FPS / 24)
-    ons = emphasize(ons, strength=2, cutoff=0.75)
+    ons = emphasize(ons, strength=2, percentile=75)
     ons = normalize(ons)
 
     ws = G.mapper(torch.randn((2, 512), device="cuda"))
@@ -213,12 +213,12 @@ def high_both_correlation():
 
     chroma = chromagram(audio, sr)
     chroma = gaussian_filter(chroma, FPS / 24)
-    chroma = emphasize(chroma, strength=3, cutoff=0.75)
+    chroma = emphasize(chroma, strength=3, percentile=75)
     chroma /= chroma.sum(1, keepdim=True)
 
     ons = onsets(audio, sr).squeeze()
     ons = gaussian_filter(ons, FPS / 24)
-    ons = emphasize(ons, strength=2, cutoff=0.75)
+    ons = emphasize(ons, strength=2, percentiel=75)
     ons = normalize(ons)
 
     ws = G.mapper(torch.randn((14, 512), device="cuda"))

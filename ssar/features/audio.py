@@ -4,7 +4,7 @@ import librosa as rosa
 import torch
 from torch.nn.functional import pad
 
-from .processing import gaussian_filter, normalize
+from .processing import emphasize, gaussian_filter, normalize
 from .rosa.beat import onset_strength, plp
 from .rosa.convert import power_to_db
 from .rosa.spectral import chroma_cens, chroma_cqt, dct, hpss, istft, melspectrogram, spectrogram, stft
@@ -38,7 +38,7 @@ def rms(y, sr, frame_length=2048, hop_length=1024, center=True, pad_mode="reflec
 
 
 def drop_strength(audio, sr):
-    return torch.sigmoid(normalize(gaussian_filter(rms(audio, sr), 10)) * 10 - 5).unsqueeze(-1)
+    return emphasize(gaussian_filter(rms(audio, sr), 10), strength=10, percentile=50)
 
 
 def chromagram(audio, sr):

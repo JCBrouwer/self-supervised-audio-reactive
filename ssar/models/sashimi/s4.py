@@ -80,7 +80,7 @@ try:  # Try pykeops
         return _r2c(r)
 
 
-except ImportError:
+except:
     has_pykeops = False
     if not has_cauchy_extension:
         log.error(

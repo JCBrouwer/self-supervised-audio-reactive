@@ -21,13 +21,13 @@ import torch.nn.functional as F
 import torchaudio
 from scipy import stats
 from scipy.stats import ttest_ind
-from ssar.supervised.data import audio2features
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 from tqdm import tqdm
 
 from ..analysis.sgw import sgw_gpu
 from ..models.audio2latent import Normalize
+from .data import AudioFeatures, audio2features, FEATURE_NAMES
 
 sys.path.append("/home/hans/code/maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
@@ -38,26 +38,6 @@ DUR = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-col_names = [
-    *[f"mfcc_{i}" for i in range(20)],
-    *[f"chroma_{i}" for i in range(12)],
-    *[f"tonnetz_{i}" for i in range(6)],
-    *[f"contrast_{i}" for i in range(7)],
-    "flatness",
-    "onsets",
-    "onsets_low",
-    "onsets_mid",
-    "onsets_high",
-    "pulse",
-    "harmonic_rms",
-    "harmonic_rms_low",
-    "harmonic_rms_mid",
-    "harmonic_rms_high",
-    "rms",
-    "rms_low",
-    "rms_mid",
-    "rms_high",
-]
 feature_names = [
     "mfcc",
     "chroma",
@@ -92,7 +72,7 @@ def feature_plots(in_dir, test_audio):
         print("raw")
         for col in range(features.shape[-1]):
             print(
-                col_names[col],
+                FEATURE_NAMES[col],
                 f"{features[:, :, col].min().item():.4f}",
                 f"{features[:, :, col].mean().item():.4f}",
                 f"{features[:, :, col].max().item():.4f}",
@@ -108,7 +88,7 @@ def feature_plots(in_dir, test_audio):
         print("normalized")
         for col in range(features.shape[-1]):
             print(
-                col_names[col],
+                FEATURE_NAMES[col],
                 f"{norm_feats[:, :, col].min().item():.4f}",
                 f"{norm_feats[:, :, col].mean().item():.4f}",
                 f"{norm_feats[:, :, col].max().item():.4f}",
@@ -124,7 +104,7 @@ def feature_plots(in_dir, test_audio):
 
     import pandas as pd
 
-    df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=col_names)
+    df = pd.DataFrame(norm_feats.squeeze().cpu().numpy(), columns=FEATURE_NAMES)
 
     for col in df.columns:
         plt.plot(df[col].values, label=col)
@@ -191,7 +171,7 @@ def test_output_sensitivity(checkpoint, test_audio, whole_feature=True):
     else:
         col_widths = [1] * 52
         col_idxs = list(range(52))
-        feature_names = col_names
+        feature_names = FEATURE_NAMES
 
     for perturb_name, perturb in [
         ("zeroed", perturb_zero),
@@ -264,7 +244,7 @@ def feature_sensitivity(whole_feature, checkpoint):
     else:
         col_widths = [1] * 52
         col_idxs = list(range(52))
-        feature_names = col_names
+        feature_names = FEATURE_NAMES
 
     trials = 5
 
@@ -485,7 +465,7 @@ def test_latent_augmenter():
                     video.write(frame.unsqueeze(0))
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def _audio2video(
     a2l,
     features,
@@ -502,6 +482,9 @@ def _audio2video(
     outputs = a2l(features)
     if isinstance(outputs, list):
         residuals, noise1, noise2, noise3, noise4 = outputs
+    elif isinstance(outputs, tuple):
+        residuals, noise = outputs
+        noise1, noise2, noise3, noise4 = [n.squeeze() for n in noise]
     else:
         residuals = outputs
         noise1 = noise2 = noise3 = noise4 = None
@@ -528,13 +511,13 @@ def _audio2video(
             for frame in (
                 synthesizer(
                     latents=base_latent + residuals[i : i + batch_size],
-                    noise1=noise1[i : i + batch_size, None],
-                    noise2=noise2[i : i + batch_size, None],
-                    noise3=noise2[i : i + batch_size, None],
-                    noise4=noise3[i : i + batch_size, None],
-                    noise5=noise3[i : i + batch_size, None],
-                    noise6=noise4[i : i + batch_size, None],
-                    noise7=noise4[i : i + batch_size, None],
+                    noise1=noise1[i : i + batch_size, None] if noise is not None else None,
+                    noise2=noise2[i : i + batch_size, None] if noise is not None else None,
+                    noise3=noise2[i : i + batch_size, None] if noise is not None else None,
+                    noise4=noise3[i : i + batch_size, None] if noise is not None else None,
+                    noise5=noise3[i : i + batch_size, None] if noise is not None else None,
+                    noise6=noise4[i : i + batch_size, None] if noise is not None else None,
+                    noise7=noise4[i : i + batch_size, None] if noise is not None else None,
                 )
                 .add(1)
                 .div(2)
@@ -608,7 +591,7 @@ def latent2video(
                 video.write(frame.unsqueeze(0))
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def audio2video(
     a2l,
     a2f,
@@ -634,26 +617,6 @@ def audio2video(
     _audio2video(
         a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration, seed
     )
-
-
-class AudioFeatures(Dataset):
-    def __init__(self, directory, a2f, dur, fps):
-        super().__init__()
-        self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
-        self.a2f = a2f
-        self.L = dur * fps
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, index):
-        file = self.files[index]
-        audio, sr = torchaudio.load(file)
-        features = self.a2f(audio, sr)
-        features = torch.stack(  # overlapping slices of DUR seconds
-            sum([list(torch.split(features[start:], self.L)[:-1]) for start in range(0, self.L, self.L // 4)], [])
-        )
-        return features
 
 
 class ModuleFromFile:

@@ -1,13 +1,13 @@
+# fmt:off
+
 import io
 import os
 from glob import glob
 from pathlib import Path
 
 import joblib
-import librosa as rosa
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchaudio
 from ffcv.fields import BytesField, IntField, NDArrayField
 from ffcv.fields.decoders import BytesDecoder, IntDecoder, NDArrayDecoder
@@ -15,114 +15,117 @@ from ffcv.loader import Loader, OrderOption
 from ffcv.transforms import ToTensor
 from ffcv.writer import DatasetWriter
 from npy_append_array import NpyAppendArray as NumpyArray
-from scipy import ndimage as ndi
-from scipy import signal
+from ssar.features.audio import (chromagram, drop_strength, harmonic, mfcc,
+                                 onset_strength, percussive, plp, rms,
+                                 spectral_contrast, spectral_flatness, tonnetz)
+from ssar.features.processing import (clamp_lower_percentile,
+                                      clamp_peaks_percentile, emphasize,
+                                      gaussian_filter, high_pass, low_pass,
+                                      mid_pass)
 from torch.utils.data import DataLoader, Dataset
+from torchaudio.functional import resample
 from tqdm import tqdm
 
-
-def low_pass(audio, sr):
-    return signal.sosfilt(signal.butter(12, 200, "low", fs=sr, output="sos"), audio)
+# fmt:on
 
 
-def mid_pass(audio, sr):
-    return signal.sosfilt(signal.butter(12, [200, 2000], "band", fs=sr, output="sos"), audio)
+_FN = [
+    *[f"mfcc_{i}" for i in range(20)],
+    *[f"chroma_{i}" for i in range(12)],
+    *[f"tonnetz_{i}" for i in range(6)],
+    *[f"contrast_{i}" for i in range(7)],
+    "flatness",
+    "onsets",
+    "onsets_low",
+    "onsets_mid",
+    "onsets_high",
+    "pulse",
+    "harmonic_rms",
+    "harmonic_rms_low",
+    "harmonic_rms_mid",
+    "harmonic_rms_high",
+    "long_rms",
+    "long_rms_low",
+    "long_rms_mid",
+    "long_rms_high",
+]
+VELOCITY = False
+if VELOCITY:
+    FEATURE_NAMES = _FN + [n + "_velocity" for n in _FN]
+else:
+    FEATURE_NAMES = _FN
 
 
-def high_pass(audio, sr):
-    return signal.sosfilt(signal.butter(12, 2000, "high", fs=sr, output="sos"), audio)
-
-
-def normalize(x):
-    y = x - x.min()
-    y = y / (y.max() + 1e-8)
-    return y
-
-
-def gaussian_filter(x, sigma, mode="circular", causal=1):
-    dim = len(x.shape)
-    n_frames = x.shape[0]
-    while len(x.shape) < 3:
-        x = x[:, None]
-
-    radius = min(int(sigma * 4), 3 * len(x))
-    channels = x.shape[1]
-
-    kernel = torch.arange(-radius, radius + 1, dtype=torch.float32, device=x.device)
-    kernel = torch.exp(-0.5 / sigma ** 2 * kernel ** 2)
-    kernel[radius + 1 :] *= causal  # make kernel less responsive to future information
-    kernel = kernel / kernel.sum()
-    kernel = kernel.view(1, 1, len(kernel)).repeat(channels, 1, 1)
-
-    if dim == 4:
-        t, c, h, w = x.shape
-        x = x.view(t, c, h * w)
-    x = x.transpose(0, 2)
-
-    if radius > n_frames:  # prevent padding errors on short sequences
-        x = F.pad(x, (n_frames, n_frames), mode=mode)
-        print(
-            f"WARNING: Gaussian filter radius ({int(sigma * 4)}) is larger than number of frames ({n_frames}).\n\t Filter size has been lowered to ({radius}). You might want to consider lowering sigma ({sigma})."
-        )
-        x = F.pad(x, (radius - n_frames, radius - n_frames), mode="replicate")
-    else:
-        x = F.pad(x, (radius, radius), mode=mode)
-
-    x = F.conv1d(x, weight=kernel, groups=channels)
-
-    x = x.transpose(0, 2)
-    if dim == 4:
-        x = x.view(t, c, h, w)
-
-    if len(x.shape) > dim:
-        x = x.squeeze()
-
-    return x
-
-
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-
-def audio2features(audio, sr, fps, clamp=True, smooth=True):
+@torch.inference_mode()
+def audio2features(audio, sr, fps, clamp=True, smooth=True, emphasis=True):
     if audio.dim() == 2:
         audio = audio.mean(0)
-    audio = audio.cpu()
-    audio = torchaudio.transforms.Resample(sr, 24575)(audio).numpy()
-    sr = 24575
-    harmonic, percussive = rosa.effects.hpss(audio, margin=8.0)
-    # fmt:off
+    audio, sr = resample(audio, sr, fps * 1024), fps * 1024
+
+    audio_harm, audio_perc = harmonic(audio), percussive(audio)
     multi_features = [
-        ndi.gaussian_filter(rosa.feature.mfcc(audio, sr, hop_length=1024), [0, 10]),
-        ndi.gaussian_filter(rosa.feature.chroma_cens(harmonic, sr, hop_length=1024), [0, 10]),
-        ndi.gaussian_filter(rosa.feature.tonnetz(harmonic, sr, hop_length=1024), [0, 10]),
-        ndi.gaussian_filter(rosa.feature.spectral_contrast(audio, sr, hop_length=1024), [0, 10]),
+        gaussian_filter(mfcc(audio, sr), 0.5 * fps),
+        gaussian_filter(chromagram(audio_harm, sr), 0.5 * fps),
+        gaussian_filter(tonnetz(audio_harm, sr), 0.5 * fps),
+        gaussian_filter(spectral_contrast(audio, sr), 0.5 * fps),
     ]
     single_features = [
-        ndi.gaussian_filter(rosa.feature.spectral_flatness(audio, hop_length=1024), [0, 10]),
-        rosa.onset.onset_strength(percussive, sr, hop_length=1024),
-        rosa.onset.onset_strength(low_pass(percussive, sr), sr, hop_length=1024),
-        rosa.onset.onset_strength(mid_pass(percussive, sr), sr, hop_length=1024),
-        rosa.onset.onset_strength(high_pass(percussive, sr), sr, hop_length=1024),
-        rosa.beat.plp(audio, sr, win_length=1024, tempo_min=60, tempo_max=180, hop_length=1024),
-        rosa.feature.rms(harmonic, sr, hop_length=1024),
-        rosa.feature.rms(low_pass(harmonic, sr), sr, hop_length=1024),
-        rosa.feature.rms(mid_pass(harmonic, sr), sr, hop_length=1024),
-        rosa.feature.rms(high_pass(harmonic, sr), sr, hop_length=1024),
-        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(audio, hop_length=1024), [0, 10])) * 10 - 5),
-        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(low_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
-        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(mid_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
-        sigmoid(normalize(ndi.gaussian_filter(rosa.feature.rms(high_pass(audio, sr), hop_length=1024), [0, 10])) * 10 - 5),
+        gaussian_filter(spectral_flatness(audio, sr), 0.5 * fps),
+        onset_strength(audio_perc, sr),
+        onset_strength(low_pass(audio_perc, sr), sr),
+        onset_strength(mid_pass(audio_perc, sr), sr),
+        onset_strength(high_pass(audio_perc, sr), sr),
+        plp(audio_perc, sr),
+        rms(audio_harm, sr),
+        rms(low_pass(audio_harm, sr), sr),
+        rms(mid_pass(audio_harm, sr), sr),
+        rms(high_pass(audio_harm, sr), sr),
+        drop_strength(audio, sr),
+        drop_strength(low_pass(audio, sr), sr),
+        drop_strength(mid_pass(audio, sr), sr),
+        drop_strength(high_pass(audio, sr), sr),
     ]
-    # fmt:on
-    features = [mf.transpose(1, 0) for mf in multi_features] + [sf.reshape(-1, 1) for sf in single_features]
-    features = np.concatenate(features, axis=1)
-    features = torch.from_numpy(features).float()
+    features = multi_features + [sf.reshape(-1, 1) for sf in single_features]
+    features = torch.cat(features, dim=1)
+
+    if VELOCITY:
+        V = torch.diff(gaussian_filter(features, fps), dim=0)
+        V = torch.cat((V[[0]], V), dim=0)
+        features = torch.cat((features, V), dim=1)
+
     if clamp:
-        features = features.clamp(torch.quantile(features, q=0.025, dim=0), torch.quantile(features, q=0.975, dim=0))
+        P = 2.5  # how hard to clamp
+        features = clamp_peaks_percentile(features, 100 - P)
+        features = clamp_lower_percentile(features, 4 * P)
+
     if smooth:
-        features = gaussian_filter(features, 2)
+        features = gaussian_filter(features, 0.1 * fps)
+
+    if emphasis:
+        features = emphasize(features, strength=2, percentile=75)
+
     return features
+
+
+class AudioFeatures(Dataset):
+    def __init__(self, directory, a2f, dur, fps):
+        super().__init__()
+        self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
+        self.a2f = a2f
+        self.L = dur * fps
+        self.fps = fps
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        file = self.files[index]
+        audio, sr = torchaudio.load(file)
+        features = self.a2f(audio, sr, self.fps)
+        features = torch.stack(  # overlapping slices of DUR seconds
+            sum([list(torch.split(features[start:], self.L)[:-1]) for start in range(0, self.L, self.L // 4)], [])
+        )
+        return features.cpu()
 
 
 def to_bytes(x: torch.Tensor) -> np.ndarray:
@@ -337,15 +340,19 @@ def get_ffcv_dataloaders(input_dir, batch_size, dur, fps):
         print(f"train is {int(100 * train_size / (train_size + val_size))}%")
         print()
 
+    class ToDevice(torch.nn.Module):
+        def forward(self,x):
+            return x.cuda()
+
     train_mean = np.load(mean_file)
     train_std = np.load(std_file)
     pipelines = {
-        "features": [NDArrayDecoder(), ToTensor()],
-        "latents": [NDArrayDecoder(), ToTensor()],
-        "noise4": [NDArrayDecoder(), ToTensor()],
-        "noise8": [NDArrayDecoder(), ToTensor()],
-        "noise16": [NDArrayDecoder(), ToTensor()],
-        "noise32": [NDArrayDecoder(), ToTensor()]
+        "features": [NDArrayDecoder(), ToTensor(), ToDevice()],
+        "latents": [NDArrayDecoder(), ToTensor(), ToDevice()],
+        "noise4": [NDArrayDecoder(), ToTensor(), ToDevice()],
+        "noise8": [NDArrayDecoder(), ToTensor(), ToDevice()],
+        "noise16": [NDArrayDecoder(), ToTensor(), ToDevice()],
+        "noise32": [NDArrayDecoder(), ToTensor(), ToDevice()]
     }
     train_loader = Loader(
         train_beton, batch_size=batch_size, num_workers=24, order=OrderOption.QUASI_RANDOM, pipelines=pipelines, os_cache=True, drop_last=True

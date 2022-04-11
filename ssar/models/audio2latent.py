@@ -8,6 +8,7 @@ from torch.nn import GRU, Dropout, LazyConv1d, LazyConvTranspose1d, LeakyReLU, L
 
 from x_transformers.x_transformers import AttentionLayers
 
+
 class AttentionLayer(AttentionLayers):
     def __init__(self, in_channels, out_channels, n_head, dim_head, dropout):
         super().__init__(

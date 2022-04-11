@@ -1,4 +1,5 @@
 # fmt: off
+import os
 from glob import glob
 
 import decord as de
@@ -7,7 +8,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from cycler import cycler
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
 from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader, Dataset
@@ -98,37 +98,42 @@ if __name__ == "__main__":
         print("# video features:", len(vfns))
         print()
 
-        results = []
-        for group, files in [
-            ("low", low),
-            ("medium", medium),
-            ("hions", hions),
-            ("hichr", hichr),
-            ("test", test),
-            ("hibot", hibot),
-        ]:
-            print(group)
-            for (audio,), sr, (video,), fps in tqdm(DataLoader(AudioVisualDataset(files), num_workers=24)):
-                audio, sr, video, fps = audio.cuda(), sr.item(), video.cuda(), fps.item()
+        csv_file = "output/audiovisual_correlations2.csv"
+        if not os.path.exists(csv_file):
+            results = []
+            for group, files in [
+                ("low", low),
+                ("medium", medium),
+                ("hions", hions),
+                ("hichr", hichr),
+                ("test", test),
+                ("hibot", hibot),
+            ]:
+                print(group)
+                for (audio,), sr, (video,), fps in tqdm(DataLoader(AudioVisualDataset(files), num_workers=24)):
+                    audio, sr, video, fps = audio.cuda(), sr.item(), video.cuda(), fps.item()
 
-                afeats = [(af.__name__, af(audio, sr)) for af in afns]
-                vfeats = [(vf.__name__, vf(video)) for vf in vfns]
+                    afeats = [(af.__name__, af(audio, sr)) for af in afns]
+                    vfeats = [(vf.__name__, vf(video)) for vf in vfns]
 
-                row = {"group": group}
-                for a in range(len(afeats)):
-                    for v in range(len(vfeats)):
-                        aname, afeat = afeats[a]
-                        vname, vfeat = vfeats[v]
+                    row = {"group": group}
+                    for a in range(len(afeats)):
+                        for v in range(len(vfeats)):
+                            aname, afeat = afeats[a]
+                            vname, vfeat = vfeats[v]
 
-                        row[f"{aname}_X_{vname}"] = correlation(afeat, vfeat).item()
+                            row[f"{aname}_X_{vname}"] = correlation(afeat, vfeat).item()
 
-                results.append(row)
+                    results.append(row)
 
-        df = pd.DataFrame(results)
+            df = pd.DataFrame(results)
+
+            df.to_csv(csv_file)
+        else:
+            df = pd.read_csv(csv_file, index_col=0)
+
         print(df)
 
-        df.to_csv("output/audiovisual_correlations2.csv")
-        df = pd.read_csv("output/audiovisual_correlations2.csv", index_col=0)
         grouped = df.groupby("group").agg(["median", "std"])
 
         stats = []
@@ -164,7 +169,7 @@ if __name__ == "__main__":
             g.ax_marg_y.cla()
             g.ax_marg_x.cla()
             sns.heatmap(
-                data=groupstats["median"].values.reshape(V, A).T,
+                data=groupstats["median"].values.reshape(A, V),
                 ax=g.ax_joint,
                 cbar=False,
                 cmap=hot,
@@ -177,10 +182,17 @@ if __name__ == "__main__":
             g.fig.colorbar(g.ax_joint.get_children()[1], cax=cax)
             cax.yaxis.set_ticks_position("left")
 
-            audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["median"].mean().values
-            video_feature_marginals = groupstats.groupby(["video"], sort=False)["median"].mean().values
-            g.ax_marg_y.barh(np.arange(0.5, A), audio_feature_marginals, color=hot(audio_feature_marginals))
-            g.ax_marg_x.bar(np.arange(0.5, V), video_feature_marginals, color=hot(video_feature_marginals))
+            np.set_printoptions(linewidth=200)
+            audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["median"].mean()
+            video_feature_marginals = groupstats.groupby(["video"], sort=False)["median"].mean()
+            g.ax_marg_y.barh(
+                np.arange(0.5, A), audio_feature_marginals.values, color=hot(audio_feature_marginals.values)
+            )
+            g.ax_marg_y.set(xlim=(0, stats["median"].max()))
+            g.ax_marg_x.bar(
+                np.arange(0.5, V), video_feature_marginals.values, color=hot(video_feature_marginals.values)
+            )
+            g.ax_marg_x.set(ylim=(0, stats["median"].max()))
 
             g.ax_joint.set_xticks(np.arange(0.5, V))
             g.ax_joint.set_xticklabels(groupstats["video"].unique(), rotation=20, ha="right", rotation_mode="anchor")
