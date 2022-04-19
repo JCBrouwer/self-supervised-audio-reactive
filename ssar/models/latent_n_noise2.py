@@ -8,10 +8,6 @@ from .audio2latent import LayerwiseLinear, Normalize
 from .sashimi.sashimi import Sashimi
 
 
-def batch_gaussian_filter(x, sig):
-    return torch.cat([gaussian_filter(xx.unsqueeze(0), ss) for xx, ss in zip(x.unbind(0), sig.unbind(0))])
-
-
 class EnvelopeReactor(torch.nn.Module):
     def __init__(
         self,
@@ -53,7 +49,6 @@ class Noise(Module):
         self.NO = n_outputs
         self.w1, self.b1 = self.get_weights_and_bias(n_outputs, in_channels, in_channels // 2)
         self.w2, self.b2 = self.get_weights_and_bias(1, in_channels // 2, 2)
-        self.ws, self.bs = self.get_weights_and_bias(1, in_channels // 2, 1)
         self.act = act
 
     def get_weights_and_bias(self, NL, IC, OC):
@@ -74,16 +69,16 @@ class Noise(Module):
         h = dropout(self.act(h), self.dropout, self.training)
 
         mu_sigs = torch.matmul(h, self.w2) + self.b2  # B,T,NO,2
-        smooths = h.mean(1) @ self.ws + self.bs  # B,NO
+
+        B, T, _, _ = x.shape
 
         noise = []
-        for i, (smooth, mu_sig) in enumerate(zip(smooths.unbind(1), mu_sigs.unbind(2))):
+        for i, mu_sig in enumerate(mu_sigs.unbind(2)):
             mu, sig = mu_sig.unbind(-1)
             size = 2 ** (i + 2)
-            mu = mu[..., None, None].expand(-1, -1, size, size)
-            sig = sig[..., None, None].expand(-1, -1, size, size)
-            n = mu + sig * torch.randn_like(mu)
-            n = batch_gaussian_filter(n, smooth)
+            mu = mu[..., None, None].expand(B, T, size, size)
+            sig = sig[..., None, None].expand(B, T, size, size)
+            n = mu + sig * gaussian_filter(torch.randn_like(mu).transpose(1, 0), 5).transpose(1, 0)
             noise.append(n)
 
         return noise
@@ -123,21 +118,34 @@ class FixedLatentNoiseDecoder(torch.nn.Module):
     def forward(self, x):
         latents = []
         for i in range(self.S):
+
             env = x[..., i * self.H : (i + 1) * self.H]
-            lat = self.latents[i * self.H : (i + 1) * self.H, i * self.W : (i + 1) * self.W]
+            env = env / env.sum(dim=-1, keepdim=True)
+
+            with torch.no_grad():
+                lat = self.latents[i * self.H : (i + 1) * self.H, i * self.W : (i + 1) * self.W]
+
             latents.append(torch.einsum("BTH,HWL->BTWL", env, lat))
+
         latents = torch.cat(latents, dim=2)
         latents = latents - latents.mean(dim=1, keepdim=True)  # latents --> residuals
 
         noise_envs = x[..., self.S * self.H :]
         noise = []
-        for i in range(noise_envs.shape[-1] // 3):
-            mu, sig, smooth = noise_envs[..., 3 * i : 3 * (i + 1)].unbind(-1)
+        B, T, _ = x.shape
+        for i in range(noise_envs.shape[-1] // 2):
+
+            mu, sig = noise_envs[..., 2 * i : 2 * (i + 1)].unbind(-1)
+
             size = 2 ** (i + 2)
-            mu = mu[..., None, None].expand(-1, -1, size, size)
-            sig = sig[..., None, None].expand(-1, -1, size, size)
-            n = mu + sig * torch.randn_like(mu)
-            n = batch_gaussian_filter(n, smooth.mean(1))
+            mu = mu[..., None, None].expand(B, T, size, size)
+            sig = sig[..., None, None].expand(B, T, size, size)
+
+            with torch.no_grad():
+                n = gaussian_filter(torch.randn_like(mu).transpose(1, 0), 5).transpose(1, 0)
+
+            n = mu + sig * n
+
             noise.append(n)
 
         return latents, noise
@@ -155,7 +163,7 @@ class LatentNoiseReactor(torch.nn.Module):
         backbone="sashimi",
         hidden_size=64,
         # decoder
-        decoder="fixed",  # or 'learned
+        decoder="fixed",  # or "learned"
         n_latent_split=3,
         n_noise=4,
         dropout=0.0,
@@ -164,7 +172,7 @@ class LatentNoiseReactor(torch.nn.Module):
 
         if decoder == "fixed":
             self.decoder = FixedLatentNoiseDecoder(latents, hidden_size, n_latent_split, n_noise)
-            n_envelopes = hidden_size * n_latent_split + 3 * n_noise
+            n_envelopes = hidden_size * n_latent_split + 2 * n_noise
         elif decoder == "learned":
             self.decoder = LearnedLatentNoiseDecoder(latents, hidden_size, n_latent_split, n_noise, dropout)
             n_envelopes = hidden_size
@@ -179,7 +187,9 @@ class LatentNoiseReactor(torch.nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x):
+    def forward(self, x, return_envelopes=False):
         envelopes = self.envolope(x)
+        if return_envelopes:
+            return envelopes
         latents, noise = self.decoder(envelopes)
         return latents, noise

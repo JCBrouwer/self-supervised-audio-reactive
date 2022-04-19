@@ -92,6 +92,7 @@ class LayerwiseLinear(Module):
         fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
         bound = 1 / np.sqrt(fan_in)
         torch.nn.init.uniform_(b, -bound, bound)
+
         return Parameter(w.squeeze()), Parameter(b.squeeze())
 
     def forward(self, x):  # B,T,IC

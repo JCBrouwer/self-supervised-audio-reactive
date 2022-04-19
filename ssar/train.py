@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List
 
 import joblib
+import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,9 @@ from .supervised.test import audio2video
 sys.path.append("/home/hans/code/maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2Mapper
 
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 np.set_printoptions(precision=2, suppress=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STYLEGAN_CKPT = "cache/RobertAGonzalves-MachineRay2-AbstractArt-188.pkl"
@@ -34,7 +38,7 @@ def get_output_shape(o):
 
 
 @torch.no_grad()
-def print_model_summary(model):
+def print_model_summary(model, example_inputs):
     global total_params
     total_params = 0
     handles = []
@@ -60,7 +64,7 @@ def print_model_summary(model):
     print("model summary:")
     print("name".ljust(70), "class".ljust(30), "output shape".ljust(40), "num params")
     print("-" * 140)
-    model(inputs.to(device))
+    model(example_inputs.to(device))
     for handle in handles:
         handle.remove()
     print("-" * 140)
@@ -69,7 +73,6 @@ def print_model_summary(model):
 
 @torch.no_grad()
 def validate():
-
     val_loss, latent_residuals = 0, []
     for _, (inputs, latents, n4, n8, n16, n32) in enumerate(val_dataloader):
         latents, noise = model(inputs)
@@ -77,6 +80,18 @@ def validate():
         val_loss += sum([F.mse_loss(o, t) for o, t in zip([latents] + noise, [latents, n4, n8, n16, n32])])
     val_loss /= len(val_dataloader)
     writer.add_scalar("Loss/val", val_loss.item(), it)
+
+    envelopes = model.forward(inputs, return_envelopes=True)
+    n_env = envelopes[0].shape[-1]
+    most_correlated = torch.topk(
+        torch.tensor([rv2(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]), k=n_env
+    ).indices
+    fig, ax = plt.subplots(n_env, 2, figsize=(16, 4 * n_env))
+    for e, env in enumerate(envelopes[0].unbind(-1)):
+        ax[e, 0].plot(inputs[0, :, most_correlated[e]].squeeze().detach().cpu().numpy())
+        ax[e, 1].plot(env.squeeze().detach().cpu().numpy())
+    plt.tight_layout()
+    plt.savefig(f"{writer.log_dir}/envelopes_{it}.pdf")
 
     try:
         loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
@@ -94,7 +109,7 @@ def rv2_loss(predictions: List[torch.Tensor], targets: List[torch.Tensor]) -> to
     for b in range(len(predictions)):
         for p in predictions[b]:
             for t in targets[b]:
-                loss[b] = loss[b] + 1 - rv2(p, t)
+                loss[b] = loss[b] + (1 - rv2(p, t))
     return loss
 
 
@@ -112,7 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--backbone", type=str, default="sashimi", choices=["sashimi", "gru"])
     parser.add_argument("--n_latent_split", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
-    parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--duration", type=int, default=8)
     parser.add_argument("--fps", type=int, default=24)
@@ -140,19 +155,39 @@ if __name__ == "__main__":
     train_mean, train_std, train_dataloader, val_dataloader = get_ffcv_dataloaders(in_dir, batch_size, dur, fps)
     train_iter = infiniter(train_dataloader)
 
-    inputs, latents, n4, n8, n16, n32 = next(iter(train_dataloader))
-    feature_dim = inputs.shape[2]
-    n_outputs, output_size = latents.shape[2], latents.shape[3]
+    example_inputs, example_latents, _, _, _, _ = next(iter(train_dataloader))
+    feature_dim = example_inputs.shape[2]
+    n_outputs, output_size = example_latents.shape[2], example_latents.shape[3]
 
     mapper = StyleGAN2Mapper(model_file=STYLEGAN_CKPT, inference=False)
-    latents = mapper(torch.from_numpy(np.random.RandomState(42).randn(args.n_latent_split * args.hidden_size, 512))).to(
-        device
-    )
+    decoder_latents = mapper(
+        torch.from_numpy(np.random.RandomState(42).randn(args.n_latent_split * args.hidden_size, 512))
+    ).to(device)
     del mapper
+
+    model = LatentNoiseReactor(
+        train_mean,
+        train_std,
+        feature_dim,
+        decoder_latents,
+        num_layers=args.num_layers,
+        backbone=args.backbone,
+        hidden_size=args.hidden_size,
+        decoder=args.decoder,
+        n_latent_split=args.n_latent_split,
+        n_noise=4,
+        dropout=args.dropout,
+    ).to(device)
+    model.train()
+    print_model_summary(model, example_inputs)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     name = "_".join(
         [
+            "",
             args.loss,
+            args.backbone,
             args.decoder,
             "decoder",
             f"n_latent_split:{args.n_latent_split}",
@@ -162,35 +197,17 @@ if __name__ == "__main__":
             f"lr:{args.lr}",
         ]
     )
-    model = LatentNoiseReactor(
-        train_mean,
-        train_std,
-        feature_dim,
-        latents,
-        num_layers=args.num_layers,
-        backbone=args.backbone,
-        hidden_size=args.hidden_size,
-        decoder=args.decoder,
-        n_latent_split=args.n_latent_split,
-        n_noise=4,
-        dropout=args.dropout,
-    ).to(device)
-    print_model_summary(model)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
     writer = SummaryWriter(comment=name)
     shutil.copytree(os.path.dirname(__file__), writer.log_dir + "/ssar")
 
     losses = []
-    with tqdm(range(0, args.n_examples, batch_size)) as progress:
+    with tqdm(range(0, args.n_examples, batch_size)) as progress, torch.autograd.set_detect_anomaly(True):
         for it in progress:
             if args.loss == "supervised":
                 inputs, latents, n4, n8, n16, n32 = next(train_iter)
 
-                latents, noise = model(inputs)
-                loss = sum([F.mse_loss(o, t) for o, t in zip([latents] + noise, [latents, n4, n8, n16, n32])])
-                print(loss)
+                pred_lats, pred_noise = model(inputs)
+                loss = sum([F.mse_loss(o, t) for o, t in zip([pred_lats] + pred_noise, [latents, n4, n8, n16, n32])])
 
                 optimizer.zero_grad()
                 loss.backward()

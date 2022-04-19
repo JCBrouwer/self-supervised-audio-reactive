@@ -342,7 +342,7 @@ def get_ffcv_dataloaders(input_dir, batch_size, dur, fps):
 
     class ToDevice(torch.nn.Module):
         def forward(self,x):
-            return x.cuda()
+            return x.to('cuda' if torch.cuda.is_available() else 'cpu')
 
     train_mean = np.load(mean_file)
     train_std = np.load(std_file)
