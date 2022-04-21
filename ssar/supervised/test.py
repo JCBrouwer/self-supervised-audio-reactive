@@ -626,11 +626,14 @@ class ModuleFromFile:
 
     def __enter__(self):
         directory = os.path.dirname(self.path)
-        with open(f"{directory}/{self.name}.py", "r") as f:
-            text = f.read()
-        text = text.replace("from context_fid", "# from context_fid").replace("# #", "#")
-        with open(f"{directory}/{self.name}.py", "w") as f:
-            f.write(text)
+        try:
+            with open(f"{directory}/{self.name}.py", "r") as f:
+                text = f.read()
+            text = text.replace("from context_fid", "# from context_fid").replace("# #", "#")
+            with open(f"{directory}/{self.name}.py", "w") as f:
+                f.write(text)
+        except Exception as e:
+            pass
         sys.path = [directory] + sys.path
         self.original_main_module = {}
         module = importlib.import_module(self.name)

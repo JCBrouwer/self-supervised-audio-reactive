@@ -21,6 +21,8 @@ class EnvelopeReactor(torch.nn.Module):
         dropout=0.0,
     ):
         super().__init__()
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
 
         self.normalize = Normalize(input_mean, input_std)
 
@@ -37,7 +39,8 @@ class EnvelopeReactor(torch.nn.Module):
     def forward(self, x):
         h = self.normalize(x)
         h = self.encode(h)
-        h, _ = self.backbone(h)
+        init_state = torch.randn((self.num_layers, x.shape[0], self.hidden_size), device=x.device, dtype=x.dtype)
+        h, _ = self.backbone(h, init_state)
         y = self.decode(h)
         return y
 

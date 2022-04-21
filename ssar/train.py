@@ -87,6 +87,8 @@ def validate():
         torch.tensor([rv2(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]), k=n_env
     ).indices
     fig, ax = plt.subplots(n_env, 2, figsize=(16, 4 * n_env))
+    ax[0, 0].set_title("most correlated input envelopes")
+    ax[0, 1].set_title("generated intermediate envelopes")
     for e, env in enumerate(envelopes[0].unbind(-1)):
         ax[e, 0].plot(inputs[0, :, most_correlated[e]].squeeze().detach().cpu().numpy())
         ax[e, 1].plot(env.squeeze().detach().cpu().numpy())
@@ -106,10 +108,10 @@ def validate():
 @torch.jit.script
 def rv2_loss(predictions: List[torch.Tensor], targets: List[torch.Tensor]) -> torch.Tensor:
     loss = torch.zeros(len(predictions[0]), device=predictions[0].device)
-    for b in range(len(predictions)):
-        for p in predictions[b]:
-            for t in targets[b]:
-                loss[b] = loss[b] + (1 - rv2(p, t))
+    for p in predictions:
+        for t in targets:
+            for b in range(len(p)):
+                loss[b] = loss[b] + (1 - rv2(p[b].flatten(1), t[b].flatten(1)))
     return loss
 
 
@@ -139,8 +141,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_examples", type=int, default=1_024_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--eval_every", type=int, default=10_240)
-    parser.add_argument("--ckpt_every", type=int, default=5 * 10_240)
+    parser.add_argument("--eval_every", type=int, default=5 * 10_240)
+    parser.add_argument("--ckpt_every", type=int, default=10 * 10_240)
 
     args = parser.parse_args()
 
@@ -221,7 +223,7 @@ if __name__ == "__main__":
                 inputs = inputs.to(device)
 
                 latents, noise = model(inputs)
-                loss = rv2_loss([latents] + noise, inputs)
+                loss = rv2_loss([latents] + noise, [inputs]).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
