@@ -108,9 +108,15 @@ def audio2features(audio, sr, fps, clamp=True, smooth=True, emphasis=True):
 
 
 class AudioFeatures(Dataset):
-    def __init__(self, directory, a2f, dur, fps):
+    def __init__(self, directory, a2f, dur, fps, files=None):
         super().__init__()
-        self.files = sum([glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], [])
+        if directory is None:
+            assert files is not None, "Must pass either directory or files!"
+            self.files = files
+        else:
+            self.files = sum(
+                [glob(f"{directory}*.{ext}") for ext in ["aac", "au", "flac", "m4a", "mp3", "ogg", "wav"]], []
+            )
         self.a2f = a2f
         self.L = dur * fps
         self.fps = fps

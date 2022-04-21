@@ -27,7 +27,7 @@ def cauchy_mult_torch(v: torch.Tensor, z: torch.Tensor, w: torch.Tensor,
 
 
 def cauchy_mult_keops(v, z, w):
-    from pykeops.torch import LazyTensor
+    # from pykeops.torch import LazyTensor
     v_l = LazyTensor(rearrange(v, 'b N -> b 1 N 1'))
     z_l = LazyTensor(rearrange(z, 'L -> 1 L 1 1'))
     w_l = LazyTensor(rearrange(w, 'b N -> b 1 N 1'))

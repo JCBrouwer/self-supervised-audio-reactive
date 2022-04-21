@@ -508,20 +508,16 @@ def _audio2video(
         audio_duration=duration,
     ) as video:
         for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
-            for frame in (
-                synthesizer(
-                    latents=base_latent + residuals[i : i + batch_size],
-                    noise1=noise1[i : i + batch_size, None] if noise is not None else None,
-                    noise2=noise2[i : i + batch_size, None] if noise is not None else None,
-                    noise3=noise2[i : i + batch_size, None] if noise is not None else None,
-                    noise4=noise3[i : i + batch_size, None] if noise is not None else None,
-                    noise5=noise3[i : i + batch_size, None] if noise is not None else None,
-                    noise6=noise4[i : i + batch_size, None] if noise is not None else None,
-                    noise7=noise4[i : i + batch_size, None] if noise is not None else None,
-                )
-                .add(1)
-                .div(2)
-            ):
+            inputs = dict(latents=base_latent + residuals[i : i + batch_size])
+            if noise1 is not None:
+                inputs["noise1"] = noise1[i : i + batch_size, None]
+                inputs["noise2"] = noise2[i : i + batch_size, None]
+                inputs["noise3"] = noise2[i : i + batch_size, None]
+                inputs["noise4"] = noise3[i : i + batch_size, None]
+                inputs["noise5"] = noise3[i : i + batch_size, None]
+                inputs["noise6"] = noise4[i : i + batch_size, None]
+                inputs["noise7"] = noise4[i : i + batch_size, None]
+            for frame in synthesizer(**inputs).add(1).div(2):
                 video.write(frame.unsqueeze(0))
 
     del features, residuals, base_latent, synthesizer
@@ -645,6 +641,7 @@ class ModuleFromFile:
                 except:
                     pass
                 setattr(sys.modules["__main__"], k, getattr(module, k))
+                setattr(sys.modules[self.name], k, getattr(module, k))
         return module
 
     def __exit__(self, exc_type, exc_value, exc_tb):
