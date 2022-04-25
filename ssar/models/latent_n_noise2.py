@@ -2,10 +2,16 @@ import numpy as np
 import torch
 from torch.nn import GELU, GRU, Dropout, Linear, Module, Parameter, Sequential
 from torch.nn.functional import dropout, gelu
+from x_transformers import Encoder
 
 from ..features.processing import gaussian_filter
 from .audio2latent import LayerwiseLinear, Normalize
 from .sashimi.sashimi import Sashimi
+
+
+class DummyHiddenState(Module):
+    def forward(self, x):
+        return x, None
 
 
 class EnvelopeReactor(torch.nn.Module):
@@ -31,6 +37,11 @@ class EnvelopeReactor(torch.nn.Module):
         if backbone.lower() == "gru":
             self.backbone = GRU(hidden_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
             self.backbone.flatten_parameters()
+        elif backbone.lower() == "transformer":
+            self.backbone = Sequential(
+                Encoder(dim=hidden_size, attn_dim_head=hidden_size // 2, depth=num_layers, dropout=dropout),
+                DummyHiddenState(),
+            )
         else:
             self.backbone = Sashimi(hidden_size, num_layers, dropout=dropout)
 
@@ -39,8 +50,7 @@ class EnvelopeReactor(torch.nn.Module):
     def forward(self, x):
         h = self.normalize(x)
         h = self.encode(h)
-        init_state = torch.randn((self.num_layers, x.shape[0], self.hidden_size), device=x.device, dtype=x.dtype)
-        h, _ = self.backbone(h, init_state)
+        h, _ = self.backbone(h)
         y = self.decode(h)
         return y
 

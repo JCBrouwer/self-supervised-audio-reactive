@@ -10,11 +10,13 @@ import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
+from functorch import vmap
 from scipy import stats
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .features.correlation import rv2
+from .features.video import absdiff
 from .models.latent_n_noise2 import LatentNoiseReactor
 from .supervised.data import audio2features, get_ffcv_dataloaders
 from .supervised.test import audio2video
@@ -28,6 +30,9 @@ import matplotlib.pyplot as plt
 np.set_printoptions(precision=2, suppress=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STYLEGAN_CKPT = "cache/RobertAGonzalves-MachineRay2-AbstractArt-188.pkl"
+
+
+batch_abs_diff = vmap(absdiff)
 
 
 def get_output_shape(o):
@@ -71,29 +76,31 @@ def print_model_summary(model, example_inputs):
     print("total".ljust(70), f"".ljust(30), f"".ljust(40), f"{total_params/1e6:.2f} M")
 
 
+def torchrand(pop_size, num_samples, device: str):
+    vec = torch.unique((torch.rand(num_samples, device=device) * pop_size).floor().long())
+    while vec.shape[0] != num_samples:
+        vec = torch.unique(
+            torch.cat(
+                [
+                    vec,
+                    (torch.rand(num_samples - vec.shape[0], device=device) * pop_size).floor().long(),
+                ]
+            )
+        )
+    return vec.view(-1)
+
+
 @torch.no_grad()
 def validate():
     val_loss, latent_residuals = 0, []
     for _, (inputs, latents, n4, n8, n16, n32) in enumerate(val_dataloader):
         latents, noise = model(inputs)
-        latent_residuals.append(np.random.choice(latents.cpu().numpy().flatten(), 100_000))
+        flatlats = latents.flatten()
+        flatlats = flatlats[torchrand(flatlats.numel(), 100_000, flatlats.device)]
+        latent_residuals.append(flatlats.cpu().numpy())
         val_loss += sum([F.mse_loss(o, t) for o, t in zip([latents] + noise, [latents, n4, n8, n16, n32])])
     val_loss /= len(val_dataloader)
     writer.add_scalar("Loss/val", val_loss.item(), it)
-
-    envelopes = model.forward(inputs, return_envelopes=True)
-    n_env = envelopes[0].shape[-1]
-    most_correlated = torch.topk(
-        torch.tensor([rv2(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]), k=n_env
-    ).indices
-    fig, ax = plt.subplots(n_env, 2, figsize=(16, 4 * n_env))
-    ax[0, 0].set_title("most correlated input envelopes")
-    ax[0, 1].set_title("generated intermediate envelopes")
-    for e, env in enumerate(envelopes[0].unbind(-1)):
-        ax[e, 0].plot(inputs[0, :, most_correlated[e]].squeeze().detach().cpu().numpy())
-        ax[e, 1].plot(env.squeeze().detach().cpu().numpy())
-    plt.tight_layout()
-    plt.savefig(f"{writer.log_dir}/envelopes_{it}.pdf")
 
     try:
         loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
@@ -101,6 +108,41 @@ def validate():
     except Exception as e:
         progress.write(f"\nError in Laplace fit:\n{e}\n\n")
         scale = -1
+
+    envelopes = model.forward(inputs, return_envelopes=True)
+    n_env = envelopes[0].shape[-1]
+    most_correlated = torch.topk(
+        torch.tensor([rv2(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]), k=n_env
+    ).indices
+    fig, ax = plt.subplots(n_env + 1, 2, figsize=(8, 4 * (n_env + 1)))
+    [x.axis("off") for x in ax.flatten()]
+
+    def sum_ac(tensors):
+        feats = [af - af.min() for af in tensors]
+        feats = [af / af.max() for af in feats]
+        ac = torch.stack([af[:, None] @ af[:, None].T for af in feats])
+        ac = torch.sum(ac, dim=0)
+        ac = ac - ac.min()
+        ac = ac / ac.max()
+        return ac
+
+    iac = sum_ac(inputs[0].unbind(-1))
+    ax[0, 0].imshow(iac.detach().cpu().numpy())
+    ax[0, 0].set_title("sum of normalized input envelopes")
+
+    iac = sum_ac(envelopes[0].unbind(-1))
+    ax[0, 1].imshow(iac.detach().cpu().numpy())
+    ax[0, 1].set_title("sum of normalized generated envelopes")
+
+    for e, env in enumerate(envelopes[0].unbind(-1)):
+        ienv = inputs[0, :, most_correlated[e]]
+        ax[e + 1, 0].imshow((ienv[:, None] @ ienv[:, None].T).detach().cpu().numpy())
+        ax[e + 1, 1].imshow((env[:, None] @ env[:, None].T).detach().cpu().numpy())
+    ax[1, 0].set_title("most correlated input envelopes")
+    ax[1, 1].set_title("generated intermediate envelopes")
+
+    plt.tight_layout()
+    plt.savefig(f"{writer.log_dir}/envelopes_{it}.pdf")
 
     return val_loss, scale
 
@@ -113,7 +155,7 @@ def rv2_loss(predictions: List[torch.Tensor], targets: List[torch.Tensor]) -> to
             for b in range(len(p)):
                 loss[b] = loss[b] + (1 - rv2(p[b].flatten(1), t[b].flatten(1)))
     return loss
-    
+
 
 def infiniter(data_loader):
     while True:
@@ -121,12 +163,28 @@ def infiniter(data_loader):
             yield batch
 
 
+class NormalizeGradients(torch.autograd.Function):
+    """Normalize gradient scale in the backward pass"""
+
+    @staticmethod
+    def forward(self, input_tensor):
+        return input_tensor
+
+    @staticmethod
+    def backward(self, grad_output):
+        grad_input = grad_output.clone()
+        grad_input = grad_input / (torch.norm(grad_input, keepdim=True) + 1e-8)
+        return grad_input, None
+
+
+normalize_gradients = NormalizeGradients.apply
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # Model options
     parser.add_argument("--decoder", type=str, default="learned", choices=["learned", "fixed"])
-    parser.add_argument("--backbone", type=str, default="sashimi", choices=["sashimi", "gru"])
+    parser.add_argument("--backbone", type=str, default="gru", choices=["sashimi", "gru", "transformer"])
     parser.add_argument("--n_latent_split", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=4)
@@ -135,14 +193,14 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=24)
 
     # Loss options
-    parser.add_argument("--loss", type=str, default="supervised", choices=["supervised", "selfsupervised"])
+    parser.add_argument("--loss", type=str, default="supervised", choices=["supervised", "selfsupervised", "ssabsdiff"])
 
     # Training options
     parser.add_argument("--n_examples", type=int, default=1_024_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--eval_every", type=int, default=5 * 10_240)
-    parser.add_argument("--ckpt_every", type=int, default=10 * 10_240)
+    parser.add_argument("--eval_every", type=int, default=1 * 10_240)
+    parser.add_argument("--ckpt_every", type=int, default=1 * 10_240)
 
     args = parser.parse_args()
 
@@ -203,7 +261,7 @@ if __name__ == "__main__":
     shutil.copytree(os.path.dirname(__file__), writer.log_dir + "/ssar")
 
     losses = []
-    with tqdm(range(0, args.n_examples, batch_size)) as progress, torch.autograd.set_detect_anomaly(True):
+    with tqdm(range(0, args.n_examples, batch_size)) as progress:  # , torch.autograd.set_detect_anomaly(True):
         for it in progress:
             if args.loss == "supervised":
                 inputs, latents, n4, n8, n16, n32 = next(train_iter)
@@ -223,7 +281,9 @@ if __name__ == "__main__":
                 inputs = inputs.to(device)
 
                 latents, noise = model(inputs)
-                loss = rv2_loss([latents] + noise, [inputs]).mean()
+                predictions = [latents] + noise
+                predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
+                loss = rv2_loss(predictions, [inputs]).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -232,7 +292,24 @@ if __name__ == "__main__":
                 writer.add_scalar("Loss/selfsupervised", loss.item(), it)
                 losses.append(loss.item())
 
-            if it % args.eval_every == 0 and it != 0:
+            elif args.loss == "ssabsdiff":
+                inputs, _, _, _, _, _ = next(train_iter)
+                inputs = inputs.to(device)
+
+                latents, noise = model(inputs)
+                predictions = [latents] + noise
+                predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
+                predictions = [batch_abs_diff(p) for p in predictions]
+                loss = rv2_loss(predictions, [inputs]).mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                writer.add_scalar("Loss/selfsupervised", loss.item(), it)
+                losses.append(loss.item())
+
+            if it % args.eval_every == 0:  # and it != 0:
                 model.eval()
                 val_loss, scale = validate()
                 progress.write("")
@@ -244,7 +321,7 @@ if __name__ == "__main__":
                 losses = []
                 model.train()
 
-            if it % args.ckpt_every == 0 and it != 0:
+            if it % args.ckpt_every == 0:  # and it != 0:
                 model.eval()
                 checkpoint_name = f"audio2latent_{name}_steps{it:08}_b{scale:.4f}_val{val_loss:.4f}"
                 joblib.dump(

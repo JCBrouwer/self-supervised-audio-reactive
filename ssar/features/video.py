@@ -65,7 +65,7 @@ def visual_variance(video):
 def absdiff(video, stride: int = 64):
     y = []
     for i in range(0, len(video), stride):
-        y_part = torch.diff(video[i : i + stride + 1], dim=0).abs().sum((1, 2, 3))
+        y_part = torch.diff(video[i : i + stride + 1], dim=0).abs().flatten(1).sum(1)
         if len(y_part) < 1:
             continue
         y.append(y_part)

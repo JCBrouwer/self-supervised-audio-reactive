@@ -1,15 +1,16 @@
 # fmt: off
 import os
 from glob import glob
+from math import ceil
 from pathlib import Path
 
 import decord as de
-import matplotlib.pyplot as plt
+import matplotlib
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
+import torchvision as tv
 from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader, Dataset
 from torchaudio.functional import resample
@@ -24,6 +25,11 @@ from .features.video import (absdiff, adaptive_freq_rms, directogram,
                              mid_freq_rms, rgb_hist, video_flow_onsets,
                              video_spectral_onsets, video_spectrogram,
                              visual_variance)
+
+matplotlib.use('Agg')
+
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
 
 afns = [chromagram, tonnetz, mfcc, spectral_contrast, spectral_flatness, rms, drop_strength, onsets, pulse]
 vfns = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_freq_rms, high_freq_rms, 
@@ -118,7 +124,7 @@ class AudioVisualDataset(Dataset):
 
 
 @torch.inference_mode()
-def heatmap(files, name):
+def heatmap(files, name, plot=False, marginals="median"):
     csv_file = f"output/audiovisual_correlations_{name}.csv"
     if not os.path.exists(csv_file):
         results = []
@@ -155,57 +161,243 @@ def heatmap(files, name):
         stats.append({"audio": af, "video": vf, "group": name, "median": means[name], "std": stds[name]})
     stats = pd.DataFrame(stats)
 
-    A = len(afns)
-    V = len(vfns)
-    hot = plt.get_cmap("hot")
-
-    g = sns.jointplot(data=stats, x="video", y="audio", kind="hist", bins=(V, A))
-    g.ax_marg_y.cla()
-    g.ax_marg_x.cla()
-    sns.heatmap(
-        data=stats["median"].values.reshape(A, V),
-        ax=g.ax_joint,
-        cbar=False,
-        cmap=hot,
-        vmin=0,
-        vmax=0.75,  # TODO better way than fixed value?
-    )
-
-    make_axes_locatable(g.ax_marg_x).append_axes("left", size="10%", pad="20%").axis("off")
-    cax = make_axes_locatable(g.ax_joint).append_axes("left", size="10%", pad="20%")
-    g.fig.colorbar(g.ax_joint.get_children()[1], cax=cax)
-    cax.yaxis.set_ticks_position("left")
-
-    np.set_printoptions(linewidth=200)
     audio_feature_marginals = stats.groupby(["audio"], sort=False)["median"].mean()
     video_feature_marginals = stats.groupby(["video"], sort=False)["median"].mean()
-    print("audio marginals", audio_feature_marginals.to_dict())
-    print("video marginals", video_feature_marginals.to_dict())
-    g.ax_marg_y.barh(np.arange(0.5, A), audio_feature_marginals.values, color=hot(audio_feature_marginals.values))
-    g.ax_marg_y.set(xlim=(0, stats["median"].max()))
-    g.ax_marg_x.bar(np.arange(0.5, V), video_feature_marginals.values, color=hot(video_feature_marginals.values))
-    g.ax_marg_x.set(ylim=(0, stats["median"].max()))
 
-    g.ax_joint.set_xticks(np.arange(0.5, V))
-    g.ax_joint.set_xticklabels(stats["video"].unique(), rotation=20, ha="right", rotation_mode="anchor")
-    g.ax_joint.set_yticks(np.arange(0.5, A))
-    g.ax_joint.set_yticklabels(stats["audio"].unique(), rotation=0)
+    if plot:
+        A = len(afns)
+        V = len(vfns)
+        hot = plt.get_cmap("hot")
 
-    # remove ticks between heatmap and histograms
-    g.ax_marg_x.tick_params(axis="x", bottom=False, labelbottom=False)
-    g.ax_marg_y.tick_params(axis="y", left=False, labelleft=False)
-    # # remove ticks showing the heights of the histograms
-    g.ax_marg_x.tick_params(axis="y", left=False, labelleft=False)
-    g.ax_marg_y.tick_params(axis="x", bottom=False, labelbottom=False)
+        g = sns.jointplot(data=stats, x="video", y="audio", kind="hist", bins=(V, A))
+        g.ax_marg_y.cla()
+        g.ax_marg_x.cla()
+        sns.heatmap(
+            data=stats["median"].values.reshape(A, V),
+            ax=g.ax_joint,
+            cbar=False,
+            cmap=hot,
+            vmin=0,
+            vmax=0.75,  # TODO better way than fixed value?
+        )
 
-    g.fig.suptitle(name)
-    g.fig.set_size_inches(16, 9)
-    plt.savefig(f"output/{name} heatmap.pdf")
+        make_axes_locatable(g.ax_marg_x).append_axes("left", size="10%", pad="20%").axis("off")
+        cax = make_axes_locatable(g.ax_joint).append_axes("left", size="10%", pad="20%")
+        g.fig.colorbar(g.ax_joint.get_children()[1], cax=cax)
+        cax.yaxis.set_ticks_position("left")
+
+        np.set_printoptions(linewidth=200)
+        g.ax_marg_y.barh(np.arange(0.5, A), audio_feature_marginals.values, color=hot(audio_feature_marginals.values))
+        g.ax_marg_y.set(xlim=(0, stats["median"].max()))
+        g.ax_marg_x.bar(np.arange(0.5, V), video_feature_marginals.values, color=hot(video_feature_marginals.values))
+        g.ax_marg_x.set(ylim=(0, stats["median"].max()))
+
+        g.ax_joint.set_xticks(np.arange(0.5, V))
+        g.ax_joint.set_xticklabels(stats["video"].unique(), rotation=20, ha="right", rotation_mode="anchor")
+        g.ax_joint.set_yticks(np.arange(0.5, A))
+        g.ax_joint.set_yticklabels(stats["audio"].unique(), rotation=0)
+
+        # remove ticks between heatmap and histograms
+        g.ax_marg_x.tick_params(axis="x", bottom=False, labelbottom=False)
+        g.ax_marg_y.tick_params(axis="y", left=False, labelleft=False)
+        # # remove ticks showing the heights of the histograms
+        g.ax_marg_x.tick_params(axis="y", left=False, labelleft=False)
+        g.ax_marg_y.tick_params(axis="x", bottom=False, labelbottom=False)
+
+        g.fig.suptitle(name)
+        g.fig.set_size_inches(16, 9)
+        plt.savefig(f"output/{name} heatmap.pdf")
+        plt.close()
+
+    return {**audio_feature_marginals.to_dict(), **video_feature_marginals.to_dict()}
+
+
+def bar_plot(ax, data, xlabels=None, colors=None, total_width=0.8, single_width=1, legend=True):
+    """Draws a bar plot with multiple bars per data point.
+
+    Parameters
+    ----------
+    ax : matplotlib.pyplot.axis
+        The axis we want to draw our plot on.
+
+    data: dictionary
+        A dictionary containing the data we want to plot. Keys are the names of the
+        data, the items is a list of the values.
+
+        Example:
+        data = {
+            "x":[1,2,3],
+            "y":[1,2,3],
+            "z":[1,2,3],
+        }
+
+    colors : array-like, optional
+        A list of colors which are used for the bars. If None, the colors
+        will be the standard matplotlib color cyle. (default: None)
+
+    total_width : float, optional, default: 0.8
+        The width of a bar group. 0.8 means that 80% of the x-axis is covered
+        by bars and 20% will be spaces between the bars.
+
+    single_width: float, optional, default: 1
+        The relative width of a single bar within a group. 1 means the bars
+        will touch eachother within a group, values less than 1 will make
+        these bars thinner.
+
+    legend: bool, optional, default: True
+        If this is set to true, a legend will be added to the axis.
+    """
+
+    # Check if colors where provided, otherwhise use the default color cycle
+    if colors is None:
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    # Number of bars per group
+    n_bars = len(data)
+
+    # The width of a single bar
+    bar_width = total_width / n_bars
+
+    # List containing handles for the drawn bars, used for the legend
+    bars = []
+
+    # Iterate over all data
+    for i, (name, values) in enumerate(data.items()):
+        # The offset in x direction of that bar
+        x_offset = (i - n_bars / 2) * bar_width + bar_width / 2
+
+        # Draw a bar for every value of that type
+        for x, y in enumerate(values):
+            bar = ax.bar(x + x_offset, y, width=bar_width * single_width, color=colors[i % len(colors)])
+
+        # Add a handle to the last drawn bar, which we'll need for the legend
+        bars.append(bar[0])
+
+    if xlabels is not None:
+        ax.set_xticks(range(len(xlabels)), list(xlabels))
+        ax.set_xticklabels(list(xlabels), rotation=40, ha="right")
+
+    # Draw legend if we need
+    if legend:
+        ax.legend(bars, data.keys())
+
+
+@torch.inference_mode()
+def marginals_bar_plot():
+    marg = "max"
+    cache_file = f"output/heatmap_marginals_{marg}.csv"
+    if not os.path.exists(cache_file):
+        rows = []
+        for group in groups:
+            for split in splits:
+                all_files = glob(f"./output/test_vids/{group}*{split}*.mp4")
+
+                grouped = {}
+                for file in all_files:
+                    steps = Path(file).stem.split("_")[1]
+                    if steps in grouped:
+                        grouped[steps].append(file)
+                    else:
+                        grouped[steps] = [file]
+
+                for steps in grouped:
+                    print(group, split, steps)
+                    marginals = heatmap(grouped[steps], f"{group},{split},{steps}", marginals=marg)
+                    rows.append({"group": group, "split": split, "steps": steps, **marginals})
+        df = pd.DataFrame(rows)
+        df.to_csv(cache_file)
+    else:
+        df = pd.read_csv(cache_file, index_col=0)
+
+    grouped = df.groupby(["group", "split"]).agg(["max"])
+
+    data = dict(zip([idx[0] + "," + idx[1] for idx in grouped.index], grouped[df.columns[3:]].values))
+    data = {k + "," + kk: data[k + "," + kk] for k in groups for kk in splits}
+    print(data)
+
+    fig, ax = plt.subplots(figsize=(16, 9))
+    bar_plot(
+        ax,
+        data,
+        xlabels=df.columns[3:],
+        colors=[
+            "lightblue",
+            "lightblue",
+            "lightblue",
+            "tab:blue",
+            "tab:blue",
+            "tab:blue",
+            "lightgreen",
+            "lightgreen",
+            "lightgreen",
+            "tab:green",
+            "tab:green",
+            "tab:green",
+        ],
+    )
+    plt.savefig("output/heatmap_marginals_barplot.pdf")
+
+
+@torch.inference_mode()
+def autocorrelations(files, name):
+    if not os.path.exists(f"output/autocorrelations/{name}_7.pdf"):
+        for i, ((audio,), sr, (video,), fps) in enumerate(tqdm(DataLoader(AudioVisualDataset(files), num_workers=24))):
+            audio, sr, video, fps = audio.cuda(), sr.item(), video.cuda(), fps.item()
+
+            afeats = [(af.__name__, af(audio, sr)) for af in afns]
+            vfeats = [(vf.__name__, vf(video)) for vf in vfns]
+
+            aceil, vceil = ceil(len(afeats) / 3), ceil(len(vfeats) / 3)
+            nrows = max(aceil, vceil)
+            fig, ax = plt.subplots(nrows, 6, figsize=(18, nrows * 3))
+            [x.axis("off") for x in ax.flatten()]
+            for a in range(len(afeats)):
+                aname, afeat = afeats[a]
+                ax[a % aceil, a // aceil].imshow((afeat @ afeat.T).cpu().numpy(), cmap="inferno")
+                ax[a % aceil, a // aceil].set_title(aname)
+            for v in range(len(vfeats)):
+                vname, vfeat = vfeats[v]
+                ax[v % vceil, 3 + v // vceil].imshow((vfeat @ vfeat.T).cpu().numpy(), cmap="inferno")
+                ax[v % vceil, 3 + v // vceil].set_title(vname)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.suptitle("<-- audio | video -->")
+            plt.savefig(f"output/autocorrelations/{name}_{i}.pdf")
+            plt.close()
 
 
 if __name__ == "__main__":
-    groups = ["supervised,learned", "oldsupervised,learned", "selfsupervised,fixed", "supervised,fixed"]
+    groups = ["selfsupervised,fixed", "supervised,fixed", "supervised,learned", "oldsupervised,learned"]
     splits = ["train", "val", "test"]
+
+    files = sum([glob(f"./output/test_vids/{groups[0]}*{split}*.mp4") for split in splits], [])
+
+    fig, ax = plt.subplots(12, 6)
+    [x.axis("off") for x in ax.flatten()]
+    facs, iacs = [], []
+    for i, ((audio,), sr, (_,), _) in enumerate(tqdm(DataLoader(AudioVisualDataset(files), num_workers=24))):
+        audio, sr = audio.cuda(), sr.item()
+        afeats = [afn(audio, sr) for afn in afns]
+
+        fafeats = torch.cat(afeats, dim=1)
+        fac = fafeats @ fafeats.T
+        fac = fac - fac.min()
+        fac = fac / fac.max()
+        facs.append(fac)
+
+        afeats = [af - af.min() for af in afeats]
+        afeats = [af / af.max() for af in afeats]
+        iac = torch.stack([af @ af.T for af in afeats])
+        iac = torch.sum(iac, dim=0)
+        iac = iac - iac.min()
+        iac = iac / iac.max()
+        iacs.append(iac)
+    facs = torch.stack(facs)
+    iacs = torch.stack(iacs)
+    tv.utils.save_image(facs.unsqueeze(1), f"output/full_autocorrelation_audio_features.pdf", nrow=12)
+    tv.utils.save_image(iacs.unsqueeze(1), f"output/neghadamard_autocorrelation_audio_features.pdf", nrow=12)
+    exit()
+
+    rows = []
     for group in groups:
         for split in splits:
             all_files = glob(f"./output/test_vids/{group}*{split}*.mp4")
@@ -219,5 +411,4 @@ if __name__ == "__main__":
                     grouped[steps] = [file]
 
             for steps in grouped:
-                print(group, split, steps)
-                heatmap(grouped[steps], f"{group},{split},{steps}")
+                autocorrelations(grouped[steps], f"{group},{split},{steps}")

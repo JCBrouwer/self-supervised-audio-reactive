@@ -251,9 +251,9 @@ if __name__ == "__main__":
             val_features = torch.from_numpy(f["val_features"])
             test_features = torch.from_numpy(f["test_features"])
 
-        # print(
-        #     "supervision,decoder,iterations,train_latent_rv2,train_latent_rv2_std,train_noise_rv2,train_noise_rv2_std,train_envelope_rv2,train_envelope_rv2_std,val_latent_rv2,val_latent_rv2_std,val_noise_rv2,val_noise_rv2_std,val_envelope_rv2,val_envelope_rv2_std,test_latent_rv2,test_latent_rv2_std,test_noise_rv2,test_noise_rv2_std,test_envelope_rv2,test_envelope_rv2_std,"
-        # )
+        print(
+            "supervision,decoder,iterations,train_latent_rv2,train_latent_rv2_std,train_noise_rv2,train_noise_rv2_std,train_envelope_rv2,train_envelope_rv2_std,val_latent_rv2,val_latent_rv2_std,val_noise_rv2,val_noise_rv2_std,val_envelope_rv2,val_envelope_rv2_std,test_latent_rv2,test_latent_rv2_std,test_noise_rv2,test_noise_rv2_std,test_envelope_rv2,test_envelope_rv2_std"
+        )
         vid_idxs = {
             "train": np.random.permutation(len(train_features))[:8],
             "val": np.random.permutation(len(val_features))[:8],
@@ -285,7 +285,7 @@ if __name__ == "__main__":
                 model, _ = load_model(ckpt)
                 model.cuda()
                 iters = int(Path(ckpt).stem.split("steps")[-1].split("_")[0])
-                # print(f"\n{name}", iters, sep=",", end=",")
+                print(f"\n{name}", iters, sep=",")
                 for split, features, audio_files, offsets in [
                     ("train", train_features, train_audio_files, train_offsets),
                     ("val", val_features, val_audio_files, val_offsets),
@@ -302,7 +302,6 @@ if __name__ == "__main__":
                             stylegan_file=STYLEGAN_CKPT,
                             output_size=(1024, 1024),
                         )
-                    continue
 
                     latrv2s, noirv2s, envrv2s = [], [], []
                     for feat in features.split(batch_size):
@@ -335,5 +334,4 @@ if __name__ == "__main__":
                         f"{np.mean(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
                         f"{np.std(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
                         sep=",",
-                        end=",",
                     )
