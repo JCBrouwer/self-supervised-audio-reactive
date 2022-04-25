@@ -113,7 +113,7 @@ def rv2_loss(predictions: List[torch.Tensor], targets: List[torch.Tensor]) -> to
             for b in range(len(p)):
                 loss[b] = loss[b] + (1 - rv2(p[b].flatten(1), t[b].flatten(1)))
     return loss
-
+    
 
 def infiniter(data_loader):
     while True:

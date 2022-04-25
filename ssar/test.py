@@ -292,7 +292,6 @@ if __name__ == "__main__":
                     ("test", test_features, test_audio_files, test_offsets),
                 ]:
                     for idx in vid_idxs[split]:
-                        print(audio_files[idx][0], offsets[idx].item() / fps)
                         _audio2video(
                             a2l=model,
                             features=features[[idx]].cuda(),

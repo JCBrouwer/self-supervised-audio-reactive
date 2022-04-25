@@ -38,7 +38,7 @@ def rms(y, sr, frame_length=2048, hop_length=1024, center=True, pad_mode="reflec
 
 
 def drop_strength(audio, sr):
-    return emphasize(gaussian_filter(rms(audio, sr), 10), strength=10, percentile=50)
+    return emphasize(gaussian_filter(rms(audio, sr), 10), strength=10, percentile=50).unsqueeze(1)
 
 
 def chromagram(audio, sr):
