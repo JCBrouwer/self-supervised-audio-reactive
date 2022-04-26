@@ -87,7 +87,7 @@ def _autocorrelation_correlation(X, Y, center: bool = True):
 
 
 @torch.jit.script
-def _rv(Ms: List[Tensor], center: bool = True, modified: bool = True):
+def _rv(Ms: List[Tensor], center: bool = True, modified: bool = True, standardize: bool = True):
     """
     This function computes the RV matrix correlation coefficients between pairs of arrays. The number and order of
     objects (rows) for the two arrays must match. The number of variables in each array may vary. The RV2 coefficient is
@@ -102,6 +102,8 @@ def _rv(Ms: List[Tensor], center: bool = True, modified: bool = True):
     for M in Ms:
         if center:
             M = M - M.mean(0)
+        if standardize:
+            M = M / M.std()
         MMt = M @ M.T
         if modified:
             MMt = MMt - torch.diag(torch.diag(MMt))

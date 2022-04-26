@@ -167,13 +167,14 @@ class NormalizeGradients(torch.autograd.Function):
     """Normalize gradient scale in the backward pass"""
 
     @staticmethod
-    def forward(self, input_tensor):
+    def forward(self, input_tensor, strength=1):
+        self.strength = strength
         return input_tensor
 
     @staticmethod
     def backward(self, grad_output):
         grad_input = grad_output.clone()
-        grad_input = grad_input / (torch.norm(grad_input, keepdim=True) + 1e-8)
+        grad_input = self.strength * grad_input / (torch.norm(grad_input, keepdim=True) + 1e-8)
         return grad_input, None
 
 
