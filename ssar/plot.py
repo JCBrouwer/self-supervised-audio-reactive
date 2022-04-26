@@ -365,12 +365,8 @@ def autocorrelations(files, name):
             plt.close()
 
 
-if __name__ == "__main__":
-    groups = ["selfsupervised,fixed", "supervised,fixed", "supervised,learned", "oldsupervised,learned"]
-    splits = ["train", "val", "test"]
-
+def aggregated_autocorrelations():
     files = sum([glob(f"./output/test_vids/{groups[0]}*{split}*.mp4") for split in splits], [])
-
     fig, ax = plt.subplots(12, 6)
     [x.axis("off") for x in ax.flatten()]
     facs, iacs = [], []
@@ -395,8 +391,9 @@ if __name__ == "__main__":
     iacs = torch.stack(iacs)
     tv.utils.save_image(facs.unsqueeze(1), f"output/full_autocorrelation_audio_features.pdf", nrow=12)
     tv.utils.save_image(iacs.unsqueeze(1), f"output/neghadamard_autocorrelation_audio_features.pdf", nrow=12)
-    exit()
 
+
+def test_autocorrelations():
     rows = []
     for group in groups:
         for split in splits:
@@ -412,3 +409,71 @@ if __name__ == "__main__":
 
             for steps in grouped:
                 autocorrelations(grouped[steps], f"{group},{split},{steps}")
+
+
+def upper_triangle_feature_autocorrelation_sum(tensor):
+    acs = torch.zeros((len(tensor), len(tensor)))
+    i = 0
+    # mfcc, chroma, tonnetz, contrast, singles
+    for section in [20, 12, 6, 7, 10000]:
+        acs += (tensor[:, i : i + section] @ tensor[:, i : i + section].T).cpu()
+        i += section
+    return acs
+
+
+if __name__ == "__main__":
+    groups = ["selfsupervised,fixed", "supervised,fixed", "supervised,learned", "oldsupervised,learned"]
+    splits = ["train", "val", "test"]
+
+    with torch.inference_mode():
+        for file in sorted(glob("output/longform_test_vids/*.mp4")):
+
+            with np.load(file.replace(".mp4", "_features.npz")) as f:
+                features = torch.from_numpy(f[list(f.keys())[0]].squeeze()).cuda()
+
+            with np.load(file.replace(".mp4", "_latnoise.npz")) as f:
+                latents = torch.from_numpy(f["residuals"]).squeeze().cuda()
+                try:
+                    noise1 = torch.from_numpy(f["noise1"]).cuda()
+                    noise2 = torch.from_numpy(f["noise2"]).cuda()
+                    noise3 = torch.from_numpy(f["noise3"]).cuda()
+                    noise4 = torch.from_numpy(f["noise4"]).cuda()
+                except:
+                    noise1 = torch.zeros_like(noise1).cuda()
+                    noise2 = torch.zeros_like(noise2).cuda()
+                    noise3 = torch.zeros_like(noise3).cuda()
+                    noise4 = torch.zeros_like(noise4).cuda()
+
+            feat_ac = features @ features.T
+            lat_ac = latents.flatten(1) @ latents.flatten(1).T
+            latabsdiff = absdiff(latents)
+            latad_ac = latabsdiff @ latabsdiff.T
+            noise1_ac = noise1.flatten(1) @ noise1.flatten(1).T
+            noise2_ac = noise2.flatten(1) @ noise2.flatten(1).T
+            noise3_ac = noise3.flatten(1) @ noise3.flatten(1).T
+            noise4_ac = noise4.flatten(1) @ noise4.flatten(1).T
+
+            fig, ax = plt.subplots(3, 4, figsize=(12, 9))
+            [x.axis("off") for x in ax.flatten()]
+            ax[0, 0].imshow(feat_ac.cpu().numpy())
+            ax[0, 3].bar(
+                ["latents", "latabsdiff", "noise1", "noise2", "noise3", "noise4"],
+                [
+                    correlation(features[: len(latents)], latents.flatten(1)).cpu().numpy(),
+                    correlation(features[: len(latabsdiff)], latabsdiff).cpu().numpy(),
+                    correlation(features[: len(noise1)], noise1.flatten(1)).cpu().numpy(),
+                    correlation(features[: len(noise2)], noise2.flatten(1)).cpu().numpy(),
+                    correlation(features[: len(noise3)], noise3.flatten(1)).cpu().numpy(),
+                    correlation(features[: len(noise4)], noise4.flatten(1)).cpu().numpy(),
+                ],
+            )
+            ax[0, 3].axis("on")
+            ax[1, 0].imshow(lat_ac.cpu().numpy())
+            ax[1, 1].imshow(latad_ac.cpu().numpy())
+            ax[2, 0].imshow(noise1_ac.cpu().numpy())
+            ax[2, 1].imshow(noise2_ac.cpu().numpy())
+            ax[2, 2].imshow(noise3_ac.cpu().numpy())
+            ax[2, 3].imshow(noise4_ac.cpu().numpy())
+            plt.tight_layout()
+            plt.savefig(f"output/longform_test_vids/{Path(file).stem}.pdf")
+            plt.close()

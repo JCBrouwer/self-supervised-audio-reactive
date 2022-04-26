@@ -185,153 +185,210 @@ class TestFeatures(Dataset):
         return features.cpu(), offsets, [file] * len(features)
 
 
-if __name__ == "__main__":
-    with torch.inference_mode():
-        dur, fps = 8, 24
-        batch_size = 32
+@torch.inference_mode()
+def generate_by_data_split():
+    dur, fps = 8, 24
+    batch_size = 32
 
-        ss_fixed_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr20_13-26-43_ubuntu94025_selfsupervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001"
-        s_learned_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_13-58-58_ubuntu94025_supervised_gru_learned_decoder_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001"
-        s_fixed_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_12-53-42_ubuntu94025_supervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001"
-        old_learned_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/earlier/___Feb21_15-59-39_ubuntu94025backbone:gru:skipFalse_layerwise:conv:6_hidden_size:64_num_layers:8_dropout:0.2_lr:0.0001_wd:0"
+    ss_fixed_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr20_13-26-43_ubuntu94025_selfsupervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001"
+    s_learned_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_13-58-58_ubuntu94025_supervised_gru_learned_decoder_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001"
+    s_fixed_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_12-53-42_ubuntu94025_supervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001"
+    old_learned_dir = "/home/hans/code/selfsupervisedaudioreactive/runs/earlier/___Feb21_15-59-39_ubuntu94025backbone:gru:skipFalse_layerwise:conv:6_hidden_size:64_num_layers:8_dropout:0.2_lr:0.0001_wd:0"
 
-        with open("cache/audio2latent_192frames_train_files.txt", "r") as f:
-            train_files = sorted(f.read().splitlines())
-        with open("cache/audio2latent_192frames_val_files.txt", "r") as f:
-            val_files = sorted(f.read().splitlines())
-        test_files = list(
-            filter(
-                lambda f: not Path(f).stem.startswith("_"),
-                sorted(glob("/home/hans/datasets/wavefunk/*.wav") + glob("/home/hans/datasets/wavefunk/*.flac")),
+    with open("cache/audio2latent_192frames_train_files.txt", "r") as f:
+        train_files = sorted(f.read().splitlines())
+    with open("cache/audio2latent_192frames_val_files.txt", "r") as f:
+        val_files = sorted(f.read().splitlines())
+    test_files = list(
+        filter(
+            lambda f: not Path(f).stem.startswith("_"),
+            sorted(glob("/home/hans/datasets/wavefunk/*.wav") + glob("/home/hans/datasets/wavefunk/*.flac")),
+        )
+    )
+
+    print("train:", len(train_files))
+    print("val:", len(val_files))
+    print("test:", len(test_files))
+
+    step_count = lambda f: int(f.split("steps")[-1].split("_")[0])
+    sorted_checkpoints = lambda d: list(sorted(glob(f"{d}/*.pt"), key=step_count))
+
+    for name, checkpoints in (
+        ("oldsupervised,learned", sorted_checkpoints(old_learned_dir)),
+        ("supervised,learned", sorted_checkpoints(s_learned_dir)),
+        ("supervised,fixed", sorted_checkpoints(s_fixed_dir)),
+        ("selfsupervised,fixed", sorted_checkpoints(ss_fixed_dir)),
+    ):
+        if not os.path.exists(f"cache/{name}_test_features.npz"):
+            _, a2f = load_model(checkpoints[0])
+
+            def load_features(files):
+                all_features = [
+                    (f.squeeze(), o.squeeze(), a)
+                    for f, o, a in tqdm(DataLoader(TestFeatures(None, a2f, dur, fps, files=files), num_workers=24))
+                ]
+                features, offsets, audio_files = list(map(list, zip(*all_features)))
+                features, offsets, audio_files = torch.cat(features), torch.cat(offsets), sum(audio_files, [])
+                return features, offsets, audio_files
+
+            train_features, train_offsets, train_audio_files = load_features(train_files)
+            val_features, val_offsets, val_audio_files = load_features(val_files)
+            test_features, test_offsets, test_audio_files = load_features(test_files)
+            np.savez_compressed(
+                f"cache/{name}_test_features.npz",
+                train_features=train_features,
+                train_offsets=train_offsets,
+                train_audio_files=train_audio_files,
+                val_features=val_features,
+                val_offsets=val_offsets,
+                val_audio_files=val_audio_files,
+                test_features=test_features,
+                test_offsets=test_offsets,
+                test_audio_files=test_audio_files,
             )
-        )
+    with np.load(f"cache/{name}_test_features.npz") as f:
+        train_features = torch.from_numpy(f["train_features"])
+        val_features = torch.from_numpy(f["val_features"])
+        test_features = torch.from_numpy(f["test_features"])
 
-        print("train:", len(train_files))
-        print("val:", len(val_files))
-        print("test:", len(test_files))
-
-        step_count = lambda f: int(f.split("steps")[-1].split("_")[0])
-        sorted_checkpoints = lambda d: list(sorted(glob(f"{d}/*.pt"), key=step_count))
-
-        for name, checkpoints in (
-            ("oldsupervised,learned", sorted_checkpoints(old_learned_dir)),
-            ("supervised,learned", sorted_checkpoints(s_learned_dir)),
-            ("supervised,fixed", sorted_checkpoints(s_fixed_dir)),
-            ("selfsupervised,fixed", sorted_checkpoints(ss_fixed_dir)),
-        ):
-            if not os.path.exists(f"cache/{name}_test_features.npz"):
-                _, a2f = load_model(checkpoints[0])
-
-                def load_features(files):
-                    all_features = [
-                        (f.squeeze(), o.squeeze(), a)
-                        for f, o, a in tqdm(DataLoader(TestFeatures(None, a2f, dur, fps, files=files), num_workers=24))
-                    ]
-                    features, offsets, audio_files = list(map(list, zip(*all_features)))
-                    features, offsets, audio_files = torch.cat(features), torch.cat(offsets), sum(audio_files, [])
-                    return features, offsets, audio_files
-
-                train_features, train_offsets, train_audio_files = load_features(train_files)
-                val_features, val_offsets, val_audio_files = load_features(val_files)
-                test_features, test_offsets, test_audio_files = load_features(test_files)
-                np.savez_compressed(
-                    f"cache/{name}_test_features.npz",
-                    train_features=train_features,
-                    train_offsets=train_offsets,
-                    train_audio_files=train_audio_files,
-                    val_features=val_features,
-                    val_offsets=val_offsets,
-                    val_audio_files=val_audio_files,
-                    test_features=test_features,
-                    test_offsets=test_offsets,
-                    test_audio_files=test_audio_files,
-                )
+    print(
+        "supervision,decoder,iterations,train_latent_rv2,train_latent_rv2_std,train_noise_rv2,train_noise_rv2_std,train_envelope_rv2,train_envelope_rv2_std,val_latent_rv2,val_latent_rv2_std,val_noise_rv2,val_noise_rv2_std,val_envelope_rv2,val_envelope_rv2_std,test_latent_rv2,test_latent_rv2_std,test_noise_rv2,test_noise_rv2_std,test_envelope_rv2,test_envelope_rv2_std"
+    )
+    vid_idxs = {
+        "train": np.random.permutation(len(train_features))[:8],
+        "val": np.random.permutation(len(val_features))[:8],
+        "test": np.random.permutation(len(test_features))[:8],
+    }
+    for name, checkpoints in (
+        ("selfsupervised,fixed", sorted_checkpoints(ss_fixed_dir)[::3]),
+        ("supervised,fixed", sorted_checkpoints(s_fixed_dir)[::3]),
+        ("oldsupervised,learned", sorted_checkpoints(old_learned_dir)[::3]),
+        ("supervised,learned", sorted_checkpoints(s_learned_dir)[::3]),
+    ):
         with np.load(f"cache/{name}_test_features.npz") as f:
-            train_features = torch.from_numpy(f["train_features"])
-            val_features = torch.from_numpy(f["val_features"])
-            test_features = torch.from_numpy(f["test_features"])
+            train_features, train_audio_files, train_offsets = (
+                torch.from_numpy(f["train_features"]),
+                f["train_audio_files"],
+                torch.from_numpy(f["train_offsets"]),
+            )
+            val_features, val_audio_files, val_offsets = (
+                torch.from_numpy(f["val_features"]),
+                f["val_audio_files"],
+                torch.from_numpy(f["val_offsets"]),
+            )
+            test_features, test_audio_files, test_offsets = (
+                torch.from_numpy(f["test_features"]),
+                f["test_audio_files"],
+                torch.from_numpy(f["test_offsets"]),
+            )
+        for ckpt in checkpoints:
+            model, _ = load_model(ckpt)
+            model.cuda()
+            iters = int(Path(ckpt).stem.split("steps")[-1].split("_")[0])
+            print(f"\n{name}", iters, sep=",")
+            for split, features, audio_files, offsets in [
+                ("train", train_features, train_audio_files, train_offsets),
+                ("val", val_features, val_audio_files, val_offsets),
+                ("test", test_features, test_audio_files, test_offsets),
+            ]:
+                for idx in vid_idxs[split]:
+                    _audio2video(
+                        a2l=model,
+                        features=features[[idx]].cuda(),
+                        audio_file=audio_files[idx][0],
+                        offset=offsets[idx].item() / fps,
+                        duration=dur,
+                        out_file=f"output/test_vids/{name}_{iters}_{split}_{idx}_{Path(audio_files[idx][0]).stem}.mp4",
+                        stylegan_file=STYLEGAN_CKPT,
+                        output_size=(1024, 1024),
+                    )
 
-        print(
-            "supervision,decoder,iterations,train_latent_rv2,train_latent_rv2_std,train_noise_rv2,train_noise_rv2_std,train_envelope_rv2,train_envelope_rv2_std,val_latent_rv2,val_latent_rv2_std,val_noise_rv2,val_noise_rv2_std,val_envelope_rv2,val_envelope_rv2_std,test_latent_rv2,test_latent_rv2_std,test_noise_rv2,test_noise_rv2_std,test_envelope_rv2,test_envelope_rv2_std"
-        )
-        vid_idxs = {
-            "train": np.random.permutation(len(train_features))[:8],
-            "val": np.random.permutation(len(val_features))[:8],
-            "test": np.random.permutation(len(test_features))[:8],
-        }
-        for name, checkpoints in (
-            ("selfsupervised,fixed", sorted_checkpoints(ss_fixed_dir)[::3]),
-            ("supervised,fixed", sorted_checkpoints(s_fixed_dir)[::3]),
-            ("oldsupervised,learned", sorted_checkpoints(old_learned_dir)[::3]),
-            ("supervised,learned", sorted_checkpoints(s_learned_dir)[::3]),
-        ):
-            with np.load(f"cache/{name}_test_features.npz") as f:
-                train_features, train_audio_files, train_offsets = (
-                    torch.from_numpy(f["train_features"]),
-                    f["train_audio_files"],
-                    torch.from_numpy(f["train_offsets"]),
+                latrv2s, noirv2s, envrv2s = [], [], []
+                for feat in features.split(batch_size):
+                    feat = feat.cuda()
+                    outputs = model(feat)
+                    if isinstance(outputs, tuple):
+                        latent_residuals, noise = outputs
+                        rv2loss = rv2_loss([n.flatten(2) for n in noise], [feat])
+                        noirv2s.append(rv2loss.cpu().numpy())
+                    else:
+                        latent_residuals = outputs
+
+                    rv2loss = rv2_loss([latent_residuals.flatten(2)], [feat])
+                    latrv2s.append(rv2loss.cpu().numpy())
+
+                    try:
+                        envelopes = model(feat, return_envelopes=True)
+                        rv2loss = rv2_loss([envelopes], [feat])
+                        envrv2s.append(rv2loss.cpu().numpy())
+                    except:
+                        pass
+                latrv2s = np.concatenate(latrv2s)
+                noirv2s = np.concatenate(noirv2s) if len(noirv2s) > 0 else []
+                envrv2s = np.concatenate(envrv2s) if len(envrv2s) > 0 else []
+                print(
+                    f"{np.mean(latrv2s):.4f}",
+                    f"{np.std(latrv2s):.4f}",
+                    f"{np.mean(noirv2s):.4f}" if len(noirv2s) > 0 else -1,
+                    f"{np.std(noirv2s):.4f}" if len(noirv2s) > 0 else -1,
+                    f"{np.mean(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
+                    f"{np.std(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
+                    sep=",",
                 )
-                val_features, val_audio_files, val_offsets = (
-                    torch.from_numpy(f["val_features"]),
-                    f["val_audio_files"],
-                    torch.from_numpy(f["val_offsets"]),
-                )
-                test_features, test_audio_files, test_offsets = (
-                    torch.from_numpy(f["test_features"]),
-                    f["test_audio_files"],
-                    torch.from_numpy(f["test_offsets"]),
-                )
-            for ckpt in checkpoints:
+
+
+@torch.inference_mode()
+def generate_longform_vids():
+    audio_file = "/home/hans/datasets/wavefunk/naamloos.wav"
+    checkpoint_dirs = [
+        "/home/hans/code/selfsupervisedaudioreactive/runs/Apr25_15-21-35_ubuntu94025_ssabsdiff_transformer_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.1_lr:0.0001",
+        "/home/hans/code/selfsupervisedaudioreactive/runs/Apr25_14-21-11_ubuntu94025_ssabsdiff_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.1_lr:0.0001",
+        "/home/hans/code/selfsupervisedaudioreactive/runs/Apr20_13-26-43_ubuntu94025_selfsupervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+        "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_13-58-58_ubuntu94025_supervised_gru_learned_decoder_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+        "/home/hans/code/selfsupervisedaudioreactive/runs/Apr19_12-53-42_ubuntu94025_supervised_gru_fixed_decoder_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+        "/home/hans/code/selfsupervisedaudioreactive/runs/earlier/___Feb21_15-59-39_ubuntu94025backbone:gru:skipFalse_layerwise:conv:6_hidden_size:64_num_layers:8_dropout:0.2_lr:0.0001_wd:0",
+    ]
+
+    step_count = lambda f: int(f.split("steps")[-1].split("_")[0])
+    sorted_checkpoints = lambda d: list(sorted(glob(f"{d}/*.pt"), key=step_count))
+
+    checkpoints = [sorted_checkpoints(d) for d in checkpoint_dirs]
+    checkpoints = [[cs[round(i)] for i in np.linspace(0, len(cs) - 1, 4)] for cs in checkpoints]
+
+    audio, sr = torchaudio.load(audio_file)
+
+    with tqdm(total=len(checkpoint_dirs) * 4) as pbar:
+        for group in checkpoints:
+
+            name = Path(group[0]).stem.split("_steps")[0]
+
+            pbar.write(f"model {name}")
+            _, a2f = load_model(group[0])
+            features = a2f(audio, sr, fps=24).unsqueeze(0).cuda()
+
+            for ckpt in group:
+                iters = int(Path(ckpt).stem.split("steps")[-1].split("_")[0])
+                pbar.write(f"steps {iters}")
+
+                filebase = f"output/longform_test_vids/{name}_steps={iters}_{Path(audio_file).stem}"
+                np.savez_compressed(f"{filebase}_features.npz", features.cpu().numpy())
+
                 model, _ = load_model(ckpt)
                 model.cuda()
-                iters = int(Path(ckpt).stem.split("steps")[-1].split("_")[0])
-                print(f"\n{name}", iters, sep=",")
-                for split, features, audio_files, offsets in [
-                    ("train", train_features, train_audio_files, train_offsets),
-                    ("val", val_features, val_audio_files, val_offsets),
-                    ("test", test_features, test_audio_files, test_offsets),
-                ]:
-                    for idx in vid_idxs[split]:
-                        _audio2video(
-                            a2l=model,
-                            features=features[[idx]].cuda(),
-                            audio_file=audio_files[idx][0],
-                            offset=offsets[idx].item() / fps,
-                            duration=dur,
-                            out_file=f"output/test_vids/{name}_{iters}_{split}_{idx}_{Path(audio_files[idx][0]).stem}.mp4",
-                            stylegan_file=STYLEGAN_CKPT,
-                            output_size=(1024, 1024),
-                        )
 
-                    latrv2s, noirv2s, envrv2s = [], [], []
-                    for feat in features.split(batch_size):
-                        feat = feat.cuda()
-                        outputs = model(feat)
-                        if isinstance(outputs, tuple):
-                            latent_residuals, noise = outputs
-                            rv2loss = rv2_loss([n.flatten(2) for n in noise], [feat])
-                            noirv2s.append(rv2loss.cpu().numpy())
-                        else:
-                            latent_residuals = outputs
+                _audio2video(
+                    a2l=model,
+                    features=features,
+                    audio_file=audio_file,
+                    offset=0,
+                    duration=None,
+                    out_file=f"{filebase}.mp4",
+                    stylegan_file=STYLEGAN_CKPT,
+                    output_size=(1024, 1024),
+                    save=f"{filebase}_latnoise.npz",
+                )
+                pbar.update()
 
-                        rv2loss = rv2_loss([latent_residuals.flatten(2)], [feat])
-                        latrv2s.append(rv2loss.cpu().numpy())
 
-                        try:
-                            envelopes = model(feat, return_envelopes=True)
-                            rv2loss = rv2_loss([envelopes], [feat])
-                            envrv2s.append(rv2loss.cpu().numpy())
-                        except:
-                            pass
-                    latrv2s = np.concatenate(latrv2s)
-                    noirv2s = np.concatenate(noirv2s) if len(noirv2s) > 0 else []
-                    envrv2s = np.concatenate(envrv2s) if len(envrv2s) > 0 else []
-                    print(
-                        f"{np.mean(latrv2s):.4f}",
-                        f"{np.std(latrv2s):.4f}",
-                        f"{np.mean(noirv2s):.4f}" if len(noirv2s) > 0 else -1,
-                        f"{np.std(noirv2s):.4f}" if len(noirv2s) > 0 else -1,
-                        f"{np.mean(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
-                        f"{np.std(envrv2s):.4f}" if len(envrv2s) > 0 else -1,
-                        sep=",",
-                    )
+if __name__ == "__main__":
+    generate_longform_vids()

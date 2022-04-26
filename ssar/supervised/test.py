@@ -478,16 +478,37 @@ def _audio2video(
     offset=0,
     duration=40,
     seed=42,
+    save=False,
 ):
     outputs = a2l(features)
     if isinstance(outputs, list):
         residuals, noise1, noise2, noise3, noise4 = outputs
+        if save:
+            np.savez_compressed(
+                save,
+                residuals=residuals.cpu().numpy(),
+                noise1=noise1.cpu().numpy(),
+                noise2=noise2.cpu().numpy(),
+                noise3=noise3.cpu().numpy(),
+                noise4=noise4.cpu().numpy(),
+            )
     elif isinstance(outputs, tuple):
         residuals, noise = outputs
         noise1, noise2, noise3, noise4 = [n.squeeze() for n in noise]
+        if save:
+            np.savez_compressed(
+                save,
+                residuals=residuals.cpu().numpy(),
+                noise1=noise1.cpu().numpy(),
+                noise2=noise2.cpu().numpy(),
+                noise3=noise3.cpu().numpy(),
+                noise4=noise4.cpu().numpy(),
+            )
     else:
         residuals = outputs
         noise1 = noise2 = noise3 = noise4 = None
+        if save:
+            np.savez_compressed(save, residuals=residuals.cpu().numpy())
     residuals = residuals.squeeze()
 
     mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
