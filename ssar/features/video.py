@@ -4,7 +4,7 @@ import torch
 import torch.multiprocessing as mp
 from kornia.color.hsv import rgb_to_hsv
 from ssar.analysis.efficient_quantile import quantile
-from ssar.features.processing import cart2pol, median_filter_2d, normalize, onset_envelope, spectral_flux, standardize
+from ssar.features.processing import cart2pol, median_filter2d, normalize, onset_envelope, spectral_flux, standardize
 
 
 # @torch.jit.script
@@ -170,7 +170,7 @@ def directogram(flow, bins: int = 8):
             dg[t, bin] = torch.sum(flow[t, 0][bin_idxs[t] == bin])
     dg = dg.float() / 255.0
 
-    dg = median_filter_2d(dg[None, None]).squeeze()
+    dg = median_filter2d(dg[None, None]).squeeze()
 
     return dg
 

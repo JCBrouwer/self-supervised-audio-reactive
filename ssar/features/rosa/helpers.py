@@ -1,7 +1,10 @@
 import torch
 
 
-def sync_agg(data, slices, aggregate=torch.mean, axis=-1):
+def sync_agg(data, slices, aggregate=torch.mean, axis=-1, pad_slice=False):
+    if pad_slice:
+        slices += [len(data) - 1]
+
     shape = list(data.shape)
     agg_shape = list(shape)
     agg_shape[axis] = len(slices)
@@ -10,7 +13,7 @@ def sync_agg(data, slices, aggregate=torch.mean, axis=-1):
     idx_in = [slice(None)] * data.ndim
     idx_agg = [slice(None)] * data_agg.ndim
 
-    for (i, segment) in enumerate(slices):
+    for i, segment in enumerate(slices):
         idx_in[axis] = segment
         idx_agg[axis] = i
         data_agg[tuple(idx_agg)] = aggregate(data[tuple(idx_in)], axis=axis)

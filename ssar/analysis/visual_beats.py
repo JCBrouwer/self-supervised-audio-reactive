@@ -90,12 +90,12 @@ def optical_flow_cpu(video):
 
 
 @torch.jit.script
-def median_filter_2d(
+def median_filter2d(
     x, k: Tuple[int, int] = (3, 3), s: Tuple[int, int] = (1, 1), p: Tuple[int, int, int, int] = (1, 1, 1, 1)
 ):
     x = pad(x, p, mode="reflect")
     x = x.unfold(2, k[0], s[0]).unfold(3, k[1], s[1])
-    x = x.contiguous().view(x.size()[:4] + (-1,)).median(dim=-1)[0]
+    x = x.contiguous().view(x.size()[:4] + (-1,)).median(dim=-1).values
     return x
 
 
@@ -116,7 +116,7 @@ def directogram(flow, bins: int = 8):
             dg[t, bin] = torch.sum(flow[t, 0][bin_idxs[t] == bin])
     dg = dg.float() / 255.0
 
-    dg = median_filter_2d(dg[None, None]).squeeze()
+    dg = median_filter2d(dg[None, None]).squeeze()
 
     return dg
 

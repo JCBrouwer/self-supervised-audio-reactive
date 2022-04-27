@@ -71,7 +71,7 @@ def cart2pol(x, y):
     return rho, phi
 
 
-def median_filter_2d(
+def median_filter2d(
     x,
     k: Tuple[int, int] = (3, 3),
     s: Tuple[int, int] = (1, 1),

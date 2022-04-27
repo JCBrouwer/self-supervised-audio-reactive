@@ -3,7 +3,7 @@ import torch
 from torch.nn.functional import conv1d
 from torchcubicspline import natural_cubic_spline_coeffs
 
-from ..processing import median_filter_2d
+from ..processing import median_filter2d
 from .convert import cq_to_chroma, hz_to_mel, mel_to_hz
 
 
@@ -150,10 +150,10 @@ def hpss(S, ks=31, power=2.0, margin=1.0):
 
     # Compute median filters. Pre-allocation here preserves memory layout.
     harm = torch.empty_like(S)
-    harm[:] = median_filter_2d(S[None, None], k=(1, ks), p=(ks // 2, ks // 2, 0, 0)).squeeze()
+    harm[:] = median_filter2d(S[None, None], k=(1, ks), p=(ks // 2, ks // 2, 0, 0)).squeeze()
 
     perc = torch.empty_like(S)
-    perc[:] = median_filter_2d(S[None, None], k=(ks, 1), p=(0, 0, ks // 2, ks // 2)).squeeze()
+    perc[:] = median_filter2d(S[None, None], k=(ks, 1), p=(0, 0, ks // 2, ks // 2)).squeeze()
 
     split_zeros = margin == 1 and margin == 1
     mask_harm = softmask(harm, perc * margin, power=power, split_zeros=split_zeros)
