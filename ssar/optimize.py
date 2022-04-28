@@ -9,7 +9,7 @@ import matplotlib
 import numpy as np
 import torch
 import torchaudio
-from torch.nn.functional import one_hot, pad
+from torch.nn.functional import binary_cross_entropy, cross_entropy, l1_loss, log_softmax, one_hot, pad
 from torchaudio.functional import resample
 from tqdm import tqdm
 
@@ -29,7 +29,7 @@ sys.path.append("/home/hans/code/maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
 from ops.video import VideoWriter
 
-afns = [chromagram, tonnetz, mfcc, spectral_contrast, spectral_flatness, rms, drop_strength, onsets, pulse]
+afns = [chromagram, tonnetz, mfcc, spectral_contrast, spectral_flatness, rms, drop_strength, onsets]#, pulse]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # fmt: on
@@ -44,7 +44,7 @@ def latent2video(
     stylegan_file,
     fps=24,
     output_size=(1024, 1024),
-    batch_size=16,
+    batch_size=8,
     offset=0,
     duration=None,
 ):
@@ -101,14 +101,14 @@ class HiPPOTimeseries(torch.nn.Module):
 
 
 class FixedLatentNoiseDecoder(torch.nn.Module):
-    def __init__(self, latents, hidden_size=12, n_latent_split=3, n_noise=4):
+    def __init__(self, latents, n_latent_split=3, n_latent_per_split=3):
         super().__init__()
 
         self.S = n_latent_split
-        self.H = hidden_size
+        self.H = n_latent_per_split
         assert (
             len(latents) == self.S * self.H
-        ), f"Number of latent vectors supplied does not equal n_latent_split * hidden_size ({self.S * self.H})"
+        ), f"Number of latent vectors supplied does not equal n_latent_split * n_latent_per_split ({self.S * self.H})"
         self.latents = latents
         self.W = self.latents.shape[1] // self.S
 
@@ -167,81 +167,83 @@ def abscos(X, Y):
     return torch.abs(XX.flatten() @ YY.flatten())
 
 
-class MutualInformation(torch.nn.Module):
-    def __init__(self, max_val=16, sigma=0.4, num_bins=256, normalize=True):
-        super(MutualInformation, self).__init__()
+def auction_lap(X, eps=None, max_iters=2500):
+    """
+    From https://github.com/bkj/auction-lap
+    https://dspace.mit.edu/bitstream/handle/1721.1/3265/P-2108-26912652.pdf
 
-        self.max_val = max_val
-        self.sigma = 2 * sigma ** 2
-        self.num_bins = num_bins
-        self.normalize = normalize
-        self.epsilon = 1e-10
+    X: n-by-n matrix w/ integer entries
+    eps: "bid size" -- smaller values means higher accuracy w/ longer runtime
+    """
+    eps = 1 / X.shape[0] if eps is None else eps
 
-        self.register_buffer("bins", torch.linspace(0, max_val, num_bins, device=device)[None, None].float())
+    cost = torch.zeros((1, X.shape[1]), device=X.device)
+    assignment = torch.zeros(X.shape[0], device=X.device, dtype=torch.long) - 1
+    bids = torch.zeros(X.shape, device=X.device)
 
-    def marginal_pdf(self, values):
-        residuals = values - self.bins
-        kernel_values = torch.exp(-0.5 * (residuals / self.sigma).pow(2))
+    counter = 0
+    while (assignment == -1).any():
+        counter += 1
 
-        pdf = torch.mean(kernel_values, dim=1)
-        normalization = torch.sum(pdf, dim=1).unsqueeze(1) + self.epsilon
-        pdf = pdf / normalization
+        # Bidding
+        unassigned = (assignment == -1).nonzero().squeeze(1)
 
-        return pdf, kernel_values
+        value = X[unassigned] - cost
+        top_value, top_idx = value.topk(2, dim=1)
 
-    def joint_pdf(self, kernel_values1, kernel_values2):
+        first_idx = top_idx[:, 0]
+        first_value, second_value = top_value[:, 0], top_value[:, 1]
 
-        joint_kernel_values = torch.matmul(kernel_values1.transpose(1, 2), kernel_values2)
-        normalization = torch.sum(joint_kernel_values, dim=(1, 2)).view(-1, 1, 1) + self.epsilon
-        pdf = joint_kernel_values / normalization
+        bid_increments = first_value - second_value + eps
 
-        return pdf
+        bids_ = bids[unassigned]
+        bids_.zero_()
+        bids_.scatter_(dim=1, index=first_idx.contiguous().view(-1, 1), src=bid_increments.view(-1, 1))
 
-    def get_mutual_information(self, x1, x2):
-        """
-        x1: 1, T, C
-        x2: 1, T, C
-        return: scalar
-        """
-        assert x1.max() <= self.max_val and x2.max() <= self.max_val, "Values must be in range [0, max_val]!"
-        pdf_x1, kernel_values1 = self.marginal_pdf(x1)
-        pdf_x2, kernel_values2 = self.marginal_pdf(x2)
-        pdf_x1x2 = self.joint_pdf(kernel_values1, kernel_values2)
+        # Assignment
+        have_bidder = (bids_ > 0).int().sum(dim=0).nonzero()
 
-        H_x1 = -torch.sum(pdf_x1 * torch.log2(pdf_x1 + self.epsilon), dim=1)
-        H_x2 = -torch.sum(pdf_x2 * torch.log2(pdf_x2 + self.epsilon), dim=1)
-        H_x1x2 = -torch.sum(pdf_x1x2 * torch.log2(pdf_x1x2 + self.epsilon), dim=(1, 2))
+        high_bids, high_bidders = bids_[:, have_bidder].max(dim=0)
+        high_bidders = unassigned[high_bidders.squeeze()]
 
-        mutual_information = H_x1 + H_x2 - H_x1x2
+        cost[:, have_bidder] += high_bids
 
-        if self.normalize:
-            mutual_information = 2 * mutual_information / (H_x1 + H_x2)
+        assignment[(assignment.view(-1, 1) == have_bidder.view(1, -1)).sum(dim=1)] = -1
+        assignment[high_bidders] = have_bidder.squeeze()
 
-        return mutual_information
+        if counter > max_iters:
+            assignment = torch.arange(len(assignment), device=X.device)  # abort
+            break
 
-    def forward(self, input1, input2):
-        """
-        input1: T, C
-        input2: T, C
-        return: scalar
-        """
-        return self.get_mutual_information(input1.unsqueeze(0), input2.unsqueeze(0))
+    return assignment
 
 
-mutual_information = MutualInformation()
+def lap_loss(targets, predictions):
+    total_loss = 0
+    for b in range(len(targets)):
+        target, prediction = targets[b], predictions[b]
+        assignment = auction_lap(target.T @ prediction)
+        prediction = prediction[:, assignment]
+        loss = l1_loss(prediction, target)
+        total_loss = total_loss + loss
+    return total_loss
 
 
 def optimize(
     audio_file,
     fps=24,
-    n_steps=1024,
-    n_params=512,
-    hidden_size=6,
+    n_steps=512,
+    n_params=128,
     n_latent_split=1,
+    n_latent_per_split=6,
     n_noise=4,
-    lr=1e-4,
-    log_steps=64,
-    eval_steps=256,
+    lr=5e-4,
+    log_steps=16,
+    eval_steps=128,
+    prediction_similarity_penalty=0,
+    lambda_rv2=0,
+    lambda_lap=1,
+    use_audio_segmentation_features=False,
 ):
     with torch.no_grad():
         audio, sr = torchaudio.load(audio_file)
@@ -249,7 +251,7 @@ def optimize(
         audio = resample(audio, sr, 1024 * fps)
         sr = 1024 * fps
 
-        n_envelopes = n_latent_split * hidden_size + 2 * n_noise
+        n_envelopes = n_latent_split * n_latent_per_split + 2 * n_noise
         pred_names = ["envelopes", "latents", "noise 4x4", "noise 8x8", "noise 16x16", "noise 32x32"]
 
         features = {afn.__name__: afn(audio, sr).to(device) for afn in afns}
@@ -260,40 +262,39 @@ def optimize(
             ac -= ac.min()
             ac /= ac.max()
             feature_weights[name] = 1 / ac.mean()
-        median_weight = torch.median(torch.tensor(list(feature_weights.values())))
 
-        ks = [2, 3, 4, 5, 6, 7, 8, 8, 8, 12, 12, 12, 16, 16, 16]
-        segmentations = laplacian_segmentation_rosa(audio.numpy(), sr, n_frames, ks=ks)
-        for i, (k, seg) in enumerate(zip(ks, segmentations.unbind(1))):
-            seg = seg.unsqueeze(1).to(device)
-            features[f"segmentation_{i}_{k}"] = seg
-            feature_weights[f"segmentation_{i}_{k}"] = median_weight
+        ks = [2, 4, 6, 8, 12, 16]
+        if use_audio_segmentation_features:
+            median_weight = torch.median(torch.tensor(list(feature_weights.values())))
+            segmentations = laplacian_segmentation_rosa(audio.numpy(), sr, n_frames, ks=ks)
+            for i, (k, seg) in enumerate(zip(ks, segmentations.unbind(1))):
+                seg = seg.unsqueeze(1).to(device)
+                features[f"segmentation_{i}_{k}"] = seg
+                feature_weights[f"segmentation_{i}_{k}"] = median_weight
 
         _, beats = rosa.beat.beat_track(y=audio.numpy(), sr=sr, trim=False, hop_length=1024)
         beats = list(beats)
         feature_segmentations = {}
         for name, feature in features.items():
             if not "segmentation" in name:
-                print(name, feature.shape)
-                feature_segmentations[name] = laplacian_segmentation(feature, beats)
-                print(feature_segmentations[name].shape)
+                feature_segmentations[name] = laplacian_segmentation(feature, beats, ks=ks)
 
         envelopes = HiPPOTimeseries(torch.rand((n_frames, n_envelopes), device=device), N=n_params)
         envelopes = envelopes.to(device)
 
         mapper = StyleGAN2Mapper(model_file=STYLEGAN_CKPT, inference=False)
         decoder_latents = mapper(
-            torch.from_numpy(np.random.RandomState(42).randn(n_latent_split * hidden_size, 512))
+            torch.from_numpy(np.random.RandomState(42).randn(n_latent_split * n_latent_per_split, 512))
         ).to(device)
         del mapper
         decoder = FixedLatentNoiseDecoder(
-            decoder_latents, hidden_size=hidden_size, n_latent_split=n_latent_split, n_noise=n_noise
+            decoder_latents, n_latent_split=n_latent_split, n_latent_per_split=n_latent_per_split
         )
 
         optimizer = torch.optim.Adam(envelopes.parameters(), lr=lr)
 
         uuid = str(uuid4())[:6]
-        save_base = f"output/hippo_{Path(audio_file).stem}_{uuid}"
+        save_base = f"output/optimization/hippo_{Path(audio_file).stem}_{uuid}"
         shutil.copy(__file__, f"{save_base}.py")
 
     with tqdm(range(n_steps)) as pbar:
@@ -308,33 +309,43 @@ def optimize(
                 + [normalize_gradients(n, 0.25) for n in noise]
             )
 
-            penalty = 0
-            for p1 in range(len(predictions)):
-                for p2 in range(p1 + 1, len(predictions)):
-                    penalty = penalty + abscos(predictions[p1], predictions[p2])
-            penalty = 10 * penalty
+            if prediction_similarity_penalty:
+                penalty = 0
+                for p1 in range(len(predictions)):
+                    for p2 in range(p1 + 1, len(predictions)):
+                        penalty = penalty + abscos(predictions[p1], predictions[p2])
+                penalty = prediction_similarity_penalty * penalty
 
             loss, loss_seg = 0, 0
             for nn, p in zip(pred_names, predictions):
-                for n, f in features.items():
-                    contribution = feature_weights[n] * (1 - rv2(p, f))
-                    loss = loss + contribution
 
-                    contribution_seg = mutual_information(feature_segmentations[n], laplacian_segmentation(f, beats))
-                    loss_seg = loss_seg + contribution_seg
+                segmentations = laplacian_segmentation(p.flatten(1), beats, ks=ks)
+
+                for n, f in features.items():
+                    if lambda_rv2:
+                        contribution = lambda_rv2 * feature_weights[n] * (1 - rv2(p, f))
+                        loss = loss + contribution
+
+                    if lambda_lap:
+                        contribution_seg = lambda_lap * lap_loss(feature_segmentations[n], segmentations).mean()
+                        loss_seg = loss_seg + contribution_seg
 
                     if it % log_steps == 0:
                         pbar.write(
-                            nn.ljust(20) + n.ljust(20) + f"{contribution.item():.4f}    {contribution_seg.item():.4f}"
+                            nn.ljust(20)
+                            + n.ljust(20)
+                            # + f"{contribution.item():.4f}".ljust(10)
+                            + f"{contribution_seg.item():.4f}"
                         )
 
-            (loss + loss_seg + penalty).backward()
+            (loss + loss_seg).backward()
             optimizer.step()
 
             if it % log_steps == 0:
                 pbar.write(f"total  : {loss.item():.4f}")
-                pbar.write(f"seg    : {loss_seg.item():.4f}")
-                pbar.write(f"penalty: {penalty.item():.4f}\n")
+                # pbar.write(f"seg    : {loss_seg.item():.4f}")
+                if prediction_similarity_penalty:
+                    pbar.write(f"penalty: {penalty.item():.4f}\n")
 
                 fig, ax = plt.subplots(5, 6, figsize=(20, 16))
                 [x.axis("off") for x in ax.flatten()]

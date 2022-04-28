@@ -152,3 +152,11 @@ def high_pass(audio, sr, fmin=4000):
 
 def contrast_enhance(audio, sr, strength=75):
     return contrast(audio, sr, strength)
+
+
+def confusion_matrix(target, prediction, num_classes):
+    unique_mapping = (target.view(-1) * num_classes + prediction.view(-1)).to(torch.long)
+    minlength = num_classes ** 2
+    bins = torch.bincount(unique_mapping, minlength=minlength)
+    confmat = bins.reshape(num_classes, num_classes)
+    return confmat

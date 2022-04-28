@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from torch.nn.functional import interpolate, pad
+from torch.nn.functional import interpolate, one_hot, pad
 from torch_geometric.utils import get_laplacian
 
 
@@ -123,6 +123,69 @@ class KMeans(NN):
                 self.train_pts[lab] = torch.mean(X[select], dim=0)
 
 
+def plus_plus(ds, k):
+    """
+    From https://www.kdnuggets.com/2020/06/centroid-initialization-k-means-clustering.html
+
+    Create cluster centroids using the k-means++ algorithm.
+    Parameters
+    ----------
+    ds : numpy array
+        The dataset to be used for centroid initialization.
+    k : int
+        The desired number of clusters for which centroids are required.
+    Returns
+    -------
+    centroids : numpy array
+        Collection of k centroids as a numpy array.
+    Inspiration from here: https://stackoverflow.com/questions/5466323/how-could-one-implement-the-k-means-algorithm
+    """
+
+    centroids = [ds[0]]
+
+    for _ in range(1, k):
+        dist_sq = np.array([min([np.inner(c - x, c - x) for c in centroids]) for x in ds])
+        probs = dist_sq / dist_sq.sum()
+        cumulative_probs = probs.cumsum()
+        r = np.random.rand()
+
+        i = len(cumulative_probs) - 1
+        for j, p in enumerate(cumulative_probs):
+            if r < p:
+                i = j
+                break
+
+        centroids.append(ds[i])
+
+    return np.array(centroids)
+
+
+def differentiable_k_means(data, k, num_iter, cluster_temp=5):
+    """
+    pytorch (differentiable) implementation of soft k-means clustering.
+    https://github.com/bwilder0/clusternet/blob/master/models.py
+    """
+    # normalize x so it lies on the unit sphere
+    data = torch.diag(1.0 / torch.norm(data, p=2, dim=1)) @ data
+    # use kmeans++ initialization
+    mu = torch.tensor(plus_plus(data.cpu().detach().numpy(), k), requires_grad=True).to(data)
+    for t in range(num_iter):
+        # get distances between all data points and cluster centers
+        dist = data @ mu.t()
+        # cluster responsibilities via softmax
+        r = torch.softmax(cluster_temp * dist, 1)
+        # total responsibility of each cluster
+        cluster_r = r.sum(dim=0)
+        # mean of points in each cluster weighted by responsibility
+        cluster_mean = (r.t().unsqueeze(1) @ data.expand(k, *data.shape)).squeeze(1)
+        # update cluster means
+        new_mu = torch.diag(1 / cluster_r) @ cluster_mean
+        mu = new_mu
+    dist = data @ mu.t()
+    r = torch.softmax(cluster_temp * dist, 1)
+    return mu, r, dist
+
+
 def recurrence_matrix(data, k=None, width=1, sym=False, bandwidth=None):
     t = data.shape[0]
     data = data.flatten(1)
@@ -224,10 +287,10 @@ def laplacian_segmentation(envelope, beats, ks=[2, 4, 6, 8, 12, 16]):
     segmentations = []
     for k in ks:
         X = evecs[:, :k] / Cnorm[:, k - 1 : k]
-        segmentation = KMeans(X=X, k=k).predict(X).float()
-        segmentation = interpolate(segmentation[None, None, :], size=envelope.shape[0], mode="nearest").squeeze()
+        _, segmentation, _ = differentiable_k_means(data=X, k=k, num_iter=100)
+        segmentation = interpolate(segmentation.T[None], size=envelope.shape[0], mode="nearest").squeeze().T
         segmentations.append(segmentation)
-    return torch.stack(segmentations, dim=1)
+    return segmentations
 
 
 import librosa as rosa
@@ -289,7 +352,7 @@ def laplacian_segmentation_rosa(audio, sr, out_size, ks=[2, 4, 6, 8, 16]):
         segmentation = torch.from_numpy(sklearn.cluster.KMeans(n_clusters=k).fit_predict(X)).float()
         segmentation = interpolate(segmentation[None, None, :], size=out_size, mode="nearest").squeeze()
         segmentations.append(segmentation)
-    return torch.stack(segmentations, dim=1)
+    return torch.stack(segmentations, dim=1).long()
 
 
 if __name__ == "__main__":
