@@ -51,7 +51,7 @@ def gaussian_filter(x, sigma, mode: str = "circular", causal: float = 1):
 # @torch.jit.script
 def normalize(array):
     array = array - array.min()
-    array = array / array.max()
+    array = array / (array.max() + 1e-8)
     return array
 
 

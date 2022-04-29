@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from torch.nn.functional import interpolate, one_hot, pad
+from torch.nn.functional import interpolate, pad
 from torch_geometric.utils import get_laplacian
 
 
@@ -8,8 +8,8 @@ def randomize_tensor(tensor):
     return tensor[torch.randperm(len(tensor))]
 
 
-def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
-    y = x if type(y) == type(None) else y
+def distance_matrix(x, p=2):  # pairwise distance of vectors
+    y = x
 
     n = x.size(0)
     m = y.size(0)
@@ -18,172 +18,10 @@ def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
     x = x.unsqueeze(1).expand(n, m, d)
     y = y.unsqueeze(0).expand(n, m, d)
 
-    dist = torch.pow(x - y, p).sum(2)
+    dist = torch.pow(x - y, p).sum(2) + 1e-8
+    dist = dist ** (1 / p)
 
     return dist
-
-
-class NN:
-    """
-    Author: Josue N Rivera (github.com/JosueCom)
-    Date: 7/3/2021
-    Description: Snippet of various clustering implementations only using PyTorch
-    Full project repository: https://github.com/JosueCom/Lign (A graph deep learning framework that works alongside PyTorch)
-    """
-
-    def __init__(self, X=None, Y=None, p=2):
-        self.p = p
-        self.train(X, Y)
-
-    def train(self, X, Y):
-        self.train_pts = X
-        self.train_label = Y
-
-    def __call__(self, x):
-        return self.predict(x)
-
-    def predict(self, x):
-        if type(self.train_pts) == type(None) or type(self.train_label) == type(None):
-            name = self.__class__.__name__
-            raise RuntimeError(f"{name} wasn't trained. Need to execute {name}.train() first")
-
-        dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-        labels = torch.argmin(dist, dim=1)
-        return self.train_label[labels]
-
-
-class KNN(NN):
-    """
-    Author: Josue N Rivera (github.com/JosueCom)
-    Date: 7/3/2021
-    Description: Snippet of various clustering implementations only using PyTorch
-    Full project repository: https://github.com/JosueCom/Lign (A graph deep learning framework that works alongside PyTorch)
-    """
-
-    def __init__(self, X=None, Y=None, k=3, p=2):
-        self.k = k
-        super().__init__(X, Y, p)
-
-    def train(self, X, Y):
-        super().train(X, Y)
-        if type(Y) != type(None):
-            self.unique_labels = self.train_label.unique()
-
-    def predict(self, x):
-        if type(self.train_pts) == type(None) or type(self.train_label) == type(None):
-            name = self.__class__.__name__
-            raise RuntimeError(f"{name} wasn't trained. Need to execute {name}.train() first")
-
-        dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-
-        knn = dist.topk(self.k, largest=False)
-        votes = self.train_label[knn.indices]
-
-        winner = torch.zeros(votes.size(0), dtype=votes.dtype, device=votes.device)
-        count = torch.zeros(votes.size(0), dtype=votes.dtype, device=votes.device) - 1
-
-        for lab in self.unique_labels:
-            vote_count = (votes == lab).sum(1)
-            who = vote_count >= count
-            winner[who] = lab
-            count[who] = vote_count[who]
-
-        return winner
-
-    def distances(self, x):
-        return distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-
-
-class KMeans(NN):
-    """
-    Author: Josue N Rivera (github.com/JosueCom)
-    Date: 7/3/2021
-    Description: Snippet of various clustering implementations only using PyTorch
-    Full project repository: https://github.com/JosueCom/Lign (A graph deep learning framework that works alongside PyTorch)
-    """
-
-    def __init__(self, X=None, k=2, n_iters=10, p=2):
-
-        self.k = k
-        self.n_iters = n_iters
-        self.p = p
-
-        if type(X) != type(None):
-            self.train(X)
-
-    def train(self, X):
-        self.train_pts = randomize_tensor(X)[: self.k]
-        self.train_label = torch.LongTensor(range(self.k))
-
-        for _ in range(self.n_iters):
-            labels = self.predict(X)
-
-            for lab in range(self.k):
-                select = labels == lab
-                self.train_pts[lab] = torch.mean(X[select], dim=0)
-
-
-def plus_plus(ds, k):
-    """
-    From https://www.kdnuggets.com/2020/06/centroid-initialization-k-means-clustering.html
-
-    Create cluster centroids using the k-means++ algorithm.
-    Parameters
-    ----------
-    ds : numpy array
-        The dataset to be used for centroid initialization.
-    k : int
-        The desired number of clusters for which centroids are required.
-    Returns
-    -------
-    centroids : numpy array
-        Collection of k centroids as a numpy array.
-    Inspiration from here: https://stackoverflow.com/questions/5466323/how-could-one-implement-the-k-means-algorithm
-    """
-
-    centroids = [ds[0]]
-
-    for _ in range(1, k):
-        dist_sq = np.array([min([np.inner(c - x, c - x) for c in centroids]) for x in ds])
-        probs = dist_sq / dist_sq.sum()
-        cumulative_probs = probs.cumsum()
-        r = np.random.rand()
-
-        i = len(cumulative_probs) - 1
-        for j, p in enumerate(cumulative_probs):
-            if r < p:
-                i = j
-                break
-
-        centroids.append(ds[i])
-
-    return np.array(centroids)
-
-
-def differentiable_k_means(data, k, num_iter, cluster_temp=5):
-    """
-    pytorch (differentiable) implementation of soft k-means clustering.
-    https://github.com/bwilder0/clusternet/blob/master/models.py
-    """
-    # normalize x so it lies on the unit sphere
-    data = torch.diag(1.0 / torch.norm(data, p=2, dim=1)) @ data
-    # use kmeans++ initialization
-    mu = torch.tensor(plus_plus(data.cpu().detach().numpy(), k), requires_grad=True).to(data)
-    for t in range(num_iter):
-        # get distances between all data points and cluster centers
-        dist = data @ mu.t()
-        # cluster responsibilities via softmax
-        r = torch.softmax(cluster_temp * dist, 1)
-        # total responsibility of each cluster
-        cluster_r = r.sum(dim=0)
-        # mean of points in each cluster weighted by responsibility
-        cluster_mean = (r.t().unsqueeze(1) @ data.expand(k, *data.shape)).squeeze(1)
-        # update cluster means
-        new_mu = torch.diag(1 / cluster_r) @ cluster_mean
-        mu = new_mu
-    dist = data @ mu.t()
-    r = torch.softmax(cluster_temp * dist, 1)
-    return mu, r, dist
 
 
 def recurrence_matrix(data, k=None, width=1, sym=False, bandwidth=None):
@@ -198,13 +36,12 @@ def recurrence_matrix(data, k=None, width=1, sym=False, bandwidth=None):
     k = int(k)
 
     # Build the neighbor search object
-    knn = KNN(data, k=min(t - 1, k + 2 * width))
-    rec = knn.distances(data)
+    rec = distance_matrix(data)
 
     # Remove connections within width
     for d in range(-width + 1, width):
         torch.diagonal(rec, offset=d).fill_(0)
-    rec[rec == 0] = 1e20
+    rec = rec + (rec == 0).float() * 1e20
 
     # Retain only the top-k links per point
     smallest_k = torch.topk(rec, k, dim=0, largest=False)
@@ -220,9 +57,9 @@ def recurrence_matrix(data, k=None, width=1, sym=False, bandwidth=None):
     # Set all the negatives back to 0
     # Negatives are temporarily inserted above to preserve the sparsity structure
     # of the matrix without corrupting the bandwidth calculations
-    rec[rec < 0] = 0.0
+    rec = rec * (1 - (rec < 0).float())  # set to zero
     rec = torch.exp(rec / (-1 * bandwidth))
-    rec[rec >= 1] = 0
+    rec = rec * (1 - (rec >= 1).float())  # set to zero
 
     return rec
 
@@ -251,11 +88,58 @@ def timelag_median_filter(rec):
     return rec
 
 
+def init_plus_plus(ds, k):
+    """
+    Create cluster centroids using the k-means++ algorithm.
+    From https://www.kdnuggets.com/2020/06/centroid-initialization-k-means-clustering.html
+    """
+    centroids = [ds[0]]
+    for _ in range(1, k):
+        dist_sq = np.array([min([np.inner(c - x, c - x) for c in centroids]) for x in ds])
+        probs = dist_sq / dist_sq.sum()
+        cumulative_probs = probs.cumsum()
+        r = np.random.rand()
+        i = len(cumulative_probs) - 1
+        for j, p in enumerate(cumulative_probs):
+            if r < p:
+                i = j
+                break
+        centroids.append(ds[i])
+    return np.array(centroids)
+
+
+def differentiable_k_means(data, k, num_iter, cluster_temp=5):
+    """
+    pytorch (differentiable) implementation of soft k-means clustering.
+    https://github.com/bwilder0/clusternet/blob/master/models.py
+    """
+    # normalize x so it lies on the unit sphere
+    data = torch.diag(1.0 / torch.norm(data, p=2, dim=1)) @ data
+    # use kmeans++ initialization
+    mu = torch.tensor(init_plus_plus(data.cpu().detach().numpy(), k), requires_grad=True).to(data)
+    for _ in range(num_iter):
+        # get distances between all data points and cluster centers
+        dist = data @ mu.t()
+        # cluster responsibilities via softmax
+        r = torch.softmax(cluster_temp * dist, 1)
+        # total responsibility of each cluster
+        cluster_r = r.sum(dim=0)
+        # mean of points in each cluster weighted by responsibility
+        cluster_mean = (r.t().unsqueeze(1) @ data.expand(k, *data.shape)).squeeze(1)
+        # update cluster means
+        new_mu = torch.diag(1 / cluster_r) @ cluster_mean
+        mu = new_mu
+    dist = data @ mu.t()
+    r = torch.softmax(cluster_temp * dist, 1)
+    return mu, r, dist
+
+
 def laplacian_segmentation(envelope, beats, ks=[2, 4, 6, 8, 12, 16]):
     # make envelope beat-synchronous to reduce dimensionality
-    Csync = torch.zeros((len(beats) + 1, envelope.shape[1]), dtype=envelope.dtype, device=envelope.device)
-    for b, (beat1, beat2) in enumerate(zip([0] + beats, beats + [len(envelope)])):
-        Csync[b, :] = torch.median(envelope[beat1:beat2], dim=0).values
+    Csync = []
+    for beat1, beat2 in zip([0] + beats, beats + [len(envelope)]):
+        Csync.append(torch.median(envelope[beat1:beat2], dim=0).values)
+    Csync = torch.stack(Csync, dim=0)
 
     # build a weighted recurrence matrix using beat-synchronous envelope
     R = recurrence_matrix(Csync, width=3, sym=True)
