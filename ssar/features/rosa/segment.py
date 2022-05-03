@@ -96,7 +96,7 @@ def init_plus_plus(ds, k):
     centroids = [ds[0]]
     for _ in range(1, k):
         dist_sq = np.array([min([np.inner(c - x, c - x) for c in centroids]) for x in ds])
-        probs = dist_sq / dist_sq.sum()
+        probs = dist_sq / (dist_sq.sum() + 1e-8)
         cumulative_probs = probs.cumsum()
         r = np.random.rand()
         i = len(cumulative_probs) - 1
@@ -162,7 +162,11 @@ def laplacian_segmentation(envelope, beats, ks=[2, 4, 6, 8, 12, 16]):
     # compute the normalized laplacian and its spectral decomposition
     edge_index, edge_weight = get_laplacian(edge_index.T, edge_weight, normalization="sym")
     L = torch.sparse_coo_tensor(edge_index, edge_weight, device=A.device).to_dense()
-    _, evecs = torch.linalg.eigh(L)
+    try:
+        _, evecs = torch.linalg.eigh(L)
+    except:
+        _, evecs = torch.linalg.eig(L)
+        evecs = evecs.real
     # median filter to smooth over small discontinuities
     evecs = median_filter1d(evecs.T, k=9, s=1, p=4).T
     # cumulative normalization for symmetric normalized laplacian eigenvectors
