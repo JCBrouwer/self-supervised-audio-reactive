@@ -53,8 +53,8 @@ def spline_loop_latents(y, size, n_loops=1):
     return out.permute(1, 0, 2)
 
 
-def latent_patch(latents, ws, segmentations, features, tempo, fps, base, k, nb, feat, where, merge, seed):
-    feature = features[feat]
+def latent_patch(latents, ws, segmentations, features, tempo, fps, base, k, nb, feat, feat_weight, where, merge, seed):
+    feature = feat_weight * features[feat]
     segmentation = segmentations[(feat, k)]
     permutation = np.random.RandomState(seed).permutation(len(ws))
 
@@ -113,74 +113,41 @@ class Noise(torch.nn.Module):
 class Blend(Noise):
     def __init__(self, length, size, modulator):
         super().__init__(length, size)
-        self.register_buffer("vec1", torch.randn((modulator.shape[1], size[0], size[1])))
-        self.register_buffer("vec2", torch.randn((modulator.shape[1], size[0], size[1])))
+        self.register_buffer("noise", torch.randn((2, modulator.shape[1], size[0], size[1])))
         self.register_buffer("modulator", modulator)
 
     def forward(self, i, b):
         mod = self.modulator[i : i + b]
         mod = mod.reshape(len(mod), -1)
-        left = torch.einsum("MHW,BM->BHW", self.vec1, mod)
-        right = torch.einsum("MHW,BM->BHW", self.vec2, 1 - mod)
+        left = torch.einsum("MHW,BM->BHW", self.noise[0], mod)
+        right = torch.einsum("MHW,BM->BHW", self.noise[1], 1 - mod)
         return left + right
 
 
 class Multiply(Noise):
     def __init__(self, length, size, modulator):
         super().__init__(length, size)
-        self.register_buffer("vec", torch.randn((modulator.shape[1], size[0], size[1])))
+        self.register_buffer("noise", torch.randn((modulator.shape[1], size[0], size[1])))
         self.register_buffer("modulator", modulator)
 
     def forward(self, i, b):
         mod = self.modulator[i : i + b]
         mod = mod.reshape(len(mod), -1)
-        left = torch.einsum("MHW,BM->BHW", self.vec, mod)
+        left = torch.einsum("MHW,BM->BHW", self.noise, mod)
         return left
 
 
-def rotation_around_random_axis(tensor, angles):  # 2D rotation around random axis with angles in radians
-    b = angles.shape[0]
-    n = tensor.numel()
-
-    idx = torch.arange(n, device=tensor.device, dtype=torch.long).unsqueeze(0)
-    index = torch.cat([torch.cat([torch.ones_like(idx) * bb, idx, idx], dim=0) for bb in range(b)], dim=1)
-
-    values = torch.ones((b, n), device=tensor.device, dtype=tensor.dtype)
-
-    i = np.random.randint(0, n)
-    values[:, i] = torch.cos(angles)
-    values[:, (i + 1) % n] = torch.cos(angles)
-    values = torch.cat((values, torch.sin(angles)[:, None], -torch.sin(angles)[:, None]), dim=1)
-
-    top_right = torch.ones((3, b), device=tensor.device, dtype=torch.long)
-    top_right[0] = torch.arange(b, device=tensor.device, dtype=torch.long)
-    top_right[1] *= i
-    top_right[2] *= (i + 1) % n
-
-    bottom_left = torch.ones((3, b), device=tensor.device, dtype=torch.long)
-    bottom_left[0] = torch.arange(b, device=tensor.device, dtype=torch.long)
-    bottom_left[1] *= (i + 1) % n
-    bottom_left[2] *= i
-
-    index = torch.cat([index, top_right, bottom_left], dim=1)
-
-    R = torch.sparse_coo_tensor(index, values.flatten(), (b, n, n))
-    return R
-
-
 class Loop(Noise):
-    def __init__(self, length, size, n_loops=1):
+    def __init__(self, length, size, n_loops=1, sigma=5):
         super().__init__(length, size)
-        self.n_loops = n_loops
-        self.loop_len = length / self.n_loops
-        self.d_theta = 2 * np.pi / self.loop_len
-        self.register_buffer("vec", torch.randn((1, size[0] * size[1], 1)))
+        self.sigma = sigma
+        self.register_buffer("noise", torch.randn((3, size[0], size[1])))
+        self.register_buffer("idx", torch.linspace(0, n_loops * 2 * torch.pi, length, device=device))
 
     def forward(self, i, b):
-        angles = torch.arange(i % self.loop_len, (i + b) % self.loop_len, device=self.vec.device) * self.d_theta
-        R = rotation_around_random_axis(self.vec, angles)
-        out = torch.bmm(R, self.vec.tile(b, 1, 1))
-        out = out.reshape(b, *self.size)
+        freqs = torch.cos(self.idx[i : i + b, None, None] + self.noise[[0]]).div(self.sigma / 50)
+        out = torch.sin(freqs + self.noise[[1]]) * self.noise[[2]]
+        out = out / (out.square().mean(dim=(1, 2), keepdim=True).sqrt() + torch.finfo(out.dtype).eps)
         return out
 
 
@@ -217,7 +184,7 @@ class ScaleBias(Noise):
         return self.scale * self.base(i, b) + self.bias
 
 
-def noise_patch(noise, features, tempo, fps, base, nb, feat, where, merge, mu, sig, seed):
+def noise_patch(noise, features, tempo, fps, base, nb, feat, feat_weight, where, merge, mu, sig, seed):
     if where == "low":
         lays = range(0, 6)
     elif where == "mid":
@@ -231,7 +198,7 @@ def noise_patch(noise, features, tempo, fps, base, nb, feat, where, merge, mu, s
     elif where == "all":
         lays = range(0, 17)
 
-    feature = features[feat]
+    feature = feat_weight * features[feat]
 
     for n in lays:
 
@@ -274,6 +241,8 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
     prior = scipy.stats.lognorm(loc=70, scale=500, s=1)
     tempo = float(rosa.beat.tempo(onset_envelope=onset_env, max_tempo=200, prior=prior, ac_size=60, hop_length=1024))
     beats = list(rosa.beat.beat_track(onset_envelope=onset_env, trim=False, hop_length=1024, bpm=tempo)[1])
+    if beats[0] == 0:
+        del beats[0]
 
     segmentations = {}
     for name, feature in features.items():
@@ -287,15 +256,34 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
 
     ws = StyleGAN2Mapper(model_file=STYLEGAN_CKPT, inference=False)(torch.randn(180, 512)).to(device)
 
-    min_patches, max_patches = 7, 15
+    min_patches, max_patches = 5, 20
     latent_patch_spec = [
         dict(
-            base=random.choice(["segmentation", "feature", "loop"]),
-            k=random.choice(ks),
-            nb=random.choice([4, 8, 16, 32]),  # loop every nb bars
-            feat=random.choice(all_features),
-            where=random.choice(["low", "mid", "high", "lowmid", "midhigh", "all"]),
-            merge=random.choice(["average", "modulate"]),  # , "overwrite"]),
+            base=np.random.choice(["segmentation", "feature", "loop"]).item(),
+            k=np.random.choice(ks).item(),
+            nb=np.random.choice([4, 8, 16, 32], p=[2 / 7, 2 / 7, 2 / 7, 1 / 7]).item(),
+            feat=np.random.choice(all_features).item(),
+            feat_weight=scipy.stats.skewnorm.rvs(a=5, loc=0.666, scale=0.5, size=1).item(),
+            where=np.random.choice(
+                ["low", "mid", "high", "lowmid", "midhigh", "all"], p=[3 / 14, 3 / 14, 3 / 14, 2 / 14, 2 / 14, 1 / 14]
+            ).item(),
+            merge=np.random.choice(["average", "modulate"], p=[1 / 4, 3 / 4]).item(),
+            seed=np.random.randint(0, 2 ** 32),
+        )
+        for _ in range(random.randint(min_patches, max_patches))
+    ]
+    noise_patch_spec = [
+        dict(
+            base=np.random.choice(["blend", "multiply", "loop"]).item(),
+            nb=np.random.choice([4, 8, 16, 32], p=[2 / 7, 2 / 7, 2 / 7, 1 / 7]).item(),
+            feat=np.random.choice(all_features).item(),
+            feat_weight=scipy.stats.skewnorm.rvs(a=5, loc=0.666, scale=0.5, size=1).item(),
+            where=np.random.choice(
+                ["low", "mid", "high", "lowmid", "midhigh", "all"], p=[3 / 14, 3 / 14, 3 / 14, 2 / 14, 2 / 14, 1 / 14]
+            ).item(),
+            merge=np.random.choice(["average", "modulate"], p=[1 / 4, 3 / 4]).item(),
+            mu=np.random.normal(scale=0.5),
+            sig=scipy.stats.skewnorm.rvs(a=5, loc=0.666, scale=0.5, size=1).item(),
             seed=np.random.randint(0, 2 ** 32),
         )
         for _ in range(random.randint(min_patches, max_patches))
@@ -305,20 +293,6 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
     latents = spline_loop_latents(ws[base_selection], n_frames)
     for spec in latent_patch_spec:
         latents = latent_patch(latents, ws, segmentations, features, tempo, fps, **spec)
-
-    noise_patch_spec = [
-        dict(
-            base=random.choice(["blend", "multiply", "loop"]),
-            nb=random.choice([4, 8, 16, 32]),  # loop every nb bars
-            feat=random.choice(all_features),
-            where=random.choice(["low", "mid", "high", "lowmid", "midhigh", "all"]),
-            merge=random.choice(["average", "modulate",  # , "overwrite"]),
-            mu=np.random.normal(),
-            sig=np.random.normal(loc=1, scale=1 / 3),
-            seed=np.random.randint(0, 2 ** 32),
-        )
-        for _ in range(random.randint(min_patches, max_patches))
-    ]
 
     noise = [Loop(length=n_frames, size=(2 ** i, 2 ** i)) for i in sum([[2]] + [[n, n] for n in range(3, 11)], [])]
     for spec in noise_patch_spec:
@@ -332,7 +306,7 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
     print()
 
     out_file = f"output/{Path(audio_file).stem}_RandomPatches++_{str(uuid4())[:6]}.mp4"
-    out_size = (1024, 1024)
+    out_size = (512, 512)
     batch_size = 16
 
     G = StyleGAN2Synthesizer(
@@ -347,8 +321,9 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
         audio_file=audio_file,
         audio_offset=0,
         audio_duration=dur,
+        debug=True,
     ) as video:
-        for i in tqdm(range(0, len(latents), batch_size), unit_scale=batch_size):
+        for i in tqdm(range(0, len(latents) - batch_size, batch_size), unit_scale=batch_size):
             L = latents[i : i + batch_size].to(device)
 
             N = {}
@@ -366,4 +341,4 @@ def generate(audio_file="/home/hans/datasets/wavefunk/naamloos.wav", fps=24, dur
 
 
 if __name__ == "__main__":
-    generate()
+    generate(audio_file=sys.argv[1], dur=180)
