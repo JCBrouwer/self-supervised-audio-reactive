@@ -194,14 +194,14 @@ import librosa as rosa
 import scipy
 import sklearn
 
+BINS_PER_OCTAVE = 12 * 3
+N_OCTAVES = 7
 
 def laplacian_segmentation_rosa(audio, sr, out_size, ks=[2, 4, 6, 8, 16]):
     """
     Segments the audio with pattern recurrence analysis
     From https://librosa.org/doc/latest/auto_examples/plot_segmentation.html#sphx-glr-auto-examples-plot-segmentation-py
     """
-    BINS_PER_OCTAVE = 12 * 3
-    N_OCTAVES = 7
     C = rosa.amplitude_to_db(
         np.abs(
             rosa.cqt(

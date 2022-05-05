@@ -42,7 +42,7 @@ def generate(
     patch_file: Optional[str] = None,
     seed: int = None,
     latent_seeds: Optional[str] = None,
-    fps: int = 30,
+    fps: float = 30,
     audio_offset: float = 0,
     audio_duration: Optional[float] = None,
     downscale_factor: float = 4,
