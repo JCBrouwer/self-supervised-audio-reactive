@@ -4,10 +4,6 @@ from torch.nn.functional import interpolate, pad
 from torch_geometric.utils import get_laplacian
 
 
-def randomize_tensor(tensor):
-    return tensor[torch.randperm(len(tensor))]
-
-
 def distance_matrix(x, p=2):  # pairwise distance of vectors
     y = x
 
@@ -94,11 +90,11 @@ def init_plus_plus(ds, k):
     From https://www.kdnuggets.com/2020/06/centroid-initialization-k-means-clustering.html
     """
     centroids = [ds[0]]
-    for _ in range(1, k):
+    for idx in range(1, k):
         dist_sq = np.array([min([np.inner(c - x, c - x) for c in centroids]) for x in ds])
         probs = dist_sq / (dist_sq.sum() + 1e-8)
         cumulative_probs = probs.cumsum()
-        r = np.random.rand()
+        r = np.random.RandomState(42 + idx).rand()
         i = len(cumulative_probs) - 1
         for j, p in enumerate(cumulative_probs):
             if r < p:
@@ -135,6 +131,19 @@ def differentiable_k_means(data, k, num_iter, cluster_temp=5):
 
 
 def laplacian_segmentation(envelope, beats, ks=[2, 4, 6, 8, 12, 16]):
+    """Differentiable segmentation based on graph laplacian of weighted recurrence/sequence matrices
+
+    Args:
+        envelope (torch.Tensor): Feature to base segmentation on
+        beats (List[int]): List of indices in envelope that are beats, this is used to reduce dimensionality of full
+                           envelope to a beat-synchronous envelope (i.e. beat every 12 frames on average => 12x
+                           reduction of computation)
+        ks (list, optional): List of number of segments to return segmentations for. Defaults to [2, 4, 6, 8, 12, 16].
+
+    Returns:
+        List[torch.Tensor]: List of soft one-hot segmentations. The probabilities of segment membership per frame.
+    """
+
     # make envelope beat-synchronous to reduce dimensionality
     Csync = []
     for beat1, beat2 in zip([0] + beats, beats + [len(envelope)]):
