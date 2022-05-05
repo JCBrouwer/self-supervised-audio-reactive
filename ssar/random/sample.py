@@ -1,8 +1,6 @@
-import json
 import sys
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
 import torch
 import torchaudio
@@ -52,6 +50,9 @@ def generate(
     batch_size: int = 32,
     device: torch.device = DEVICE,
 ):
+    if seed is None:
+        seed = torch.randint(0, 2 ** 32, size=(), device=device).item()
+
     out_size = (round(aspect_ratio * 1024 / downscale_factor), round(1024 / downscale_factor))
     out_file = f"output/{Path(audio_file).stem}_RandomPatches++_seed{seed}_{out_size[0]}x{out_size[1]}.mp4"
 

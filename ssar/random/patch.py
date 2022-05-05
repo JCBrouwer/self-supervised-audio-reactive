@@ -34,12 +34,10 @@ def skewnorm(rng, a, loc, scale, size=()):
 
 class Patch(torch.nn.Module):
     def __init__(
-        self, features, segmentations, tempo, fps=24, seed=None, min_subpatches=5, max_subpatches=20, device=DEVICE
+        self, features, segmentations, tempo, fps=24, seed=42, min_subpatches=5, max_subpatches=20, device=DEVICE
     ):
         super().__init__()
 
-        if seed is None:
-            seed = torch.randint(0, 2 ** 32, device=device).item()
         rng = torch.Generator(device)
         rng.manual_seed(seed)
         self.seed = seed
@@ -62,7 +60,7 @@ class Patch(torch.nn.Module):
             dict(
                 patch_type=random_choice(rng, ["segmentation", "feature", "loop"]),
                 segments=random_choice(rng, ks),
-                loop_bar_len=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
+                loop_bars=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
                 seq_feat=random_choice(rng, ALLFEATS),
                 seq_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
                 mod_feat=random_choice(rng, UNITFEATS),
@@ -77,7 +75,7 @@ class Patch(torch.nn.Module):
         self.noise_patches = [
             dict(
                 patch_type=random_choice(rng, ["blend", "multiply", "loop"]),
-                loop_bar_len=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
+                loop_bars=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
                 seq_feat=random_choice(rng, ALLFEATS),
                 seq_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
                 mod_feat=random_choice(rng, UNITFEATS),
@@ -120,29 +118,23 @@ class Patch(torch.nn.Module):
         return latents.to(self.rng.device), [n.to(self.rng.device) for n in noise]
 
     def __repr__(self):
-        latstrs = [
-            ", ".join(
-                [
-                    f"{k}=" + (f"{v:.2f}" if isinstance(v, float) else f"{v}").replace("spectral_", "")
-                    for k, v in subpatch.items()
-                ]
-            )
-            for subpatch in self.latent_patches
-        ]
-        noistrs = [
-            ", ".join(
-                [
-                    f"{k}=" + (f"{v:.2f}" if isinstance(v, float) else f"{v}").replace("spectral_", "")
-                    for k, v in subpatch.items()
-                ]
-            )
-            for subpatch in self.noise_patches
-        ]
+        reprs = []
+        for patches in [self.latent_patches, self.noise_patches]:
+            header = [""] + [k for k in patches[0]]
+            values = [
+                [str(i + 1)]
+                + [(f"{v:.4f}" if isinstance(v, float) else f"{v}").replace("spectral_", "") for v in p.values()]
+                for i, p in enumerate(patches)
+            ]
+            widths = [max([len(row[n]) for row in [header] + values]) for n in range(len(header))]
+            seps = ["-" * w for w in widths]
+            strs = [" | ".join([row[c].ljust(widths[c]) for c in range(len(row))]) for row in [header, seps] + values]
+            reprs.append(strs)
         return (
             "Patch(\n  Latent(\n    "
-            + "\n    ".join(latstrs)
+            + "\n    ".join(reprs[0])
             + "\n  ),\n  Noise(\n    "
-            + "\n    ".join(noistrs)
+            + "\n    ".join(reprs[1])
             + "\n  )\n)"
         )
 

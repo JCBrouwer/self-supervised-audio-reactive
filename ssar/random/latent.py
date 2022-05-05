@@ -23,7 +23,7 @@ def latent_patch(
     fps,
     patch_type,
     segments,
-    loop_bar_len,
+    loop_bars,
     seq_feat,
     seq_feat_weight,
     mod_feat,
@@ -50,7 +50,7 @@ def latent_patch(
             sequence = torch.einsum("TN,NWL->TWL", feature, palette[selection])
     elif patch_type == "loop":
         selection = permutation[:segments]
-        n_loops = len(latents) / fps / 60 / tempo / 4 / loop_bar_len
+        n_loops = len(latents) / fps / 60 / tempo / 4 / loop_bars
         sequence = spline_loop_latents(palette[selection], len(latents), n_loops=n_loops)
     sequence = gaussian_filter(sequence, 1)
 

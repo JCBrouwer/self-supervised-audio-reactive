@@ -93,7 +93,7 @@ def noise_patch(
     tempo,
     fps,
     patch_type,
-    loop_bar_len,
+    loop_bars,
     seq_feat,
     seq_feat_weight,
     mod_feat,
@@ -125,7 +125,7 @@ def noise_patch(
         elif patch_type == "multiply":
             new_noise = Multiply(rng=rng, length=len(feature), size=noise[n].size, modulator=feature)
         elif patch_type == "loop":
-            n_loops = len(feature) / fps / 60 / tempo / 4 / loop_bar_len
+            n_loops = len(feature) / fps / 60 / tempo / 4 / loop_bars
             new_noise = Loop(rng=rng, length=len(feature), size=noise[n].size, n_loops=n_loops)
 
         if merge_type == "average":
