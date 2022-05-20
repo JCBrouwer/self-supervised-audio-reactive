@@ -87,7 +87,7 @@ def _autocorrelation_correlation(X, Y, center: bool = True):
 
 
 @torch.jit.script
-def _rv(Ms: List[Tensor], center: bool = True, modified: bool = True, standardize: bool = True):
+def _rv(Ms: List[Tensor], center: bool = True, modified: bool = True, standardize: bool = False):
     """
     This function computes the RV matrix correlation coefficients between pairs of arrays. The number and order of
     objects (rows) for the two arrays must match. The number of variables in each array may vary. The RV2 coefficient is
@@ -351,15 +351,15 @@ def _coxhead2(X, Y, center: bool = True):
 
 
 def pearson(X, Y):
-    return _pearson_correlation(X, Y).mean()
+    return _pearson_correlation(X, Y).median()
 
 
 def spearman(X, Y):
-    return _spearman_correlation(X, Y).mean()
+    return _spearman_correlation(X, Y).median()
 
 
 def concordance(X, Y):
-    return _concordance_correlation(X, Y).mean()
+    return _concordance_correlation(X, Y).median()
 
 
 def autocorrcorr(X, Y):
@@ -375,7 +375,7 @@ def rv2(X, Y):
 
 
 def smi(X, Y):
-    return _smi(X, Y)[0].mean()
+    return _smi(X, Y)[0].median()
 
 
 def r1(X, Y):
@@ -410,12 +410,17 @@ if __name__ == "__main__":
     X, Y1 = torch.from_numpy(X).float().cuda(), torch.from_numpy(Y1).float().cuda()
     Y2 = torch.randn(400, 64, device="cuda")
 
+    Y1, Y2 = Y1[:, :48], Y2[:, :48]
+
     for correlation in [pearson, spearman, concordance, autocorrcorr, rv, rv2, smi, r1, r3, svcca, pwcca, lcka, op]:
-        print(
-            f"{correlation.__name__}".ljust(12),
-            f"correlated: {correlation(X, Y1).item():.4f}".ljust(20),
-            f"3quarter: {correlation(X, 0.75*Y1+0.25*Y2).item():.4f}".ljust(20),
-            f"half: {correlation(X, 0.5*Y1+0.5*Y2).item():.4f}".ljust(20),
-            f"quarter: {correlation(X, 0.25*Y1+0.75*Y2).item():.4f}".ljust(20),
-            f"random: {correlation(X, Y2).item():.4f}",
-        )
+        try:
+            print(
+                f"{correlation.__name__}".ljust(12),
+                f"correlated: {correlation(X, Y1).item():.4f}".ljust(20),
+                f"3quarter: {correlation(X, 0.75*Y1+0.25*Y2).item():.4f}".ljust(20),
+                f"half: {correlation(X, 0.5*Y1+0.5*Y2).item():.4f}".ljust(20),
+                f"quarter: {correlation(X, 0.25*Y1+0.75*Y2).item():.4f}".ljust(20),
+                f"random: {correlation(X, Y2).item():.4f}",
+            )
+        except:
+            print(f"{correlation.__name__}")

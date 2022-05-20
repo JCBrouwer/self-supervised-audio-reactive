@@ -10,10 +10,17 @@ import torch
 import torchaudio as ta
 import torchvision as tv
 from einops import rearrange
-from ssar.features.processing import emphasize, high_pass, low_pass, mid_pass, normalize
+from ssar.features.processing import (
+    clamp_lower_percentile,
+    clamp_peaks_percentile,
+    high_pass,
+    low_pass,
+    mid_pass,
+    normalize,
+)
 from ssar.features.rosa.beat import onset_strength, plp
 from ssar.supervised.data import audio2features, gaussian_filter
-from ssar.supervised.latent_augmenter import LatentAugmenter, spline_loop_latents
+from ssar.random.latent import spline_loop_latents
 from torch.nn.functional import interpolate
 from torchvision.transforms.functional import resize
 from tqdm import tqdm
@@ -40,7 +47,7 @@ de.bridge.set_bridge("torch")
 ckpt = "cache/RobertAGonzalves-MachineRay2-AbstractArt-188.pkl"
 G = StyleGAN2(ckpt)
 G = G.eval().cuda()
-LA = LatentAugmenter(ckpt, n_patches=5)
+# LA = LatentAugmenter(ckpt, n_patches=5)
 FPS = 24
 DUR = 16
 N = DUR * FPS
@@ -83,6 +90,15 @@ def low_correlation():
     noise = torch.randn((np.random.randint(DUR // 8, DUR), 1, 16 * 16))
     noise = spline_loop_latents(noise, N).reshape(N, 1, 16, 16)
 
+    return audio, sr, get_video(latents, noise), FPS
+
+
+@torch.inference_mode()
+def noise_correlation():
+    audio, sr = get_random_audio()
+    zs = torch.randn((N, 512), device="cuda")
+    latents = G.mapper(zs)
+    noise = torch.randn((N, 1, 16, 16))
     return audio, sr, get_video(latents, noise), FPS
 
 
@@ -137,6 +153,84 @@ def medium_correlation():
 
 
 @torch.inference_mode()
+def high_chroma_correlation():
+    audio, sr = get_random_audio()
+
+    chroma = chromagram(audio, sr)
+    chroma = gaussian_filter(chroma, FPS / 24)
+    chroma = clamp_peaks_percentile(chroma, 97)
+    chroma = clamp_lower_percentile(chroma, 5)
+    # chroma = emphasize(chroma, strength=2, percentile=75)
+    chroma /= chroma.sum(1, keepdim=True)
+
+    ws = G.mapper(torch.randn((12, 512), device="cuda"))
+
+    latents = torch.einsum("TC,CNL->TNL", chroma, ws)
+    latents = gaussian_filter(latents, FPS / 24)
+
+    noise = gaussian_filter(torch.randn((len(chroma), 1, 32, 32), device="cuda"), FPS)
+    noise /= noise.std()
+
+    return audio, sr, get_video(latents, noise), FPS
+
+
+@torch.inference_mode()
+def high_onset_correlation():
+    audio, sr = get_random_audio()
+
+    ons = onsets(audio, sr).squeeze()
+    ons = gaussian_filter(ons, FPS / 24)
+    ons = clamp_peaks_percentile(ons, 97)
+    ons = clamp_lower_percentile(ons, 5)
+    # ons = emphasize(ons, strength=2, percentile=75)
+    ons = normalize(ons)
+
+    ws = G.mapper(torch.randn((2, 512), device="cuda"))
+
+    latents = ws[[0]] * ons.reshape(-1, 1, 1) + ws[[1]] * (1 - ons.reshape(-1, 1, 1))
+    latents = gaussian_filter(latents, FPS / 24)
+
+    noise = gaussian_filter(torch.randn((len(ons), 1, 64, 64), device="cuda"), FPS / 4)
+    noise /= noise.std(dim=(1, 2, 3), keepdim=True)
+    noise += noise * ons.reshape(-1, 1, 1, 1)
+
+    return audio, sr, get_video(latents, noise), FPS
+
+
+@torch.inference_mode()
+def high_both_correlation():
+    audio, sr = get_random_audio()
+
+    chroma = chromagram(audio, sr)
+    chroma = gaussian_filter(chroma, FPS / 24)
+    chroma = clamp_peaks_percentile(chroma, 97)
+    chroma = clamp_lower_percentile(chroma, 5)
+    # chroma = emphasize(chroma, strength=2, percentile=75)
+    chroma /= chroma.sum(1, keepdim=True)
+
+    ons = onsets(audio, sr).squeeze()
+    ons = gaussian_filter(ons, FPS / 24)
+    ons = clamp_peaks_percentile(ons, 97)
+    ons = clamp_lower_percentile(ons, 5)
+    # ons = emphasize(ons, strength=2, percentile=75)
+    ons = normalize(ons)
+
+    ws = G.mapper(torch.randn((14, 512), device="cuda"))
+
+    chroma_latents = torch.einsum("TC,CNL->TNL", chroma, ws[:12])
+    onset_latents = ws[[12]] * ons.reshape(-1, 1, 1) + ws[[13]] * (1 - ons.reshape(-1, 1, 1))
+    latents = (chroma_latents + onset_latents) / 2
+    latents = gaussian_filter(latents, FPS / 24)
+
+    noise = torch.randn((len(ons), 1, 64, 64), device="cuda")
+    noise = gaussian_filter(noise, FPS / 4)
+    noise /= noise.std(dim=(1, 2, 3), keepdim=True)
+    noise += noise * ons.reshape(-1, 1, 1, 1)
+
+    return audio, sr, get_video(latents, noise), FPS
+
+
+@torch.inference_mode()
 def test_set_correlation():
     video_file = random.choice(glob("/home/hans/datasets/audiovisual/maua256/*"))
 
@@ -152,6 +246,11 @@ def test_set_correlation():
 
     audio = torch.cat(audio, dim=1).squeeze().contiguous().cuda()
     video = video.permute(0, 3, 1, 2).div(255).contiguous().cuda()
+    _, _, h, w = video.shape
+    oversize = (w - 256) // 2
+    video = video[..., :, oversize : oversize + 256]
+    _, _, h, w = video.shape
+    assert h == w == 256
 
     offset_time = np.random.rand() * (len(audio) / sr - DUR)
 
@@ -167,88 +266,63 @@ def test_set_correlation():
 
 
 @torch.inference_mode()
-def high_chroma_correlation():
+def interp(smooth):
     audio, sr = get_random_audio()
-
-    chroma = chromagram(audio, sr)
-    chroma = gaussian_filter(chroma, FPS / 24)
-    chroma = emphasize(chroma, strength=3, percentile=75)
-    chroma /= chroma.sum(1, keepdim=True)
-
-    ws = G.mapper(torch.randn((12, 512), device="cuda"))
-
-    latents = torch.einsum("TC,CNL->TNL", chroma, ws)
-    latents = gaussian_filter(latents, FPS / 24)
-
-    noise = gaussian_filter(torch.randn((len(chroma), 1, 32, 32), device="cuda"), 3 * FPS)
-    noise /= noise.std()
-
+    zs = gaussian_filter(torch.randn((N, 512), device="cuda"), smooth)
+    latents = G.mapper(zs)
+    noise = gaussian_filter(torch.randn((N, 1, 16, 16)), smooth)
     return audio, sr, get_video(latents, noise), FPS
 
 
-@torch.inference_mode()
-def high_onset_correlation():
-    audio, sr = get_random_audio()
-
-    ons = onsets(audio, sr).squeeze()
-    ons = gaussian_filter(ons, FPS / 24)
-    ons = emphasize(ons, strength=2, percentile=75)
-    ons = normalize(ons)
-
-    ws = G.mapper(torch.randn((2, 512), device="cuda"))
-
-    latents = ws[[0]] * ons.reshape(-1, 1, 1) + ws[[1]] * (1 - ons.reshape(-1, 1, 1))
-    latents = gaussian_filter(latents, FPS / 24)
-
-    noise = gaussian_filter(torch.randn((len(ons), 1, 64, 64), device="cuda"), 3 * FPS / 24)
-    noise /= noise.std()
-    noise *= ons.reshape(-1, 1, 1, 1)
-
-    return audio, sr, get_video(latents, noise), FPS
+def interp1():
+    return interp(1)
 
 
-@torch.inference_mode()
-def high_both_correlation():
-    audio, sr = get_random_audio()
+def interp2():
+    return interp(2)
 
-    chroma = chromagram(audio, sr)
-    chroma = gaussian_filter(chroma, FPS / 24)
-    chroma = emphasize(chroma, strength=3, percentile=75)
-    chroma /= chroma.sum(1, keepdim=True)
 
-    ons = onsets(audio, sr).squeeze()
-    ons = gaussian_filter(ons, FPS / 24)
-    ons = emphasize(ons, strength=2, percentiel=75)
-    ons = normalize(ons)
+def interp4():
+    return interp(4)
 
-    ws = G.mapper(torch.randn((14, 512), device="cuda"))
 
-    chroma_latents = torch.einsum("TC,CNL->TNL", chroma, ws[:12])
-    onset_latents = ws[[12]] * ons.reshape(-1, 1, 1) + ws[[13]] * (1 - ons.reshape(-1, 1, 1))
-    latents = (chroma_latents + onset_latents) / 2
-    latents = gaussian_filter(latents, FPS / 24)
+def interp8():
+    return interp(8)
 
-    noise = torch.randn((len(ons), 1, 64, 64), device="cuda")
-    noise = gaussian_filter(noise, 3 * FPS / 24)
-    noise = noise / noise.std()
-    noise = noise * ons.reshape(-1, 1, 1, 1)
 
-    return audio, sr, get_video(latents, noise), FPS
+def interp16():
+    return interp(16)
+
+
+def interp32():
+    return interp(32)
+
+
+def interp64():
+    return interp(64)
+
+
+def interp128():
+    return interp(128)
 
 
 if __name__ == "__main__":
-    od = "output/maua_correlation_test2"
+    import os
+
+    od = "output/metric_analysis_1000"
+    os.makedirs(od, exist_ok=True)
+
     groups = [
         low_correlation,
-        medium_correlation,
-        test_set_correlation,
+        noise_correlation,
         high_chroma_correlation,
         high_onset_correlation,
         high_both_correlation,
+        test_set_correlation,
     ]
-    num = 100
+    num = 900
     with torch.inference_mode(), tqdm(total=len(groups) * num) as progress:
-        for i in range(100):
+        for i in range(num):
             for correlation in groups:
                 try:
                     audio, sr, video, fps = correlation()
@@ -262,5 +336,4 @@ if __name__ == "__main__":
                     progress.write(f"\nError: {correlation.__name__}")
                     progress.write(traceback.format_exc())
                     progress.write("\n")
-
                 progress.update()
