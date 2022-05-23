@@ -79,14 +79,22 @@ class AudioVisualDataset(Dataset):
         return filepath, load_audio_video(filepath)
 
 
-def audiovisual_correlation(afeats, vfeats, cname, correlation_fn, quadratic=False, variation_normalized=False):
+def audiovisual_correlation(
+    afeats, vfeats, cname, correlation_fn, quadratic=False, variation_normalized=False, mean_diff_normalized=False
+):
     if quadratic:
         res = {}
         for aname, afeat in afeats.items():
             for vname, vfeat in vfeats.items():
                 cor = correlation_fn(afeat, vfeat).item()
+                if mean_diff_normalized:
+                    asmooth = torch.max(torch.diff(afeat, dim=0).abs() / afeat.abs().max(dim=0).values)
+                    vsmooth = torch.max(torch.diff(vfeat, dim=0).abs() / vfeat.abs().max(dim=0).values)
+                    cor *= (asmooth + vsmooth).item()
                 if variation_normalized:
-                    cor *= afeat.std(0).mean() / (afeat.norm() + 1e-8) + vfeat.std(0).mean() / (vfeat.norm() + 1e-8)
+                    cor *= (
+                        afeat.std(0).mean() / (afeat.norm() + 1e-8) + vfeat.std(0).mean() / (vfeat.norm() + 1e-8)
+                    ).item()
                 res[(aname, vname, cname)] = cor
     else:
         afeatvals, vfeatvals = list(afeats.values()), list(vfeats.values())
@@ -96,8 +104,12 @@ def audiovisual_correlation(afeats, vfeats, cname, correlation_fn, quadratic=Fal
         for vfeat in vfeatvals:
             vf = torch.cat((vf, vfeat), dim=1)
         res = correlation_fn(af, vf).item()
+        if mean_diff_normalized:
+            asmooth = torch.max(torch.diff(af, dim=0) / af.max(dim=0).values)
+            vsmooth = torch.max(torch.diff(vf, dim=0) / vf.max(dim=0).values)
+            res *= (asmooth + vsmooth).item()
         if variation_normalized:
-            res *= af.std(0).mean() / (af.norm() + 1e-8) + vf.std(0).mean() / (vf.norm() + 1e-8)
+            res *= (af.std(0).mean() / (af.norm() + 1e-8) + vf.std(0).mean() / (vf.norm() + 1e-8)).item()
     return res
 
 
@@ -108,6 +120,9 @@ if __name__ == "__main__":
     parser.add_argument("--titles", nargs="*", default=[])
     parser.add_argument("-n", type=int, default=None)
     args = parser.parse_args()
+
+    corr_fns = {c.__name__: c for c in [op, pwcca, rv2, smi, svcca]}
+    COLORS = ["forestgreen", "limegreen", "blueviolet", "tab:purple", "tab:pink", "tab:orange"]
 
     with torch.inference_mode():
         data_dir = args.data_dir
@@ -149,7 +164,7 @@ if __name__ == "__main__":
                             vfeats = {vf.__name__: torch.from_numpy(arr[vf.__name__]).cuda() for vf in vfns}
 
                     row = {"group": group}
-                    for cname, correlation in {c.__name__: c for c in [op, pwcca, rv2, smi, svcca]}.items():
+                    for cname, correlation in corr_fns.items():
                         row = {**row, **audiovisual_correlation(afeats, vfeats, cname, correlation, quadratic=True)}
                         row[("concat", "concat", cname)] = audiovisual_correlation(
                             afeats, vfeats, cname, correlation, quadratic=False
@@ -161,6 +176,10 @@ if __name__ == "__main__":
             df.to_csv(csv_file)
         else:
             df = pd.read_csv(csv_file, index_col=0)
+            df = df.rename(columns={col: eval(col) for col in df.columns if "(" in col})
+            # df = df.apply(
+            #     lambda row: {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in row.items()}, axis=1
+            # )
 
         print(df)
 
@@ -177,16 +196,14 @@ if __name__ == "__main__":
             print("worst")
             for idx, vals in lowest.iterrows():
                 print(files[idx], vals[("concat", "concat", "op")])
-        exit()
 
         grouped = df.groupby("group", sort=False).agg(["mean", "std"])
 
         stats = []
         for col in grouped.columns[::2]:
-            key, _ = col
-            af, vf, cn = key
-            means = grouped[(key, "mean")]
-            stds = grouped[(key, "std")]
+            af, vf, cn, _ = col
+            means = grouped[(af, vf, cn, "mean")]
+            stds = grouped[(af, vf, cn, "std")]
             for g, group in enumerate(file_groups):
                 group_name = args.titles[g] if len(args.titles) > 0 else group
                 stats.append(
@@ -208,7 +225,7 @@ if __name__ == "__main__":
             x="group",
             y="mean",
             yerr="std",
-            color=plt.get_cmap("YlOrRd")(np.linspace(0, 1, len(file_groups))),
+            color=COLORS,
             legend=False,
             xlabel="Group",
             rot=10,
@@ -239,7 +256,7 @@ if __name__ == "__main__":
                 fig, ax = plt.subplots(len(correlations) // 2, 2, figsize=(16, 9), sharex=True)
                 for c, corr in enumerate(correlations):
                     corrstats = stats[stats["correlation"] == corr]
-                    colors = plt.get_cmap("YlOrRd")(np.linspace(0, 1, len(groups)))
+                    colors = COLORS
                     data_fn().plot.bar(
                         y="mean", yerr="std", ax=ax.flatten()[c], color=colors, legend=False, xlabel="Group", rot=10
                     )
@@ -249,40 +266,43 @@ if __name__ == "__main__":
                 plt.close()
 
         def grouphists():
+            print()
             for pdf, data_fn in [
-                ("full", lambda: groupstats["mean"]),
-                ("chroma", lambda: groupstats[groupstats.audio == "chromagram"]["mean"]),
-                ("onsets", lambda: groupstats[groupstats.audio == "onsets"]["mean"]),
-                ("audio", lambda: groupstats.groupby(["audio"], sort=False)["mean"].mean()),
-                ("video", lambda: groupstats.groupby(["video"], sort=False)["mean"].mean()),
+                ("full", lambda: cdf),
+                ("chroma", lambda: cdf[[col for col in cdf.columns if "chromagram" in col]]),
+                ("onsets", lambda: cdf[[col for col in cdf.columns if "onsets" in col]]),
             ]:
-                fig, ax = plt.subplots(len(correlations) // 2, 2, figsize=(16, 9), sharex=True)
-                maxheight = [0 for _ in range(len(correlations))]
-                for c, corr in enumerate(correlations):
-                    corrstats = stats[stats["correlation"] == corr]
-                    for g, group in enumerate(groups):
-                        groupstats = corrstats[corrstats["group"] == group]
+                print("\n", pdf)
+                fig, ax = plt.subplots(len(groups), len(corr_fns) - 1, figsize=(16, 9), sharex=True)
+                for g, group in enumerate(file_groups):
+                    gdf = df[df["group"] == group]
+                    for c, corr in enumerate(corr_fns):
+                        if corr == "svcca":
+                            continue
+                        cdf = gdf[[col for col in gdf.columns if corr in col]]
                         data = data_fn()
-                        color = plt.get_cmap("YlOrRd")(np.linspace(0, 1, len(groups))[g])
-                        yvals, _, _ = ax.flatten()[c].hist(
-                            data,
-                            label=group,
+                        print(group, corr)
+                        color = COLORS[g]
+                        yvals, _, _ = ax[g, c].hist(
+                            data.values.flatten(),
                             bins=100,
                             range=(stats["mean"].min(), stats["mean"].max()),
-                            alpha=0.666,
                             color=color,
+                            density=True,
                         )
-                        maxheight[c] = max(maxheight[c], yvals.max())
-                for c, corr in enumerate(correlations):
-                    corrstats = stats[stats["correlation"] == corr]
-                    for g, group in enumerate(groups):
-                        groupstats = corrstats[corrstats["group"] == group]
-                        data = data_fn()
-                        color = plt.get_cmap("YlOrRd")(np.linspace(0, 1, len(groups))[g])
-                        ax.flatten()[c].vlines(data.mean(), 0, maxheight[c], ls="--", color=color)
-                    ax.flatten()[c].set_xlabel(corr)
+                        ax[g, c].vlines(data.values.mean(), 0, yvals.max(), ls="--", color=color)
+                        ax[5, c].set_xlabel(corr)
+                        ax[g, 0].set_ylabel(group)
+                # for g, group in enumerate(file_groups):
+                #     gdf = df[df["group"] == group]
+                #     for c, corr in enumerate(corr_fns):
+                #         if corr == "svcca":
+                #             continue
+                #         cdf = gdf[[col for col in gdf.columns if corr in col]]
+                #         data = data_fn()
+                #         color = COLORS[g]
+                #         ax.flatten()[c].vlines(data.mean(), 0, maxheight[c], ls="--", color=color)
                 plt.tight_layout()
-                ax.flatten()[0].legend()
                 plt.savefig(f"output/{exp_name}_{pdf}groupcorrhists mean.pdf")
                 plt.close()
 
@@ -345,6 +365,6 @@ if __name__ == "__main__":
                     plt.savefig(f"output/{exp_name}_{corr}_{group} heatmap mean.pdf")
                     plt.close()
 
-        heatmap()
         grouphists()
         groupbars()
+        # heatmap()
