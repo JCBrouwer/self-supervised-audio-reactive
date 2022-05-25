@@ -57,20 +57,20 @@ else:
 
 
 @torch.inference_mode()
-def audio2features(audio, sr, fps, clamp=True, smooth=True, emphasis=True):
+def audio2features(audio, sr, fps, clamp=True, smooth=True, emphasis=False):
     if audio.dim() == 2:
         audio = audio.mean(0)
     audio, sr = resample(audio, sr, fps * 1024), fps * 1024
 
     audio_harm, audio_perc = harmonic(audio), percussive(audio)
     multi_features = [
-        gaussian_filter(mfcc(audio, sr), 0.5 * fps),
-        gaussian_filter(chromagram(audio_harm, sr), 0.5 * fps),
-        gaussian_filter(tonnetz(audio_harm, sr), 0.5 * fps),
-        gaussian_filter(spectral_contrast(audio, sr), 0.5 * fps),
+        mfcc(audio, sr),
+        chromagram(audio_harm, sr),
+        tonnetz(audio_harm, sr),
+        spectral_contrast(audio, sr),
     ]
     single_features = [
-        gaussian_filter(spectral_flatness(audio, sr), 0.5 * fps),
+        spectral_flatness(audio, sr),
         onset_strength(audio_perc, sr),
         onset_strength(low_pass(audio_perc, sr), sr),
         onset_strength(mid_pass(audio_perc, sr), sr),
@@ -206,11 +206,9 @@ class SlicedAudio2LatentFFCVPreprocessor(Dataset):
         return len(self.features)
 
     def __getitem__(self, index):
-        latents = self.latents[index].copy()
-        residuals = latents - latents.mean((0, 1))
         return (
             self.features[index].copy().astype(np.float32),
-            residuals.astype(np.float32),
+            self.latents[index].copy().astype(np.float32),
             self.noise4[index].copy().astype(np.float32),
             self.noise8[index].copy().astype(np.float32),
             self.noise16[index].copy().astype(np.float32),

@@ -466,6 +466,46 @@ def test_latent_augmenter():
 
 
 @torch.no_grad()
+def audio2video(
+    a2l,
+    a2f,
+    audio_file,
+    out_file,
+    stylegan_file,
+    fps=24,
+    output_size=(512, 512),
+    batch_size=8,
+    offset=0,
+    duration=40,
+    residual=True,
+    seed=42,
+    onsets_only=False,
+):
+    try:
+        a2l = a2l.eval().to(device)
+    except:
+        pass
+    audio, sr = torchaudio.load(audio_file)
+    test_features = a2f(audio, sr, fps)
+    test_features = test_features[int(fps * offset) : int(fps * (offset + duration))]
+    test_features = test_features.unsqueeze(0).to(device)
+    _audio2video(
+        a2l=a2l,
+        features=test_features,
+        audio_file=audio_file,
+        out_file=out_file,
+        stylegan_file=stylegan_file,
+        fps=fps,
+        output_size=output_size,
+        batch_size=batch_size,
+        offset=offset,
+        duration=duration,
+        seed=seed,
+        residual=residual,
+    )
+
+
+@torch.no_grad()
 def _audio2video(
     a2l,
     features,
@@ -479,41 +519,43 @@ def _audio2video(
     duration=40,
     seed=42,
     save=False,
+    residual=True,
 ):
     outputs = a2l(features)
     if isinstance(outputs, list):
-        residuals, noise1, noise2, noise3, noise4 = outputs
+        latents, noise1, noise2, noise3, noise4 = outputs
         if save:
             np.savez_compressed(
                 save,
-                residuals=residuals.cpu().numpy(),
+                latents=latents.cpu().numpy(),
                 noise1=noise1.cpu().numpy(),
                 noise2=noise2.cpu().numpy(),
                 noise3=noise3.cpu().numpy(),
                 noise4=noise4.cpu().numpy(),
             )
     elif isinstance(outputs, tuple):
-        residuals, noise = outputs
+        latents, noise = outputs
         noise1, noise2, noise3, noise4 = [n.squeeze() for n in noise]
         if save:
             np.savez_compressed(
                 save,
-                residuals=residuals.cpu().numpy(),
+                latents=latents.cpu().numpy(),
                 noise1=noise1.cpu().numpy(),
                 noise2=noise2.cpu().numpy(),
                 noise3=noise3.cpu().numpy(),
                 noise4=noise4.cpu().numpy(),
             )
     else:
-        residuals = outputs
+        latents = outputs
         noise1 = noise2 = noise3 = noise4 = None
         if save:
-            np.savez_compressed(save, residuals=residuals.cpu().numpy())
-    residuals = residuals.squeeze()
+            np.savez_compressed(save, latents=latents.cpu().numpy())
+    latents = latents.squeeze()
 
-    mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
-    base_latent = mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
-    del mapper
+    if residual:
+        mapper = StyleGAN2Mapper(model_file=stylegan_file, inference=False)
+        latents += mapper(torch.from_numpy(np.random.RandomState(seed).randn(1, 512))).to(device)
+        del mapper
 
     synthesizer = StyleGAN2Synthesizer(
         model_file=stylegan_file, inference=False, output_size=output_size, strategy="stretch", layer=0
@@ -528,8 +570,8 @@ def _audio2video(
         audio_offset=offset,
         audio_duration=duration,
     ) as video:
-        for i in tqdm(range(0, len(residuals), batch_size), unit_scale=batch_size):
-            inputs = dict(latents=base_latent + residuals[i : i + batch_size])
+        for i in tqdm(range(0, len(latents), batch_size), unit_scale=batch_size):
+            inputs = dict(latents=latents[i : i + batch_size])
             if noise1 is not None:
                 inputs["noise1"] = noise1[i : i + batch_size, None]
                 inputs["noise2"] = noise2[i : i + batch_size, None]
@@ -541,7 +583,7 @@ def _audio2video(
             for frame in synthesizer(**inputs).add(1).div(2):
                 video.write(frame.unsqueeze(0))
 
-    del features, residuals, base_latent, synthesizer
+    del features, latents, synthesizer
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -606,34 +648,6 @@ def latent2video(
                 .div(2)
             ):
                 video.write(frame.unsqueeze(0))
-
-
-@torch.no_grad()
-def audio2video(
-    a2l,
-    a2f,
-    audio_file,
-    out_file,
-    stylegan_file,
-    fps=24,
-    output_size=(512, 512),
-    batch_size=8,
-    offset=0,
-    duration=40,
-    onsets_only=False,
-    seed=42,
-):
-    try:
-        a2l = a2l.eval().to(device)
-    except:
-        pass
-    audio, sr = torchaudio.load(audio_file)
-    test_features = a2f(audio, sr, fps)
-    test_features = test_features[int(24 * offset) : int(24 * (offset + duration))]
-    test_features = test_features.unsqueeze(0).to(device)
-    _audio2video(
-        a2l, test_features, audio_file, out_file, stylegan_file, fps, output_size, batch_size, offset, duration, seed
-    )
 
 
 class ModuleFromFile:

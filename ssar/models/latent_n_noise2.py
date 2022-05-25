@@ -141,7 +141,6 @@ class FixedLatentNoiseDecoder(torch.nn.Module):
             latents.append(torch.einsum("BTH,HWL->BTWL", env, lat))
 
         latents = torch.cat(latents, dim=2)
-        latents = latents - latents.mean(dim=1, keepdim=True)  # latents --> residuals
 
         noise_envs = x[..., self.S * self.H :]
         noise = []
@@ -171,6 +170,7 @@ class LatentNoiseReactor(torch.nn.Module):
         input_std,
         input_size,
         latents,
+        residual=True,
         # envelope
         num_layers=8,
         backbone="sashimi",
@@ -199,10 +199,13 @@ class LatentNoiseReactor(torch.nn.Module):
             backbone=backbone,
             dropout=dropout,
         )
+        self.residual = residual
 
     def forward(self, x, return_envelopes=False):
         envelopes = self.envolope(x)
         if return_envelopes:
             return envelopes
         latents, noise = self.decoder(envelopes)
+        if self.residual:
+            latents = latents - latents.mean(dim=1, keepdim=True)
         return latents, noise

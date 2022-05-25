@@ -157,26 +157,26 @@ if __name__ == "__main__":
                 val_loss /= len(val_dataloader)
                 writer.add_scalar("Loss/val", val_loss.item(), n_iter)
 
-                try:
-                    fcd = calculate_fcd(val_dataloader, a2l)
-                    writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
-                except Exception as e:
-                    pbar.write(f"\nError in FCD:\n{e}\n\n")
-                    fcd = -1
+                # try:
+                #     fcd = calculate_fcd(val_dataloader, a2l)
+                #     writer.add_scalar("Eval/FCD", fcd.item(), n_iter)
+                # except Exception as e:
+                #     pbar.write(f"\nError in FCD:\n{e}\n\n")
+                #     fcd = -1
 
-                try:
-                    loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
-                    writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
-                except Exception as e:
-                    pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
-                    scale = -1
+                # try:
+                #     loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
+                #     writer.add_scalar("Eval/laplace_b", scale.item(), n_iter)
+                # except Exception as e:
+                #     pbar.write(f"\nError in Laplace fit:\n{e}\n\n")
+                #     scale = -1
 
             pbar.write("")
             pbar.write(f"epoch {epoch + 1}")
             pbar.write(f"train_loss: {np.mean(losses):.4f}")
             pbar.write(f"val_loss  : {val_loss:.4f}")
-            pbar.write(f"laplace_b : {scale:.4f}")
-            pbar.write(f"fcd       : {fcd:.4f}")
+            # pbar.write(f"laplace_b : {scale:.4f}")
+            # pbar.write(f"fcd       : {fcd:.4f}")
             pbar.write("")
 
         if (epoch + 1) % video_interval == 0 or (epoch + 1) == n_epochs:

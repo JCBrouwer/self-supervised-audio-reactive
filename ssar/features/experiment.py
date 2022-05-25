@@ -11,6 +11,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.multiprocessing as mp
+import torchdatasets as td
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
 from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader, Dataset
@@ -49,6 +50,7 @@ def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):
     video = video.permute(0, 3, 1, 2).float().div(255).contiguous()
 
     if resample_fps and fps != resample_fps:
+        l, c, h, w = video.shape
         audio = resample(audio, sr, 1024 * resample_fps).contiguous()
         video = video.permute(1, 2, 3, 0).reshape(c * h, w, l)
         video = interpolate(video, size=round(dur * resample_fps))
@@ -66,7 +68,7 @@ def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):
     return audio, sr, video, fps
 
 
-class AudioVisualDataset(Dataset):
+class AudioVisualDataset(td.Dataset):
     def __init__(self, files):
         super().__init__()
         self.files = files

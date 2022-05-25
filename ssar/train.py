@@ -11,11 +11,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from functorch import vmap
-from scipy import stats
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from .features.correlation import rv2
 from .features.video import absdiff
 from .models.latent_n_noise2 import LatentNoiseReactor
 from .supervised.data import audio2features, get_ffcv_dataloaders
@@ -102,19 +100,22 @@ def validate():
     val_loss /= len(val_dataloader)
     writer.add_scalar("Loss/val", val_loss.item(), it)
 
-    try:
-        loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
-        writer.add_scalar("Eval/laplace_b", scale.item(), it)
-    except Exception as e:
-        progress.write(f"\nError in Laplace fit:\n{e}\n\n")
-        scale = -1
+    # try:
+    #     loc, scale = stats.laplace.fit(np.concatenate(latent_residuals), loc=0, scale=0.1)
+    #     writer.add_scalar("Eval/laplace_b", scale.item(), it)
+    # except Exception as e:
+    #     progress.write(f"\nError in Laplace fit:\n{e}\n\n")
+    #     scale = -1
 
     envelopes = model.forward(inputs, return_envelopes=True)
     n_env = envelopes[0].shape[-1]
     most_correlated = torch.topk(
-        torch.tensor([rv2(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]), k=n_env
+        torch.tensor(
+            [1 - orthogonal_procrustes_distance(inp.unsqueeze(-1), envelopes[0]) for inp in inputs[0].unbind(-1)]
+        ),
+        k=n_env,
     ).indices
-    fig, ax = plt.subplots(n_env + 1, 2, figsize=(8, 4 * (n_env + 1)))
+    _, ax = plt.subplots(n_env + 1, 2, figsize=(8, 4 * (n_env + 1)))
     [x.axis("off") for x in ax.flatten()]
 
     def sum_ac(tensors):
@@ -144,23 +145,35 @@ def validate():
     plt.tight_layout()
     plt.savefig(f"{writer.log_dir}/envelopes_{it}.pdf")
 
-    return val_loss, scale
-
-
-@torch.jit.script
-def rv2_loss(predictions: List[torch.Tensor], targets: List[torch.Tensor]) -> torch.Tensor:
-    loss = torch.zeros(len(predictions[0]), device=predictions[0].device)
-    for p in predictions:
-        for t in targets:
-            for b in range(len(p)):
-                loss[b] = loss[b] + (1 - rv2(p[b].flatten(1), t[b].flatten(1)))
-    return loss
+    return val_loss  # , scale
 
 
 def infiniter(data_loader):
     while True:
         for batch in data_loader:
             yield batch
+
+
+def orthogonal_procrustes_distance(x, y):
+    x = x - x.mean(dim=0, keepdim=True)
+    x = x / torch.linalg.norm(x, ord="fro")
+    y = y - y.mean(dim=0, keepdim=True)
+    y = y / torch.linalg.norm(y, ord="fro")
+    return 1 - torch.linalg.norm(x.t() @ y, ord="nuc")
+
+
+def audio_reactive_loss(afeats, vfeats):
+    if isinstance(afeats, dict):
+        afeats, vfeats = list(afeats.values()), list(vfeats.values())
+    return torch.stack(
+        [
+            orthogonal_procrustes_distance(a, v)
+            for a, v in zip(
+                torch.cat([af.flatten(2) for af in afeats], dim=2),
+                torch.cat([vf.flatten(2) for vf in vfeats], dim=2),
+            )
+        ]
+    )
 
 
 class NormalizeGradients(torch.autograd.Function):
@@ -187,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument("--decoder", type=str, default="learned", choices=["learned", "fixed"])
     parser.add_argument("--backbone", type=str, default="gru", choices=["sashimi", "gru", "transformer"])
     parser.add_argument("--n_latent_split", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
-    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--hidden_size", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--duration", type=int, default=8)
@@ -195,13 +208,14 @@ if __name__ == "__main__":
 
     # Loss options
     parser.add_argument("--loss", type=str, default="supervised", choices=["supervised", "selfsupervised", "ssabsdiff"])
+    parser.add_argument("--residual", action="store_true")
 
     # Training options
-    parser.add_argument("--n_examples", type=int, default=1_024_000)
+    parser.add_argument("--n_examples", type=int, default=128_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--eval_every", type=int, default=1 * 10_240)
-    parser.add_argument("--ckpt_every", type=int, default=1 * 10_240)
+    parser.add_argument("--eval_every", type=int, default=10_240)
+    parser.add_argument("--ckpt_every", type=int, default=10_240)
 
     args = parser.parse_args()
 
@@ -231,6 +245,7 @@ if __name__ == "__main__":
         train_std,
         feature_dim,
         decoder_latents,
+        residual=args.residual,
         num_layers=args.num_layers,
         backbone=args.backbone,
         hidden_size=args.hidden_size,
@@ -247,10 +262,11 @@ if __name__ == "__main__":
     name = "_".join(
         [
             "",
-            args.loss,
             args.backbone,
+            args.loss,
             args.decoder,
             "decoder",
+            f"residual:{args.residual}",
             f"n_latent_split:{args.n_latent_split}",
             f"hidden_size:{args.hidden_size}",
             f"num_layers:{args.num_layers}",
@@ -262,10 +278,12 @@ if __name__ == "__main__":
     shutil.copytree(os.path.dirname(__file__), writer.log_dir + "/ssar")
 
     losses = []
-    with tqdm(range(0, args.n_examples, batch_size)) as progress:  # , torch.autograd.set_detect_anomaly(True):
+    with tqdm(range(0, args.n_examples, batch_size)) as progress:
         for it in progress:
             if args.loss == "supervised":
                 inputs, latents, n4, n8, n16, n32 = next(train_iter)
+                if args.residual:
+                    latents -= latents.mean(dim=1, keepdim=True)
 
                 pred_lats, pred_noise = model(inputs)
                 loss = sum([F.mse_loss(o, t) for o, t in zip([pred_lats] + pred_noise, [latents, n4, n8, n16, n32])])
@@ -283,8 +301,8 @@ if __name__ == "__main__":
 
                 latents, noise = model(inputs)
                 predictions = [latents] + noise
-                predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
-                loss = rv2_loss(predictions, [inputs]).mean()
+                # predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
+                loss = audio_reactive_loss(predictions, [inputs]).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -299,9 +317,9 @@ if __name__ == "__main__":
 
                 latents, noise = model(inputs)
                 predictions = [latents] + noise
-                predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
+                # predictions = [normalize_gradients(p) for p in predictions]  # equalize gradient contributions
                 predictions = [batch_abs_diff(p) for p in predictions]
-                loss = rv2_loss(predictions, [inputs]).mean()
+                loss = audio_reactive_loss(predictions, [inputs]).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -312,19 +330,19 @@ if __name__ == "__main__":
 
             if it % args.eval_every == 0:  # and it != 0:
                 model.eval()
-                val_loss, scale = validate()
+                val_loss = validate()
                 progress.write("")
                 progress.write(f"iter {it}")
                 progress.write(f"train_loss: {np.mean(losses):.4f}")
                 progress.write(f"val_loss  : {val_loss:.4f}")
-                progress.write(f"laplace_b : {scale:.4f}")
+                # progress.write(f"laplace_b : {scale:.4f}")
                 progress.write("")
                 losses = []
                 model.train()
 
             if it % args.ckpt_every == 0:  # and it != 0:
                 model.eval()
-                checkpoint_name = f"audio2latent_{name}_steps{it:08}_b{scale:.4f}_val{val_loss:.4f}"
+                checkpoint_name = f"audio2latent_{name}_steps{it:08}_val{val_loss:.4f}"
                 joblib.dump(
                     {"model": model, "optim": optimizer, "n_iter": it},
                     f"{writer.log_dir}/{checkpoint_name}.pt",
@@ -337,7 +355,26 @@ if __name__ == "__main__":
                     out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
                     stylegan_file=STYLEGAN_CKPT,
                     output_size=(1024, 1024),
+                    seed=None,
+                    residual=args.residual,
                 )
                 model.train()
+
+    checkpoint_name = f"audio2latent_{name}_steps{it:08}_val{val_loss:.4f}"
+    joblib.dump(
+        {"model": model, "optim": optimizer, "n_iter": it},
+        f"{writer.log_dir}/{checkpoint_name}.pt",
+        compress=9,
+    )
+    audio2video(
+        a2l=model,
+        a2f=audio2features,
+        audio_file=test_audio,
+        out_file=f"{writer.log_dir}/{checkpoint_name}_{Path(test_audio).stem}.mp4",
+        stylegan_file=STYLEGAN_CKPT,
+        output_size=(1024, 1024),
+        seed=None,
+        residual=args.residual,
+    )
 
     writer.close()

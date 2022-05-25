@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from .supervised.data import FEATURE_NAMES, AudioFeatures, audio2features
 from .supervised.test import _audio2video, load_a2l
-from .train import STYLEGAN_CKPT, rv2_loss
+from .train import STYLEGAN_CKPT, audio_reactive_loss
 
 np.set_printoptions(precision=3, suppress=True, linewidth=200)
 
@@ -309,17 +309,17 @@ def generate_by_data_split():
                     outputs = model(feat)
                     if isinstance(outputs, tuple):
                         latent_residuals, noise = outputs
-                        rv2loss = rv2_loss([n.flatten(2) for n in noise], [feat])
+                        rv2loss = audio_reactive_loss([n.flatten(2) for n in noise], [feat])
                         noirv2s.append(rv2loss.cpu().numpy())
                     else:
                         latent_residuals = outputs
 
-                    rv2loss = rv2_loss([latent_residuals.flatten(2)], [feat])
+                    rv2loss = audio_reactive_loss([latent_residuals.flatten(2)], [feat])
                     latrv2s.append(rv2loss.cpu().numpy())
 
                     try:
                         envelopes = model(feat, return_envelopes=True)
-                        rv2loss = rv2_loss([envelopes], [feat])
+                        rv2loss = audio_reactive_loss([envelopes], [feat])
                         envrv2s.append(rv2loss.cpu().numpy())
                     except:
                         pass

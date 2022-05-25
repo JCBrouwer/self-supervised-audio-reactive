@@ -1,9 +1,19 @@
 # fmt:off
+import os
 import sys
+from glob import glob
+from pathlib import Path
+from time import time
 
+import decord
+import joblib
+import numpy as np
+import pandas as pd
 import torch
-import torchaudio
-from torchaudio.functional import resample
+import torchdatasets as td
+from resize_right import resize
+from torch.utils.data import DataLoader
+from torchaudio.functional.functional import resample
 from tqdm import tqdm
 
 from .features.audio import (chromagram, drop_strength, mfcc, onsets, pulse,
@@ -20,11 +30,10 @@ from .optimize import FixedLatentNoiseDecoder, HiPPOTimeseries, autocorrelation
 from .random.mir import retrieve_music_information
 from .random.patch import Patch
 from .test import load_model
-from .train import STYLEGAN_CKPT, normalize_gradients
+from .train import STYLEGAN_CKPT, audio_reactive_loss, normalize_gradients
 
 sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
-from ops.video import VideoWriter
+from GAN.wrappers.stylegan2 import StyleGAN2
 
 AFNS = [chromagram, tonnetz, mfcc, spectral_contrast, rms, drop_strength, onsets, spectral_flatness, pulse]
 VFNS = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_freq_rms, high_freq_rms, 
@@ -32,54 +41,28 @@ VFNS = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_fr
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FPS = 24
 OUT_SIZE = (1024, 1024)
-M = StyleGAN2Mapper(model_file=STYLEGAN_CKPT, inference=False).eval().to(DEVICE)
-G = StyleGAN2Synthesizer(
+SG2 = StyleGAN2(
     model_file=STYLEGAN_CKPT, inference=False, output_size=OUT_SIZE, strategy="stretch", layer=0
 ).eval().to(DEVICE)
+M = SG2.mapper
+G = SG2.synthesizer
 # fmt:on
 
-
-@torch.no_grad()
-def latent2mp4(
-    audio_file,
-    latents,
-    noise,
-    out_file,
-    fps=FPS,
-    batch_size=8,
-    offset=0,
-    duration=None,
-):
-    start_frame = int(fps * offset)
-    end_frame = int(fps * (offset + duration)) if duration is not None else len(latents)
-
-    noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
-
-    with VideoWriter(
-        output_file=out_file,
-        output_size=OUT_SIZE,
-        fps=fps,
-        audio_file=audio_file,
-        audio_offset=offset,
-        audio_duration=duration,
-    ) as video:
-        for i in tqdm(range(start_frame, end_frame, batch_size), unit_scale=batch_size):
-            for frame in (
-                G(
-                    latents=latents[i : i + batch_size],
-                    **{f"noise{j}": n[i : i + batch_size, None] for j, n in enumerate(noise)},
-                )
-                .add(1)
-                .div(2)
-            ):
-                video.write(frame.unsqueeze(0))
+decord.bridge.set_bridge("torch")
 
 
 class RandomGenerator:
-    def predict(self, audio, sr, seed=None):
+    def predict(self, audio, sr):
         features, segmentations, tempo = retrieve_music_information(audio, sr)
-        patch = Patch(features=features, segmentations=segmentations, tempo=tempo, seed=seed, fps=FPS, device=DEVICE)
-        z = torch.randn((180, 512), device=DEVICE, generator=torch.Generator(DEVICE).manual_seed(seed))
+        patch = Patch(
+            features=features,
+            segmentations=segmentations,
+            tempo=tempo,
+            seed=np.random.randint(0, 2 ** 32),
+            fps=FPS,
+            device=DEVICE,
+        )
+        z = torch.randn((180, 512), device=DEVICE)
         latent_palette = M(z)
         return patch.forward(latent_palette)
 
@@ -87,14 +70,19 @@ class RandomGenerator:
 class SupervisedSequenceModel:
     def __init__(self, checkpoint, residual=False):
         self.model, self.a2f = load_model(checkpoint)
+        self.model.to(DEVICE)
+        try:
+            self.model.envelope.backbone.flatten_parameters()
+        except:
+            pass
         self.residual = residual
 
-    def predict(self, audio, sr, seed=None):
-        latents, noise = self.model(self.a2f(audio, sr, fps=FPS).unsqueeze(0).to(DEVICE))
+    def predict(self, audio, sr):
+        latents, noise = self.model(self.a2f(audio.unsqueeze(0), sr, fps=FPS).unsqueeze(0).to(DEVICE))
         if self.residual:
-            z = torch.randn((1, 512), device=DEVICE, generator=torch.Generator(DEVICE).manual_seed(seed))
+            z = torch.randn((1, 512), device=DEVICE)
             latents = latents + M(z)
-        return latents, noise
+        return latents.squeeze(), [n.squeeze() for n in noise]
 
 
 class SelfSupervisedOptimization:
@@ -102,7 +90,6 @@ class SelfSupervisedOptimization:
         self,
         audio,
         sr,
-        seed=None,
         n_steps=512,
         n_params=2048,
         n_latent_split=3,
@@ -133,9 +120,7 @@ class SelfSupervisedOptimization:
         # initialize modules
         n_envelopes = n_latent_split * n_latent_groups * n_latent_per_group + 2 * n_noise
         envelopes = HiPPOTimeseries(torch.rand((n_frames, n_envelopes), device=DEVICE), N=n_params).to(DEVICE)
-        decoder_latents = M(
-            torch.randn((180, 512), device=DEVICE, generator=torch.Generator(DEVICE).manual_seed(seed))
-        ).to(DEVICE)
+        decoder_latents = M(torch.randn((180, 512), device=DEVICE)).to(DEVICE)
         decoder = FixedLatentNoiseDecoder(decoder_latents, n_latent_split, n_latent_groups, n_latent_per_group)
 
         # initialize optimization
@@ -170,48 +155,173 @@ class SelfSupervisedOptimization:
         return decoder(envelopes())
 
 
-def audio_reactive_correlation(afeats, vfeats):
-    afeatvals, vfeatvals = list(afeats.values()), list(vfeats.values())
-    af, vf = afeatvals[0], vfeatvals[0]
-    for afeat in afeatvals:
-        af = torch.cat((af, afeat), dim=1)
-    for vfeat in vfeatvals:
-        vf = torch.cat((vf, vfeat), dim=1)
-    return 1 - orthogonal_procrustes_distance(af, vf).item()
+def load_audio(path, fps=24):
+    a = decord.AudioReader(path)
+    audio = a[:].float().squeeze().contiguous()
+    old_sr = round(len(audio) / a.duration())
+    new_sr = round(1024 * fps)
+    audio = resample(audio, old_sr, new_sr).contiguous()
+    return audio, new_sr
+
+
+class AudioDataset(td.Dataset):
+    def __init__(self, files):
+        super().__init__()
+        self.files = files
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        filepath = self.files[idx]
+        return filepath, load_audio(filepath)
+
+
+TESTSET = AudioDataset(glob("/home/hans/datasets/audiovisual/maua/*.mp4"))
+TESTSET.cache(td.cachers.Pickle(Path("cache/")))
+for _ in tqdm(DataLoader(TESTSET, num_workers=8), total=len(TESTSET), desc="Caching test set..."):
+    pass
+
+
+@torch.no_grad()
+def evaluate_trained_checkpoint_dirs(dirs):
+    try:
+        results = joblib.load("output/learned_checkpoint_comparison.pkl")
+        jobs_done = len(results)
+    except:
+        results = []
+        jobs_done = 0
+    j = 0
+    for ckdir in tqdm(dirs):
+        backbone, loss, decoder, _, residual, _, _, split, _, hidden, _, layers, dropout, lr = ckdir.split("_")[3:]
+        ckpts = sorted(glob(f"{ckdir}/*.pt"))
+        ckpts = [ckpts[idx] for idx in np.linspace(0, len(ckpts) - 1, 5).round().astype(int)]
+        for ckpt in tqdm(ckpts):
+            steps, val = Path(ckpt).stem.split("_")[-2:]
+            t = time()
+            for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
+                if j < jobs_done:
+                    j += 1
+                    print(ckdir, ckpt, filepath, "already done, skipping...")
+                    continue
+                print("load", time() - t)
+                t = time()
+
+                latents, noise = SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt).predict(
+                    audio, sr.item()
+                )
+                noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
+                inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+                print("sequence", time() - t)
+                t = time()
+
+                video = torch.cat(list(SG2.render(inputs, postprocess_fn=lambda x: resize(x, out_shape=(128, 128)))))
+                print("render", time() - t)
+                t = time()
+
+                vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
+                print("vfeats", time() - t)
+                t = time()
+
+                if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
+                    afeats = {af.__name__: af(audio, sr.item()).unsqueeze(0).cuda() for af in AFNS}
+                    np.savez_compressed(
+                        filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
+                    )
+                else:
+                    with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
+                        afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in AFNS}
+                print("afeats", time() - t)
+                t = time()
+
+                results.append(
+                    dict(
+                        filepath=filepath,
+                        steps=int(steps.replace("steps", "")),
+                        val=float(val.replace("val", "")),
+                        backbone=backbone.split(":")[-1],
+                        loss=loss.split(":")[-1],
+                        decoder=decoder.split(":")[-1],
+                        residual=bool(residual.split(":")[-1]),
+                        split=int(split.split(":")[-1]),
+                        hidden=int(hidden.split(":")[-1]),
+                        layers=int(layers.split(":")[-1]),
+                        dropout=float(dropout.split(":")[-1]),
+                        lr=float(lr.split(":")[-1]),
+                        correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
+                        **{
+                            an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
+                            for vn, vf in vfeats.items()
+                            for an, af in afeats.items()
+                        },
+                    )
+                )
+                print("results", time() - t)
+                print(results[-1])
+                t = time()
+                joblib.dump(results, "output/learned_checkpoint_comparison.pkl")
+
+    results = pd.DataFrame(results)
+    results.to_csv("output/learned_checkpoint_comparison.csv")
+    return results
+
+
+@torch.no_grad()
+def compare_big_three(seqckpts, n_samples=10):
+    results = []
+    for model_name, model in [
+        *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
+        RandomGenerator,
+        SelfSupervisedOptimization,
+    ]:
+        for _ in range(n_samples):
+            for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
+                latents, noise = model().predict(audio, sr.item())
+
+                noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
+                inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+                video = torch.cat(list(SG2.render(inputs, postprocess_fn=lambda x: resize(x, out_shape=(256, 256)))))
+
+                vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
+
+                if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
+                    audio = audio.cuda()
+                    afeats = {af.__name__: af(audio.cpu(), sr.item()).unsqueeze(0).cuda() for af in AFNS}
+                    np.savez_compressed(
+                        filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
+                    )
+                else:
+                    with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
+                        afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in AFNS}
+
+                results.append(
+                    dict(
+                        filepath=filepath,
+                        model_name=model_name,
+                        correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
+                        **{
+                            an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
+                            for (an, af), (vn, vf) in zip(afeats.items(), vfeats.items())
+                        },
+                    )
+                )
+                print(results[-1])
+    results = pd.DataFrame(results)
+    results.to_csv("output/big3_comparison.csv")
+    return results
 
 
 if __name__ == "__main__":
-    audio_file = ""
-
-    audio, sr = torchaudio.load(audio_file)
-    audio = audio.mean(0)
-    audio = audio[: 40 * sr]
-    audio = resample(audio, sr, 1024 * FPS)
-    sr = 1024 * FPS
-
-    for (filepath,), ((audio,), sr, (video,), _) in tqdm(DataLoader(AudioVisualDataset(files), num_workers=24)):
-        audio, sr, video = audio.cuda(), sr.item(), video.cuda()
-
-        if not os.path.exists(filepath.replace(".mp4", "_vfeats.npz")):
-            audio, video = audio.cuda(), video.cuda()
-            afeats = {af.__name__: af(audio, sr) for af in AFNS}
-            vfeats = {vf.__name__: vf(video) for vf in VFNS}
-            np.savez_compressed(
-                filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
-            )
-            np.savez_compressed(
-                filepath.replace(".mp4", "_vfeats.npz"), **{n: f.cpu().numpy() for n, f in vfeats.items()}
-            )
-        else:
-            with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
-                afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in afns}
-            with np.load(filepath.replace(".mp4", "_vfeats.npz")) as arr:
-                vfeats = {vf.__name__: torch.from_numpy(arr[vf.__name__]).cuda() for vf in vfns}
-
-        row = {"group": group}
-        for cname, correlation in {c.__name__: c for c in [op, pwcca, rv2, smi, svcca]}.items():
-            row = {**row, **audiovisual_correlation(afeats, vfeats, cname, correlation, quadratic=True)}
-            row[("concat", "concat", cname)] = audiovisual_correlation(
-                afeats, vfeats, cname, correlation, quadratic=False
-            )
-        results.append(row)
+    results = evaluate_trained_checkpoint_dirs(
+        [
+            "runs/May23_17-01-54_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_16-43-01_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_16-24-29_ubuntu94025_gru_selfsupervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_16-05-58_ubuntu94025_gru_selfsupervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_15-41-49_ubuntu94025_gru_supervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_15-27-32_ubuntu94025_gru_supervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_15-10-44_ubuntu94025_gru_supervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+            "runs/May23_14-48-57_ubuntu94025_gru_supervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+        ]
+    )
+    print(results)
