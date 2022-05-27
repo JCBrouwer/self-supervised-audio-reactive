@@ -12,13 +12,7 @@ from x_transformers.x_transformers import AttentionLayers
 class AttentionLayer(AttentionLayers):
     def __init__(self, in_channels, out_channels, n_head, dim_head, dropout):
         super().__init__(
-            dim=in_channels,
-            depth=1,
-            heads=n_head,
-            attn_dim_head=dim_head,
-            ff_dim_out=out_channels,
-            dropout=dropout,
-            rotary_pos_emb=True,
+            dim=in_channels, depth=1, heads=n_head, attn_dim_head=dim_head, ff_dim_out=out_channels, dropout=dropout
         )
 
 

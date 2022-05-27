@@ -149,3 +149,68 @@ class ConvNeXt(Module):
         x = self.norm(x)
         x = self.layerwise(x)
         return x
+
+
+class ConvNeXtSeq2Seq(Module):
+    def __init__(
+        self,
+        input_size=52,
+        hidden_size=64,
+        num_layers=4,
+        depth=2,
+        cbase=4,
+        drop_path_rate=0.2,
+        gamma_eps=1e-6,
+    ):
+        super().__init__()
+
+        self.num_layers = nl = num_layers
+        depths = [depth] * nl
+
+        dims = cbase * 2 ** np.clip(np.arange(nl), 0, 2)
+
+        self.downsample_layers, self.upsample_layers = ModuleList(), ModuleList()
+        self.downsample_layers.append(
+            Sequential(Conv1d(input_size, dims[0], kernel_size=4, stride=4), LayerNorm(dims[0]))
+        )
+        for i in range(nl - 1):
+            self.downsample_layers.append(Conv1d(dims[i], dims[i + 1], kernel_size=2, stride=2))
+            self.upsample_layers.append(ConvTranspose1d(dims[nl - i - 1], dims[nl - i - 2], kernel_size=2, stride=2))
+        self.upsample_layers.append(
+            Sequential(ConvTranspose1d(dims[0], hidden_size, kernel_size=4, stride=4), LayerNorm(hidden_size))
+        )
+
+        # 4 feature resolution stages, each consisting of multiple residual blocks
+        c = 0
+        drop_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        self.down_stages, self.up_stages = ModuleList(), ModuleList()
+        for i in range(nl):
+            self.down_stages.append(
+                Sequential(
+                    *[ConvNeXtBlock(dims[i], drop_rates[c + j], gamma_eps) for j in range(depths[i])],
+                    LayerNorm(dims[i]),
+                )
+            )
+            self.up_stages.append(
+                Sequential(
+                    *[ConvNeXtBlock(dims[nl - i - 1], drop_rates[-(c + j) - 1], gamma_eps) for j in range(depths[i])],
+                    LayerNorm(dims[nl - i - 1]),
+                )
+            )
+            c += depths[i]
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # BTC --> BCT
+        skips = []
+        for i in range(self.num_layers):
+            x = self.downsample_layers[i](x)
+            x = self.down_stages[i](x)
+            if i < self.num_layers - 1:  # don't need last x
+                skips.append(x)
+        for i in range(self.num_layers):
+            x = self.up_stages[i](x)
+            x = self.upsample_layers[i](x)
+            if i < self.num_layers - 1:  # don't need last x
+                x += skips.pop()
+        x = x.permute(0, 2, 1)  # BCT --> BTC
+        return x

@@ -74,3 +74,36 @@ class MLP(Module):
             x = self.dropout(x)
         w = self.layerwise(x)
         return w
+
+
+class MLPSeq2Seq(Module):
+    def __init__(
+        self,
+        in_channels,
+        channels,
+        num_layers,
+        dropout,
+        mult=2,
+        kernel_size=15,
+    ):
+        super().__init__()
+        self.attn = Sequential(
+            Linear(in_channels, channels * mult // 2),
+            GELU(),
+            Dropout(dropout),
+            AttentionLayer(
+                channels * mult // 2, channels * mult // 2, n_head=4, dim_head=channels // 4, dropout=dropout
+            ),
+        )
+        self.input_dense = Linear(in_channels, channels)
+        self.dropout = Dropout(dropout)
+        self.blocks = ModuleList([MLPBlock(channels, kernel_size=kernel_size, mult=mult) for _ in range(num_layers)])
+
+    def forward(self, x):
+        z = self.attn(x)
+        x = self.input_dense(x)
+        x = self.dropout(x)
+        for block in self.blocks:
+            x = block(x, z)
+            x = self.dropout(x)
+        return x

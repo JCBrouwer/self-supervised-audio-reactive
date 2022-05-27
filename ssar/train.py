@@ -71,7 +71,7 @@ def print_model_summary(model, example_inputs):
     for handle in handles:
         handle.remove()
     print("-" * 140)
-    print("total".ljust(70), f"".ljust(30), f"".ljust(40), f"{total_params/1e6:.2f} M")
+    print("total".ljust(70), f"".ljust(30), f"".ljust(40), f"{total_params/1e3:.2f} K")
 
 
 def torchrand(pop_size, num_samples, device: str):
@@ -198,7 +198,9 @@ if __name__ == "__main__":
 
     # Model options
     parser.add_argument("--decoder", type=str, default="learned", choices=["learned", "fixed"])
-    parser.add_argument("--backbone", type=str, default="gru", choices=["sashimi", "gru", "transformer"])
+    parser.add_argument(
+        "--backbone", type=str, default="gru", choices=["sashimi", "gru", "lstm", "transformer", "conv", "mlp"]
+    )
     parser.add_argument("--n_latent_split", type=int, default=3, choices=[1, 2, 3, 6, 9, 18])
     parser.add_argument("--hidden_size", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=4)

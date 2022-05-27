@@ -1,4 +1,5 @@
 # fmt:off
+import gc
 import os
 import sys
 from glob import glob
@@ -19,7 +20,6 @@ from tqdm import tqdm
 from .features.audio import (chromagram, drop_strength, mfcc, onsets, pulse,
                              rms, spectral_contrast, spectral_flatness,
                              tonnetz)
-from .features.correlation import orthogonal_procrustes_distance
 from .features.rosa.segment import laplacian_segmentation_rosa
 from .features.video import (absdiff, adaptive_freq_rms, directogram,
                              high_freq_rms, hsv_hist, low_freq_rms,
@@ -30,7 +30,8 @@ from .optimize import FixedLatentNoiseDecoder, HiPPOTimeseries, autocorrelation
 from .random.mir import retrieve_music_information
 from .random.patch import Patch
 from .test import load_model
-from .train import STYLEGAN_CKPT, audio_reactive_loss, normalize_gradients
+from .train import (STYLEGAN_CKPT, audio_reactive_loss, normalize_gradients,
+                    orthogonal_procrustes_distance)
 
 sys.path.append("/home/hans/code/maua/maua/")
 from GAN.wrappers.stylegan2 import StyleGAN2
@@ -90,20 +91,25 @@ class SelfSupervisedOptimization:
         self,
         audio,
         sr,
-        n_steps=512,
-        n_params=2048,
+        n_steps=1024,
+        n_params=512,
         n_latent_split=3,
         n_latent_groups=3,
         n_latent_per_group=1,
-        n_noise=6,
+        n_noise=3,
         lr=1e-3,
         use_audio_segmentation_features=True,
         use_env=True,
+        norm_grads=False,
         feature_weights=None,
+        use_hippo=True,
+        emphasize_feature=False,
     ):
         # extract features from audio
         features = {afn.__name__: afn(audio, sr).to(DEVICE) for afn in AFNS}
         n_frames = features["rms"].shape[0]
+        if emphasize_feature:
+            feature_weights = {}
         if feature_weights is not None:
             for name, feature in features.items():
                 ac = autocorrelation(feature)
@@ -116,41 +122,63 @@ class SelfSupervisedOptimization:
             features[f"rosa_segmentation"] = segmentations.float().to(DEVICE)
             if feature_weights is not None:
                 feature_weights[f"rosa_segmentation"] = torch.max(torch.tensor(list(feature_weights.values())))
+        if emphasize_feature:
+            feature_weights[emphasize_feature] *= 10
 
         # initialize modules
         n_envelopes = n_latent_split * n_latent_groups * n_latent_per_group + 2 * n_noise
-        envelopes = HiPPOTimeseries(torch.rand((n_frames, n_envelopes), device=DEVICE), N=n_params).to(DEVICE)
-        decoder_latents = M(torch.randn((180, 512), device=DEVICE)).to(DEVICE)
+
+        if use_hippo:
+            envelopes = HiPPOTimeseries(torch.rand((n_frames, n_envelopes), device=DEVICE), N=n_params).to(DEVICE)
+        else:
+
+            class Raw(torch.nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.envs = torch.nn.Parameter(torch.rand((n_frames, n_envelopes), device=DEVICE))
+
+                def forward(self):
+                    return self.envs
+
+            envelopes = Raw().to(DEVICE)
+
+        decoder_latents = M(torch.randn((n_latent_split * n_latent_groups * n_latent_per_group, 512), device=DEVICE))
         decoder = FixedLatentNoiseDecoder(decoder_latents, n_latent_split, n_latent_groups, n_latent_per_group)
 
-        # initialize optimization
-        optimizer = torch.optim.Adam(envelopes.parameters(), lr=lr)
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr / 100)
+        with torch.enable_grad():
+            # initialize optimization
+            optimizer = torch.optim.Adam(envelopes.parameters(), lr=lr)
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr / 100)
 
-        for _ in range(n_steps):
-            optimizer.zero_grad()
-            envs = envelopes()
-            latents, noise = decoder(envs)
-            predictions = (
-                ([normalize_gradients(envs).flatten(1)] if use_env else [])
-                + [normalize_gradients(latents).flatten(1)]
-                + [normalize_gradients(n, 1 / len(noise).flatten(1)) for n in noise]
-            )
+            for _ in range(n_steps):
+                optimizer.zero_grad()
+                envs = envelopes()
+                latents, noise = decoder(envs)
+                if norm_grads:
+                    predictions = (
+                        ([normalize_gradients(envs).flatten(1)] if use_env else [])
+                        + [normalize_gradients(latents).flatten(1)]
+                        + [normalize_gradients(n, 1 / len(noise)).flatten(1) for n in noise]
+                    )
+                else:
+                    predictions = (
+                        ([envs.flatten(1)] if use_env else []) + [latents.flatten(1)] + [n.flatten(1) for n in noise]
+                    )
 
-            if feature_weights is not None:
-                loss = torch.zeros((), device=DEVICE)
-                for p in predictions:
-                    for n, f in features.items():
-                        loss = loss + feature_weights[n] * orthogonal_procrustes_distance(p, f)
+                if feature_weights is not None:
+                    loss = torch.zeros((), device=DEVICE)
+                    for p in predictions:
+                        for n, f in features.items():
+                            loss = loss + feature_weights[n] * orthogonal_procrustes_distance(p, f)
 
-            else:
-                preds = torch.stack(predictions, dim=1)
-                feats = torch.stack(list(features.values()), dim=1)
-                loss = orthogonal_procrustes_distance(preds, feats)
+                else:
+                    preds = torch.cat(predictions, dim=1)
+                    feats = torch.cat(list(features.values()), dim=1)
+                    loss = orthogonal_procrustes_distance(preds, feats)
 
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
 
         return decoder(envelopes())
 
@@ -184,7 +212,7 @@ for _ in tqdm(DataLoader(TESTSET, num_workers=8), total=len(TESTSET), desc="Cach
 
 
 @torch.no_grad()
-def evaluate_trained_checkpoint_dirs(dirs):
+def evaluate_trained_checkpoint_dirs(dirs, n_ckpts=1):
     try:
         results = joblib.load("output/learned_checkpoint_comparison.pkl")
         jobs_done = len(results)
@@ -195,7 +223,11 @@ def evaluate_trained_checkpoint_dirs(dirs):
     for ckdir in tqdm(dirs):
         backbone, loss, decoder, _, residual, _, _, split, _, hidden, _, layers, dropout, lr = ckdir.split("_")[3:]
         ckpts = sorted(glob(f"{ckdir}/*.pt"))
-        ckpts = [ckpts[idx] for idx in np.linspace(0, len(ckpts) - 1, 5).round().astype(int)]
+        ckpts = (
+            [ckpts[idx] for idx in np.linspace(0, len(ckpts) - 1, n_ckpts).round().astype(int)]
+            if n_ckpts > 1
+            else ckpts[-1]
+        )
         for ckpt in tqdm(ckpts):
             steps, val = Path(ckpt).stem.split("_")[-2:]
             t = time()
@@ -242,7 +274,7 @@ def evaluate_trained_checkpoint_dirs(dirs):
                         backbone=backbone.split(":")[-1],
                         loss=loss.split(":")[-1],
                         decoder=decoder.split(":")[-1],
-                        residual=bool(residual.split(":")[-1]),
+                        residual=residual.split(":")[-1],
                         split=int(split.split(":")[-1]),
                         hidden=int(hidden.split(":")[-1]),
                         layers=int(layers.split(":")[-1]),
@@ -267,26 +299,45 @@ def evaluate_trained_checkpoint_dirs(dirs):
 
 
 @torch.no_grad()
-def compare_big_three(seqckpts, n_samples=10):
-    results = []
+def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_samples=1):
+    try:
+        results = joblib.load(f"output/{name}.pkl")
+        jobs_done = len(results)
+    except:
+        results = []
+        jobs_done = 0
+    j = 0
     for model_name, model in [
-        *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
-        RandomGenerator,
-        SelfSupervisedOptimization,
+        ("ssopt", SelfSupervisedOptimization),
+        # ("random", RandomGenerator),
+        # *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
     ]:
         for _ in range(n_samples):
             for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
-                latents, noise = model().predict(audio, sr.item())
+                if j < jobs_done:
+                    j += 1
+                    print(model_name, filepath, "already done, skipping...")
+                    continue
 
-                noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
-                inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
-                video = torch.cat(list(SG2.render(inputs, postprocess_fn=lambda x: resize(x, out_shape=(256, 256)))))
+                if model_name == "random":
+                    latents, noise_modules = model().predict(audio, sr.item())
+                    inputs = {"latents": latents}
+                    for j, noise_module in enumerate(noise_modules[:9]):
+                        inputs[f"noise{j}"] = noise_module.forward(0, len(latents))[:, None]
+
+                else:
+                    latents, noise = model().predict(audio, sr.item(), n_params=n_params, emphasize_feature=emphasize)
+                    noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
+                    inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+
+                video = torch.cat(
+                    list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(128, 128))))
+                )
 
                 vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
 
                 if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
-                    audio = audio.cuda()
-                    afeats = {af.__name__: af(audio.cpu(), sr.item()).unsqueeze(0).cuda() for af in AFNS}
+                    afeats = {af.__name__: af(audio, sr.item()).unsqueeze(0).cuda() for af in AFNS}
                     np.savez_compressed(
                         filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
                     )
@@ -301,27 +352,45 @@ def compare_big_three(seqckpts, n_samples=10):
                         correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
                         **{
                             an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
-                            for (an, af), (vn, vf) in zip(afeats.items(), vfeats.items())
+                            for vn, vf in vfeats.items()
+                            for an, af in afeats.items()
                         },
                     )
                 )
-                print(results[-1])
+                print("CORRELATION:", results[-1]["correlation"])
+                joblib.dump(results, f"output/{name}.pkl")
+
     results = pd.DataFrame(results)
-    results.to_csv("output/big3_comparison.csv")
+    results.to_csv(f"output/{name}.csv")
     return results
 
 
 if __name__ == "__main__":
-    results = evaluate_trained_checkpoint_dirs(
-        [
-            "runs/May23_17-01-54_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_16-43-01_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_16-24-29_ubuntu94025_gru_selfsupervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_16-05-58_ubuntu94025_gru_selfsupervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_15-41-49_ubuntu94025_gru_supervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_15-27-32_ubuntu94025_gru_supervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_15-10-44_ubuntu94025_gru_supervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
-            "runs/May23_14-48-57_ubuntu94025_gru_supervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
-        ]
-    )
-    print(results)
+    # compare_big_three(name="hippo64env", n_params=64)
+    # compare_big_three(name="hippo128env", n_params=128)
+    # compare_big_three(name="hippo256env", n_params=256)
+    # compare_big_three(name="hippo724env", n_params=724)
+    # compare_big_three(name="hippo1024env", n_params=1024)
+
+    compare_big_three(name="hippo_onsets", emphasize="onsets")
+    compare_big_three(name="hippo_chromagram", emphasize="chromagram")
+    compare_big_three(name="hippo_drop_strength", emphasize="drop_strength")
+    compare_big_three(name="hippo_spectral_flatness", emphasize="spectral_flatness")
+    # results = evaluate_trained_checkpoint_dirs(
+    #     [
+    #     ],
+    #     n_ckpts=1,
+    # )
+    # results = evaluate_trained_checkpoint_dirs(
+    #     [
+    #         "runs/May23_17-01-54_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_16-43-01_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_16-24-29_ubuntu94025_gru_selfsupervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_16-05-58_ubuntu94025_gru_selfsupervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_15-41-49_ubuntu94025_gru_supervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_15-27-32_ubuntu94025_gru_supervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_15-10-44_ubuntu94025_gru_supervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+    #         "runs/May23_14-48-57_ubuntu94025_gru_supervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
+    #     ]
+    # )
+    # print(results)

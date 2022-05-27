@@ -41,29 +41,35 @@ def encode_leg_t(fs, A, B):
 
 def init_leg_s(N, max_length=1024, measure="legs", discretization="bilinear"):
     A, B = transition(measure, N)
-    B = B.squeeze(-1)
-    A_stacked = np.empty((max_length, N, N), dtype=A.dtype)
-    B_stacked = np.empty((max_length, N), dtype=B.dtype)
+    A = torch.from_numpy(A.copy()).float().cuda()
+    B = torch.from_numpy(B.copy().squeeze(-1)).float().cuda()
+    A_stacked = torch.empty((max_length, N, N), device="cuda")
+    B_stacked = torch.empty((max_length, N), device="cuda")
     for t in range(1, max_length + 1):
         At = A / t
         Bt = B / t
         if discretization == "forward":
-            A_stacked[t - 1] = np.eye(N) + At
+            A_stacked[t - 1] = torch.eye(N, device="cuda") + At
             B_stacked[t - 1] = Bt
         elif discretization == "backward":
-            A_stacked[t - 1] = la.solve_triangular(np.eye(N) - At, np.eye(N), lower=True)
-            B_stacked[t - 1] = la.solve_triangular(np.eye(N) - At, Bt, lower=True)
+            A_stacked[t - 1] = torch.linalg.solve_triangular(
+                torch.eye(N, device="cuda") - At, torch.eye(N, device="cuda"), upper=False
+            )
+            B_stacked[t - 1] = torch.linalg.solve(torch.eye(N, device="cuda") - At, Bt)
         elif discretization == "bilinear":
-            A_stacked[t - 1] = la.solve_triangular(np.eye(N) - At / 2, np.eye(N) + At / 2, lower=True)
-            B_stacked[t - 1] = la.solve_triangular(np.eye(N) - At / 2, Bt, lower=True)
+            A_stacked[t - 1] = torch.linalg.solve_triangular(
+                torch.eye(N, device="cuda") - At / 2,
+                torch.eye(N, device="cuda") + At / 2,
+                upper=False,
+            )
+            B_stacked[t - 1] = torch.linalg.solve(torch.eye(N, device="cuda") - At / 2, Bt)
         else:  # ZOH
-            A_stacked[t - 1] = la.expm(A * (math.log(t + 1) - math.log(t)))
-            B_stacked[t - 1] = la.solve_triangular(A, A_stacked[t - 1] @ B - B, lower=True)
+            A_stacked[t - 1] = torch.linalg.matrix_exp(A * (math.log(t + 1) - math.log(t)))
+            B_stacked[t - 1] = torch.linalg.solve(A, A_stacked[t - 1] @ B - B)
 
-    vals = np.linspace(0.0, 1.0, max_length)
-    E = (B[:, None] * ss.eval_legendre(np.arange(N)[:, None], 2 * vals - 1)).T
+    E = (B[:, None].cpu() * ss.eval_legendre(np.arange(N)[:, None], 2 * np.linspace(0.0, 1.0, max_length) - 1)).T
 
-    return torch.FloatTensor(A_stacked), torch.FloatTensor(B_stacked), torch.FloatTensor(E)
+    return A_stacked, B_stacked, E.float().cuda()
 
 
 def encode_leg_s(fs, A, B, fast=False):

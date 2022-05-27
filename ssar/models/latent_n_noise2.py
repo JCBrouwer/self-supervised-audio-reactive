@@ -1,8 +1,11 @@
 import numpy as np
 import torch
-from torch.nn import GELU, GRU, Dropout, Linear, Module, Parameter, Sequential
+from torch.nn import GELU, GRU, LSTM, Dropout, Linear, Module, Parameter, Sequential
 from torch.nn.functional import dropout, gelu
 from x_transformers import Encoder
+
+from ssar.models.convnext import ConvNeXtSeq2Seq
+from ssar.models.mlp import MLPSeq2Seq
 
 from ..features.processing import gaussian_filter
 from .audio2latent import LayerwiseLinear, Normalize
@@ -22,7 +25,7 @@ class EnvelopeReactor(torch.nn.Module):
         input_size,
         hidden_size=64,
         output_size=None,
-        num_layers=8,
+        num_layers=4,
         backbone="sashimi",
         dropout=0.0,
     ):
@@ -37,13 +40,25 @@ class EnvelopeReactor(torch.nn.Module):
         if backbone.lower() == "gru":
             self.backbone = GRU(hidden_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
             self.backbone.flatten_parameters()
-        elif backbone.lower() == "transformer":
+        elif backbone.lower() == "lstm":
+            self.backbone = LSTM(hidden_size, hidden_size, num_layers, dropout=dropout, batch_first=True)
+            self.backbone.flatten_parameters()
+        elif backbone.lower() == "conv":
             self.backbone = Sequential(
-                Encoder(dim=hidden_size, attn_dim_head=hidden_size // 2, depth=num_layers, dropout=dropout),
+                ConvNeXtSeq2Seq(hidden_size, hidden_size, num_layers=num_layers, drop_path_rate=dropout),
                 DummyHiddenState(),
             )
-        else:
-            self.backbone = Sashimi(hidden_size, num_layers, dropout=dropout)
+        elif backbone.lower() == "mlp":
+            self.backbone = Sequential(
+                MLPSeq2Seq(hidden_size, hidden_size, num_layers=num_layers, dropout=dropout), DummyHiddenState()
+            )
+        elif backbone.lower() == "transformer":
+            self.backbone = Sequential(
+                Encoder(dim=hidden_size, heads=4, attn_dim_head=hidden_size // 4, depth=num_layers, dropout=dropout),
+                DummyHiddenState(),
+            )
+        elif backbone.lower() == "sashimi":
+            self.backbone = Sashimi(hidden_size, num_layers, dropout=dropout, expand=1, ff=1)
 
         self.decode = Sequential(GELU(), Linear(hidden_size, hidden_size if output_size is None else output_size))
 
@@ -172,7 +187,7 @@ class LatentNoiseReactor(torch.nn.Module):
         latents,
         residual=True,
         # envelope
-        num_layers=8,
+        num_layers=2,
         backbone="sashimi",
         hidden_size=64,
         # decoder
