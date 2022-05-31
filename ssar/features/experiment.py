@@ -5,7 +5,6 @@ from glob import glob
 from pathlib import Path
 
 import decord as de
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -31,7 +30,13 @@ vfns = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_fr
         adaptive_freq_rms, absdiff, visual_variance, video_flow_onsets, video_spectral_onsets]
 
 de.bridge.set_bridge("torch")
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 # fmt: on
+
+sns.set_theme(context="notebook", style="white", palette="tab10")
 
 
 def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):
@@ -54,6 +59,7 @@ def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):
         audio = resample(audio, sr, 1024 * resample_fps).contiguous()
         video = video.permute(1, 2, 3, 0).reshape(c * h, w, l)
         video = interpolate(video, size=round(dur * resample_fps))
+        fps = resample_fps
         video = video.reshape(c, h, w, -1).permute(3, 0, 1, 2).contiguous()
 
     if enforce_shapes:
@@ -151,7 +157,7 @@ if __name__ == "__main__":
 
                     if not os.path.exists(filepath.replace(".mp4", "_vfeats.npz")):
                         audio, video = audio.cuda(), video.cuda()
-                        afeats = {af.__name__: af(audio, sr) for af in afns}
+                        afeats = {af.__name__: af(audio.cpu(), sr).cuda() for af in afns}
                         vfeats = {vf.__name__: vf(video) for vf in vfns}
                         np.savez_compressed(
                             filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
@@ -173,8 +179,6 @@ if __name__ == "__main__":
                         )
                     results.append(row)
             df = pd.DataFrame(results)
-            print(df)
-
             df.to_csv(csv_file)
         else:
             df = pd.read_csv(csv_file, index_col=0)
@@ -183,28 +187,29 @@ if __name__ == "__main__":
             #     lambda row: {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in row.items()}, axis=1
             # )
 
-        print(df)
+        def extrema():
+            for group, files in file_groups.items():
+                print("\n", group)
+                gdf = df[df["group"] == group].reset_index(drop=True)
+                highest = gdf.nlargest(n=5, columns=[("concat", "concat", "op")])
+                lowest = gdf.nsmallest(n=5, columns=[("concat", "concat", "op")])
 
-        for group, files in file_groups.items():
-            print("\n", group)
-            gdf = df[df["group"] == group].reset_index(drop=True)
-            highest = gdf.nlargest(n=5, columns=[("concat", "concat", "op")])
-            lowest = gdf.nsmallest(n=5, columns=[("concat", "concat", "op")])
+                print("best")
+                for idx, vals in highest.iterrows():
+                    print(files[idx], vals[("concat", "concat", "op")])
 
-            print("best")
-            for idx, vals in highest.iterrows():
-                print(files[idx], vals[("concat", "concat", "op")])
+                print("worst")
+                for idx, vals in lowest.iterrows():
+                    print(files[idx], vals[("concat", "concat", "op")])
 
-            print("worst")
-            for idx, vals in lowest.iterrows():
-                print(files[idx], vals[("concat", "concat", "op")])
+        # extrema()
 
-        grouped = df.groupby("group", sort=False).agg(["mean", "std"])
+        grouped = df.groupby("group", sort=False).agg(["median", "std"])
 
         stats = []
         for col in grouped.columns[::2]:
             af, vf, cn, _ = col
-            means = grouped[(af, vf, cn, "mean")]
+            medians = grouped[(af, vf, cn, "median")]
             stds = grouped[(af, vf, cn, "std")]
             for g, group in enumerate(file_groups):
                 group_name = args.titles[g] if len(args.titles) > 0 else group
@@ -213,28 +218,32 @@ if __name__ == "__main__":
                         "correlation": cn.replace("op", "Orthogonal Procrustes")
                         .replace("rv2", "Adjusted RV Coefficient")
                         .replace("smi", "Matrix Similarity Index")
-                        .replace("pwcca", "Projection-weighted Canonical Correlation Analysis"),
+                        .replace("pwcca", "Projection-weighted CCA"),
                         "audio": af,
                         "video": vf,
                         "group": group_name,
-                        "mean": means[group],
+                        "median": medians[group],
                         "std": stds[group],
                     }
                 )
         stats = pd.DataFrame(stats)
 
-        stats[(stats["audio"] == "concat") & (stats["correlation"] == "Orthogonal Procrustes")].plot.bar(
-            x="group",
-            y="mean",
-            yerr="std",
-            color=COLORS,
-            legend=False,
-            xlabel="Group",
-            rot=10,
-        )
-        plt.tight_layout()
-        plt.savefig(f"output/{exp_name}_barplotconcatcorr.pdf")
-        plt.close()
+        def concatbar():
+            stats[(stats["audio"] == "concat") & (stats["correlation"] == "Orthogonal Procrustes")].plot.bar(
+                x="group",
+                y="median",
+                yerr="std",
+                color=COLORS,
+                legend=False,
+                xlabel="Group",
+                rot=10,
+            )
+            plt.tight_layout()
+            sns.despine()
+            plt.savefig(f"output/{exp_name}_barplotconcatcorr.pdf")
+            plt.close()
+
+        # concatbar()
 
         stats = stats[stats["correlation"] != "svcca"]
         stats = stats[stats["audio"] != "concat"]
@@ -243,16 +252,18 @@ if __name__ == "__main__":
 
         def groupbars():
             for pdf, data_fn in [
-                ("full", lambda: corrstats.groupby("group", sort=False)[["mean", "std"]].mean()),
+                ("full", lambda: corrstats.groupby("group", sort=False)[["median", "std"]].median()),
                 (
                     "chroma",
                     lambda: corrstats[corrstats.audio == "chromagram"]
-                    .groupby("group", sort=False)[["mean", "std"]]
-                    .mean(),
+                    .groupby("group", sort=False)[["median", "std"]]
+                    .median(),
                 ),
                 (
                     "onsets",
-                    lambda: corrstats[corrstats.audio == "onsets"].groupby("group", sort=False)[["mean", "std"]].mean(),
+                    lambda: corrstats[corrstats.audio == "onsets"]
+                    .groupby("group", sort=False)[["median", "std"]]
+                    .median(),
                 ),
             ]:
                 fig, ax = plt.subplots(len(correlations) // 2, 2, figsize=(16, 9), sharex=True)
@@ -260,17 +271,18 @@ if __name__ == "__main__":
                     corrstats = stats[stats["correlation"] == corr]
                     colors = COLORS
                     data_fn().plot.bar(
-                        y="mean", yerr="std", ax=ax.flatten()[c], color=colors, legend=False, xlabel="Group", rot=10
+                        y="median", yerr="std", ax=ax.flatten()[c], color=colors, legend=False, xlabel="Group", rot=10
                     )
                     ax.flatten()[c].set_title(corr)
                 plt.tight_layout()
-                plt.savefig(f"output/{exp_name}_{pdf}groupcorrbars mean.pdf")
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_{pdf}groupcorrbars median.pdf")
                 plt.close()
 
         def grouphists():
-            print()
             for pdf, data_fn in [
-                ("full", lambda: cdf),
+                ("quadratic", lambda: cdf[[col for col in cdf.columns if "concat" not in col]]),
+                ("concat", lambda: cdf[[col for col in cdf.columns if "concat" in col]]),
                 ("chroma", lambda: cdf[[col for col in cdf.columns if "chromagram" in col]]),
                 ("onsets", lambda: cdf[[col for col in cdf.columns if "onsets" in col]]),
             ]:
@@ -288,24 +300,60 @@ if __name__ == "__main__":
                         yvals, _, _ = ax[g, c].hist(
                             data.values.flatten(),
                             bins=100,
-                            range=(stats["mean"].min(), stats["mean"].max()),
+                            range=(stats["median"].min(), stats["median"].max()),
                             color=color,
                             density=True,
                         )
-                        ax[g, c].vlines(data.values.mean(), 0, yvals.max(), ls="--", color=color)
-                        ax[5, c].set_xlabel(corr)
-                        ax[g, 0].set_ylabel(group)
-                # for g, group in enumerate(file_groups):
-                #     gdf = df[df["group"] == group]
-                #     for c, corr in enumerate(corr_fns):
-                #         if corr == "svcca":
-                #             continue
-                #         cdf = gdf[[col for col in gdf.columns if corr in col]]
-                #         data = data_fn()
-                #         color = COLORS[g]
-                #         ax.flatten()[c].vlines(data.mean(), 0, maxheight[c], ls="--", color=color)
+                        ax[g, c].vlines(np.median(data.values), 0, yvals.max(), ls="--", color=color)
+                        ax[5, c].set_xlabel(
+                            corr.replace("op", "Orthogonal Procrustes")
+                            .replace("rv2", "Adjusted RV Coefficient")
+                            .replace("smi", "Matrix Similarity Index")
+                            .replace("pwcca", "Projection-weighted CCA")
+                        )
+                        ax[g, 0].set_ylabel(args.titles[list(file_groups.keys()).index(group)])
+                        ax[g, c].set_yticklabels([])
                 plt.tight_layout()
-                plt.savefig(f"output/{exp_name}_{pdf}groupcorrhists mean.pdf")
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_{pdf}groupcorrhists median.pdf")
+                plt.close()
+
+        def hists():
+            for pdf, data_fn in [
+                ("Quadratic", lambda: cdf[[col for col in cdf.columns if "concat" not in col]]),
+                ("Concatenated", lambda: cdf[[col for col in cdf.columns if "concat" in col]]),
+            ]:
+
+                print("\n", pdf)
+                fig, ax = plt.subplots(1, len(corr_fns) - 1, figsize=(16, 4), sharex=True)
+                gdf, g = df[df["group"] == "test"], -1
+                for c, corr in enumerate(corr_fns):
+                    if corr == "svcca":
+                        continue
+                    cdf = gdf[[col for col in gdf.columns if corr in col]]
+                    data = data_fn()
+                    print(group, corr)
+                    color = COLORS[g]
+                    yvals, _, _ = ax[c].hist(
+                        data.values.flatten(),
+                        bins=100,
+                        range=(stats["median"].min(), stats["median"].max()),
+                        color=color,
+                        density=True,
+                    )
+                    ax[c].vlines(np.median(data.values), 0, yvals.max(), ls="--", color=color)
+                    ax[c].set_xlabel(
+                        corr.replace("op", "Orthogonal Procrustes")
+                        .replace("rv2", "Adjusted RV Coefficient")
+                        .replace("smi", "Matrix Similarity Index")
+                        .replace("pwcca", "Projection-weighted CCA")
+                    )
+                    ax[0].set_ylabel(args.titles[list(file_groups.keys()).index(group)])
+                    ax[c].set_yticklabels([])
+                plt.suptitle(pdf)
+                plt.tight_layout()
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_{pdf.lower()}_hist_comparison.pdf")
                 plt.close()
 
         def heatmap():
@@ -323,12 +371,12 @@ if __name__ == "__main__":
                     g.ax_marg_y.cla()
                     g.ax_marg_x.cla()
                     sns.heatmap(
-                        data=groupstats["mean"].values.reshape(A, V),
+                        data=groupstats["median"].values.reshape(A, V),
                         ax=g.ax_joint,
                         cbar=False,
                         cmap=hot,
                         vmin=0,
-                        vmax=stats["mean"].max(),
+                        vmax=stats["median"].max(),
                     )
 
                     make_axes_locatable(g.ax_marg_x).append_axes("left", size="10%", pad="20%").axis("off")
@@ -337,16 +385,16 @@ if __name__ == "__main__":
                     cax.yaxis.set_ticks_position("left")
 
                     np.set_printoptions(linewidth=200)
-                    audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["mean"].mean()
-                    video_feature_marginals = groupstats.groupby(["video"], sort=False)["mean"].mean()
+                    audio_feature_marginals = groupstats.groupby(["audio"], sort=False)["median"].median()
+                    video_feature_marginals = groupstats.groupby(["video"], sort=False)["median"].median()
                     g.ax_marg_y.barh(
                         np.arange(0.5, A), audio_feature_marginals.values, color=hot(audio_feature_marginals.values)
                     )
-                    g.ax_marg_y.set(xlim=(0, stats["mean"].max()))
+                    g.ax_marg_y.set(xlim=(0, stats["median"].max()))
                     g.ax_marg_x.bar(
                         np.arange(0.5, V), video_feature_marginals.values, color=hot(video_feature_marginals.values)
                     )
-                    g.ax_marg_x.set(ylim=(0, stats["mean"].max()))
+                    g.ax_marg_x.set(ylim=(0, stats["median"].max()))
 
                     g.ax_joint.set_xticks(np.arange(0.5, V))
                     g.ax_joint.set_xticklabels(
@@ -364,9 +412,119 @@ if __name__ == "__main__":
 
                     g.fig.suptitle(group)
                     g.fig.set_size_inches(16, 9)
-                    plt.savefig(f"output/{exp_name}_{corr}_{group} heatmap mean.pdf")
+                    plt.savefig(f"output/{exp_name}_{corr}_{group} heatmap median.pdf")
                     plt.close()
 
-        grouphists()
-        groupbars()
+        if not os.path.exists(csv_file.replace(".csv", "_melted.csv")):
+            melted = []
+            for col in tqdm(df.columns[1:]):
+                af, vf, cn = col
+                for idx, row in df.iterrows():
+                    group_name = (
+                        args.titles[list(file_groups.keys()).index(row.group)] if len(args.titles) > 0 else row.group
+                    )
+                    melted.append(
+                        {
+                            "correlation": cn.replace("op", "Orthogonal Procrustes")
+                            .replace("rv2", "Adjusted RV Coefficient")
+                            .replace("smi", "Matrix Similarity Index")
+                            .replace("pwcca", "Projection-weighted CCA"),
+                            "val": row[col],
+                            "audio": af,
+                            "video": vf,
+                            "group": group_name,
+                        }
+                    )
+            melted = pd.DataFrame(melted)
+            melted.to_csv(csv_file.replace(".csv", "_melted.csv"))
+        else:
+            melted = pd.read_csv(csv_file.replace(".csv", "_melted.csv"), index_col="Unnamed: 0")
+        melted = melted[melted["correlation"] != "svcca"]
+        melted = melted[melted["val"] >= 0]
+
+        def full_comparison_barbox():
+            sns.set_theme(context="paper", style="white", palette="tab10")
+
+            for pdf, mdf in [
+                ("quadratic", melted[melted["audio"] != "concat"]),
+                ("chroma", melted[melted["audio"] == "chromagram"]),
+                ("onsets", melted[melted["audio"] == "onsets"]),
+                ("drop_strength", melted[melted["audio"] == "drop_strength"]),
+                ("concat", melted[melted["audio"] == "concat"]),
+            ]:
+                g = sns.FacetGrid(data=mdf, col="correlation", col_wrap=2, aspect=1.5, sharey=False)
+                g.map_dataframe(sns.barplot, x="group", y="val", estimator=np.median, ci=99, palette=COLORS)
+                g.set_xlabels("Interpolation Type")
+                g.set_xticklabels(rotation=15, ha="right")
+                g.set_ylabels("Audio-reactive Correlation")
+                g.set_titles(template="{col_name}")
+                plt.tight_layout()
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_{pdf}groupcorrbarplotsimproved.pdf")
+                plt.close()
+
+            for pdf, mdf in [
+                ("quadratic", melted[melted["audio"] != "concat"]),
+                ("chroma", melted[melted["audio"] == "chromagram"]),
+                ("onsets", melted[melted["audio"] == "onsets"]),
+                ("drop_strength", melted[melted["audio"] == "drop_strength"]),
+                ("concat", melted[melted["audio"] == "concat"]),
+            ]:
+                g = sns.FacetGrid(data=mdf, col="correlation", col_wrap=2, aspect=1.5, sharey=False)
+                g.map_dataframe(sns.boxenplot, x="group", y="val", palette=COLORS)
+                g.set_xlabels("Interpolation Type")
+                g.set_xticklabels(rotation=15, ha="right")
+                g.set_ylabels("Audio-reactive Correlation")
+                g.set_titles(template="{col_name}")
+                plt.tight_layout()
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_{pdf}groupcorrboxplots.pdf")
+                plt.close()
+
+        def barbox():
+            g = sns.FacetGrid(
+                data=melted[
+                    (melted["correlation"] == "Orthogonal Procrustes")
+                    & (
+                        (melted["audio"] == "chromagram")
+                        | (melted["audio"] == "onsets")
+                        # | (melted["audio"] == "drop_strength")
+                        # | (melted["audio"] == "spectral_flatness")
+                    )
+                ],
+                col="audio",
+                sharey=False,
+            )
+            g.map_dataframe(sns.barplot, x="group", y="val", estimator=np.median, ci=99, palette=COLORS)
+            g.set_xlabels("Interpolation Type")
+            g.set_xticklabels(rotation=20, ha="right")
+            g.set_ylabels("Audio-reactive Correlation")
+            g.set_titles(template="{col_name}")
+            plt.tight_layout()
+            sns.despine()
+            plt.savefig(f"output/{exp_name}_audiofeat_comparison.pdf")
+            plt.close()
+
+            g = sns.barplot(
+                data=melted[(melted["correlation"] == "Orthogonal Procrustes") & ((melted["audio"] != "concat"))],
+                x="group",
+                y="val",
+                estimator=np.median,
+                ci=99,
+                palette=COLORS,
+            )
+            g.set_xlabel("Interpolation Type")
+            g.set_xticklabels(g.get_xticklabels(), rotation=15, ha="right")
+            g.set_ylabel("Audio-reactive Correlation")
+            plt.tight_layout()
+            sns.despine()
+            plt.savefig(f"output/{exp_name}_op_concat_comparison.pdf")
+            plt.close()
+
+        # grouphists()
+        # groupbars()
         # heatmap()
+        # grouphists()
+        # full_comparison_barbox()
+        barbox()
+        hists()

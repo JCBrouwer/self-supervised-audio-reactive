@@ -11,6 +11,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn.functional import interpolate
 import torchdatasets as td
 from resize_right import resize
 from torch.utils.data import DataLoader
@@ -183,6 +184,40 @@ class SelfSupervisedOptimization:
         return decoder(envelopes())
 
 
+def load_video(path, downsample=8, resample_fps=24, enforce_shapes=True):
+    v = decord.VideoReader(path)
+    fps = round(v.get_avg_fps())
+    l, (h, w, c) = len(v), v[0].shape
+    dur = l / fps
+    del v
+    v = decord.VideoReader(path, width=w // downsample, height=h // downsample)
+    video = v[:]
+    del v
+
+    video = video.permute(0, 3, 1, 2).float().div(255).contiguous()
+    print(video.shape, l, fps, dur)
+
+    if enforce_shapes:
+        l, c, h, w = video.shape
+        s = min(h, w)
+        lh, lw = (h - s) // 2, (w - s) // 2
+        uh, uw = h if lh == 0 else -lh, w if lw == 0 else -lw
+        video = video[..., lh:uh, lw:uw]
+    print(video.shape, l, fps, dur)
+
+    if resample_fps and fps != resample_fps:
+        l, c, h, w = video.shape
+        video = video.permute(1, 2, 3, 0).reshape(c * h, w, l)
+        print(video.shape, round(dur * resample_fps))
+        video = interpolate(video, size=round(dur * resample_fps))
+        print(video.shape)
+        video = video.reshape(c, h, w, -1).permute(3, 0, 1, 2).contiguous()
+        fps = resample_fps
+    print(video.shape, l, fps, dur)
+
+    return video, fps
+
+
 def load_audio(path, fps=24):
     a = decord.AudioReader(path)
     audio = a[:].float().squeeze().contiguous()
@@ -212,9 +247,9 @@ for _ in tqdm(DataLoader(TESTSET, num_workers=8), total=len(TESTSET), desc="Cach
 
 
 @torch.no_grad()
-def evaluate_trained_checkpoint_dirs(dirs, n_ckpts=1):
+def evaluate_trained_checkpoint_dirs(dirs, name, n_ckpts=1):
     try:
-        results = joblib.load("output/learned_checkpoint_comparison.pkl")
+        results = joblib.load(f"output/{Path(name).stem}.pkl")
         jobs_done = len(results)
     except:
         results = []
@@ -222,11 +257,11 @@ def evaluate_trained_checkpoint_dirs(dirs, n_ckpts=1):
     j = 0
     for ckdir in tqdm(dirs):
         backbone, loss, decoder, _, residual, _, _, split, _, hidden, _, layers, dropout, lr = ckdir.split("_")[3:]
-        ckpts = sorted(glob(f"{ckdir}/*.pt"))
+        ckpts = list(sorted(glob(f"{ckdir}/*.pt")))
         ckpts = (
             [ckpts[idx] for idx in np.linspace(0, len(ckpts) - 1, n_ckpts).round().astype(int)]
             if n_ckpts > 1
-            else ckpts[-1]
+            else [ckpts[-1]]
         )
         for ckpt in tqdm(ckpts):
             steps, val = Path(ckpt).stem.split("_")[-2:]
@@ -236,70 +271,76 @@ def evaluate_trained_checkpoint_dirs(dirs, n_ckpts=1):
                     j += 1
                     print(ckdir, ckpt, filepath, "already done, skipping...")
                     continue
-                print("load", time() - t)
-                t = time()
+                try:
+                    print("load", time() - t)
+                    t = time()
 
-                latents, noise = SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt).predict(
-                    audio, sr.item()
-                )
-                noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
-                inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
-                print("sequence", time() - t)
-                t = time()
-
-                video = torch.cat(list(SG2.render(inputs, postprocess_fn=lambda x: resize(x, out_shape=(128, 128)))))
-                print("render", time() - t)
-                t = time()
-
-                vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
-                print("vfeats", time() - t)
-                t = time()
-
-                if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
-                    afeats = {af.__name__: af(audio, sr.item()).unsqueeze(0).cuda() for af in AFNS}
-                    np.savez_compressed(
-                        filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
+                    latents, noise = SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt).predict(
+                        audio, sr.item()
                     )
-                else:
-                    with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
-                        afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in AFNS}
-                print("afeats", time() - t)
-                t = time()
+                    noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
+                    inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+                    print("sequence", time() - t)
+                    t = time()
 
-                results.append(
-                    dict(
-                        filepath=filepath,
-                        steps=int(steps.replace("steps", "")),
-                        val=float(val.replace("val", "")),
-                        backbone=backbone.split(":")[-1],
-                        loss=loss.split(":")[-1],
-                        decoder=decoder.split(":")[-1],
-                        residual=residual.split(":")[-1],
-                        split=int(split.split(":")[-1]),
-                        hidden=int(hidden.split(":")[-1]),
-                        layers=int(layers.split(":")[-1]),
-                        dropout=float(dropout.split(":")[-1]),
-                        lr=float(lr.split(":")[-1]),
-                        correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
-                        **{
-                            an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
-                            for vn, vf in vfeats.items()
-                            for an, af in afeats.items()
-                        },
+                    video = torch.cat(
+                        list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(128, 128))))
                     )
-                )
-                print("results", time() - t)
-                print(results[-1])
-                t = time()
-                joblib.dump(results, "output/learned_checkpoint_comparison.pkl")
+                    print("render", time() - t)
+                    print(video.shape)
+                    t = time()
+
+                    vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
+                    print("vfeats", time() - t)
+                    t = time()
+
+                    if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
+                        afeats = {af.__name__: af(audio, sr.item()).unsqueeze(0).cuda() for af in AFNS}
+                        np.savez_compressed(
+                            filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
+                        )
+                    else:
+                        with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
+                            afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in AFNS}
+                    print("afeats", time() - t)
+                    t = time()
+
+                    results.append(
+                        dict(
+                            filepath=filepath,
+                            steps=int(steps.replace("steps", "")),
+                            val=float(val.replace("val", "")),
+                            backbone=backbone.split(":")[-1],
+                            loss=loss.split(":")[-1],
+                            decoder=decoder.split(":")[-1],
+                            residual=residual.split(":")[-1],
+                            split=int(split.split(":")[-1]),
+                            hidden=int(hidden.split(":")[-1]),
+                            layers=int(layers.split(":")[-1]),
+                            dropout=float(dropout.split(":")[-1]),
+                            lr=float(lr.split(":")[-1]),
+                            correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
+                            **{
+                                an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
+                                for vn, vf in vfeats.items()
+                                for an, af in afeats.items()
+                            },
+                        )
+                    )
+                    print("results", time() - t)
+                    print(results[-1])
+                    t = time()
+                    joblib.dump(results, f"output/{Path(name).stem}.pkl")
+                except:
+                    pass
 
     results = pd.DataFrame(results)
-    results.to_csv("output/learned_checkpoint_comparison.csv")
+    results.to_csv(f"output/{Path(name).stem}.csv")
     return results
 
 
 @torch.no_grad()
-def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_samples=1):
+def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_samples=3):
     try:
         results = joblib.load(f"output/{name}.pkl")
         jobs_done = len(results)
@@ -309,8 +350,8 @@ def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_sample
     j = 0
     for model_name, model in [
         ("ssopt", SelfSupervisedOptimization),
-        # ("random", RandomGenerator),
-        # *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
+        ("random", RandomGenerator),
+        *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
     ]:
         for _ in range(n_samples):
             for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
@@ -365,23 +406,60 @@ def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_sample
     return results
 
 
-if __name__ == "__main__":
-    # compare_big_three(name="hippo64env", n_params=64)
-    # compare_big_three(name="hippo128env", n_params=128)
-    # compare_big_three(name="hippo256env", n_params=256)
-    # compare_big_three(name="hippo724env", n_params=724)
-    # compare_big_three(name="hippo1024env", n_params=1024)
+@torch.no_grad()
+def from_video_dir(directory):
+    name = Path(directory).stem
+    try:
+        results = joblib.load(f"output/{name}.pkl")
+        jobs_done = len(results)
+    except:
+        results = []
+        jobs_done = 0
+    j = 0
+    for (filepath,), ((audio,), sr) in tqdm(DataLoader(AudioDataset(glob(f"{directory}/*.mp4")), num_workers=8)):
+        if j < jobs_done:
+            j += 1
+            print(filepath, "already done, skipping...")
+            continue
 
-    compare_big_three(name="hippo_onsets", emphasize="onsets")
-    compare_big_three(name="hippo_chromagram", emphasize="chromagram")
-    compare_big_three(name="hippo_drop_strength", emphasize="drop_strength")
-    compare_big_three(name="hippo_spectral_flatness", emphasize="spectral_flatness")
-    # results = evaluate_trained_checkpoint_dirs(
-    #     [
-    #     ],
-    #     n_ckpts=1,
-    # )
-    # results = evaluate_trained_checkpoint_dirs(
+        video, fps = load_video(filepath)
+
+        vfeats = {vf.__name__: vf(video.cuda()).unsqueeze(0) for vf in VFNS}
+
+        if not os.path.exists(filepath.replace(".mp4", "_afeats.npz")):
+            afeats = {af.__name__: af(audio, sr.item()).unsqueeze(0).cuda() for af in AFNS}
+            np.savez_compressed(
+                filepath.replace(".mp4", "_afeats.npz"), **{n: f.cpu().numpy() for n, f in afeats.items()}
+            )
+        else:
+            with np.load(filepath.replace(".mp4", "_afeats.npz")) as arr:
+                afeats = {af.__name__: torch.from_numpy(arr[af.__name__]).cuda() for af in AFNS}
+        length = list(afeats.values())[0].shape[1]
+        print(video.shape, {k: v.shape for k, v in vfeats.items()})
+        vfeats = {k: interpolate(v.permute(0, 2, 1), size=length).permute(0, 2, 1) for k, v in vfeats.items()}
+        print(video.shape, {k: v.shape for k, v in vfeats.items()})
+        print(audio.shape, {k: v.shape for k, v in afeats.items()})
+
+        results.append(
+            dict(
+                filepath=filepath,
+                correlation=(1 - audio_reactive_loss(afeats, vfeats)).squeeze().item(),
+                **{
+                    an + "|" + vn: (1 - audio_reactive_loss([af], [vf])).squeeze().item()
+                    for vn, vf in vfeats.items()
+                    for an, af in afeats.items()
+                },
+            )
+        )
+        print("CORRELATION:", results[-1]["correlation"])
+        joblib.dump(results, f"output/{name}.pkl")
+    results = pd.DataFrame(results)
+    results.to_csv(f"output/{name}.csv")
+    return results
+
+
+if __name__ == "__main__":
+    # evaluate_trained_checkpoint_dirs(
     #     [
     #         "runs/May23_17-01-54_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
     #         "runs/May23_16-43-01_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
@@ -391,6 +469,26 @@ if __name__ == "__main__":
     #         "runs/May23_15-27-32_ubuntu94025_gru_supervised_fixed_decoder_residual:True_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
     #         "runs/May23_15-10-44_ubuntu94025_gru_supervised_learned_decoder_residual:True_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
     #         "runs/May23_14-48-57_ubuntu94025_gru_supervised_learned_decoder_residual:False_n_latent_split:3_hidden_size:16_num_layers:4_dropout:0.0_lr:0.0001",
-    #     ]
+    #     ],
+    #     "learned_sequence_model",
+    #     n_ckpts=5,
     # )
-    # print(results)
+
+    # compare_big_three(name="hippo64env2", n_params=64)
+    # compare_big_three(name="hippo128env2", n_params=128)
+    # compare_big_three(name="hippo256env2", n_params=256)
+    # compare_big_three(name="hippo724env2", n_params=724)
+    # compare_big_three(name="hippo1024env2", n_params=1024)
+
+    # compare_big_three(name="hippo_onsets2", emphasize="onsets")
+    # compare_big_three(name="hippo_chromagram2", emphasize="chromagram")
+    # compare_big_three(name="hippo_drop_strength2", emphasize="drop_strength")
+    # compare_big_three(name="hippo_spectral_flatness2", emphasize="spectral_flatness")
+
+    # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/May27*"), "backbones", n_ckpts=1)
+    # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/*num_layers:6*"), "6layer", n_ckpts=3)
+
+    # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/May30*"), "more_n_layers", n_ckpts=3)
+    # from_video_dir("/home/hans/datasets/audiovisual/maua")
+    # from_video_dir("/home/hans/datasets/audiovisual/wzrd")
+    from_video_dir("/home/hans/datasets/audiovisual/lucid")
