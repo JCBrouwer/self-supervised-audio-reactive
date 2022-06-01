@@ -20,22 +20,24 @@ from scipy.signal import resample
 from tqdm import trange
 
 # fmt:off
-sys.path.append("/home/hans/code/maua/maua")
-from audiovisual.audioreactive.audio import (band_pass, harmonic, high_pass,
-                                             load_audio, low_pass, percussive,
-                                             unmixed)
-from audiovisual.audioreactive.features import (chroma, onsets, pitch_track,
-                                                pulse, spectral_max, tempo,
-                                                tonnetz, volume)
-from audiovisual.audioreactive.postprocess import (compress, expand,
+sys.path.append("/home/hans/code/maua/")
+from maua.audiovisual.audioreactive.audio import (band_pass, harmonic,
+                                                  high_pass, load_audio,
+                                                  low_pass, percussive,
+                                                  unmixed)
+from maua.audiovisual.audioreactive.mir import (chroma, onsets, pitch_track,
+                                                tempo, tonnetz, volume)
+from maua.audiovisual.audioreactive.signal import (compress, expand,
                                                    gaussian_filter,
                                                    percentile_clip)
-from audiovisual.patches.primitives import (ModulatedLatents, ModulatedNoise,
-                                            ModulationSum, PitchTrackLatents,
-                                            TempoLoopLatents, TempoLoopNoise,
-                                            TonalLatents, TonalNoise)
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
-from ops.video import VideoWriter
+from maua.audiovisual.patches.primitives import (ModulatedLatents,
+                                                 ModulatedNoise, ModulationSum,
+                                                 PitchTrackLatents,
+                                                 TempoLoopLatents,
+                                                 TempoLoopNoise, TonalLatents,
+                                                 TonalNoise)
+from maua.GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
+from maua.ops.video import VideoWriter
 
 # fmt:on
 

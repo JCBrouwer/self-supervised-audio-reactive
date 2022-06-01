@@ -19,9 +19,9 @@ from .mir import retrieve_music_information
 from .patch import Patch
 from .sample import load_audio
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2
-from ops.video import VideoWriter
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2
+from maua.ops.video import VideoWriter
 
 WELCOME = """
 Welcome to Hans' audio-reactive video synthesizer!

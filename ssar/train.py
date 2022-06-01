@@ -19,8 +19,8 @@ from .models.latent_n_noise2 import LatentNoiseReactor
 from .supervised.data import audio2features, get_ffcv_dataloaders
 from .supervised.test import audio2video
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2Mapper
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

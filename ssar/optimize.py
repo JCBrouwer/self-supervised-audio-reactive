@@ -25,9 +25,9 @@ from .train import STYLEGAN_CKPT, normalize_gradients
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
-from ops.video import VideoWriter
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
+from maua.ops.video import VideoWriter
 
 afns = [chromagram, tonnetz, mfcc, spectral_contrast, rms, drop_strength, onsets]#, spectral_flatness, pulse]
 

@@ -9,8 +9,8 @@ from scipy.io.wavfile import write as write_wav
 sys.path.append("/home/hans/code/maua-stylegan2/")
 from audioreactive.frequent.timestamps import timestamps
 
-sys.path.append("/home/hans/code/maua/maua")
-from audiovisual.audioreactive.audio import load_audio
+sys.path.append("/home/hans/code/maua/")
+from maua.audiovisual.audioreactive.audio import load_audio
 
 if __name__ == "__main__":
 

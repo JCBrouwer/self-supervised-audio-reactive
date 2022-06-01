@@ -21,9 +21,9 @@ sys.path.append("/home/hans/code/maua-stylegan2/")
 from audioreactive import load_latents
 from audioreactive.frequent.timestamps import timestamps
 
-sys.path.append("/home/hans/code/maua/maua")
-from audiovisual.audioreactive.audio import load_audio
-from audiovisual.patches.primitives import ModulationSum
+sys.path.append("/home/hans/code/maua/")
+from maua.audiovisual.audioreactive.audio import load_audio
+from maua.audiovisual.patches.primitives import ModulationSum
 
 
 def get_latent_selection(latent_file, ckpt, ckpt2=None, shuffle_latents=True, n=36):

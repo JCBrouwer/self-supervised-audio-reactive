@@ -36,7 +36,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 # fmt: on
 
-sns.set_theme(context="notebook", style="white", palette="tab10")
+sns.set_theme(context="paper", style="white", palette="tab10")
 
 
 def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):

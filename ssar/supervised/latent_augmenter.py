@@ -7,8 +7,8 @@ from torchcubicspline import NaturalCubicSpline, natural_cubic_spline_coeffs
 
 from .data import normalize
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2Mapper
 
 
 def spline_loop_latents(y, size):

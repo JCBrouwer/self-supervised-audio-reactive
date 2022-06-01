@@ -27,11 +27,11 @@ from tqdm import tqdm
 
 from ..analysis.sgw import sgw_gpu
 from ..models.audio2latent import Normalize
-from .data import AudioFeatures, audio2features, FEATURE_NAMES
+from .data import FEATURE_NAMES, AudioFeatures, audio2features
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
-from ops.video import VideoWriter
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2Mapper, StyleGAN2Synthesizer
+from maua.ops.video import VideoWriter
 
 FPS = 24
 DUR = 8

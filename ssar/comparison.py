@@ -11,11 +11,12 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from torch.nn.functional import interpolate
 import torchdatasets as td
 from resize_right import resize
+from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader
 from torchaudio.functional.functional import resample
+from torchvision.io import write_video
 from tqdm import tqdm
 
 from .features.audio import (chromagram, drop_strength, mfcc, onsets, pulse,
@@ -34,8 +35,8 @@ from .test import load_model
 from .train import (STYLEGAN_CKPT, audio_reactive_loss, normalize_gradients,
                     orthogonal_procrustes_distance)
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2
 
 AFNS = [chromagram, tonnetz, mfcc, spectral_contrast, rms, drop_strength, onsets, spectral_flatness, pulse]
 VFNS = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_freq_rms, high_freq_rms, 
@@ -93,7 +94,7 @@ class SelfSupervisedOptimization:
         audio,
         sr,
         n_steps=1024,
-        n_params=512,
+        n_params=128,
         n_latent_split=3,
         n_latent_groups=3,
         n_latent_per_group=1,
@@ -195,7 +196,6 @@ def load_video(path, downsample=8, resample_fps=24, enforce_shapes=True):
     del v
 
     video = video.permute(0, 3, 1, 2).float().div(255).contiguous()
-    print(video.shape, l, fps, dur)
 
     if enforce_shapes:
         l, c, h, w = video.shape
@@ -203,17 +203,13 @@ def load_video(path, downsample=8, resample_fps=24, enforce_shapes=True):
         lh, lw = (h - s) // 2, (w - s) // 2
         uh, uw = h if lh == 0 else -lh, w if lw == 0 else -lw
         video = video[..., lh:uh, lw:uw]
-    print(video.shape, l, fps, dur)
 
     if resample_fps and fps != resample_fps:
         l, c, h, w = video.shape
         video = video.permute(1, 2, 3, 0).reshape(c * h, w, l)
-        print(video.shape, round(dur * resample_fps))
         video = interpolate(video, size=round(dur * resample_fps))
-        print(video.shape)
         video = video.reshape(c, h, w, -1).permute(3, 0, 1, 2).contiguous()
         fps = resample_fps
-    print(video.shape, l, fps, dur)
 
     return video, fps
 
@@ -238,12 +234,6 @@ class AudioDataset(td.Dataset):
     def __getitem__(self, idx):
         filepath = self.files[idx]
         return filepath, load_audio(filepath)
-
-
-TESTSET = AudioDataset(glob("/home/hans/datasets/audiovisual/maua/*.mp4"))
-TESTSET.cache(td.cachers.Pickle(Path("cache/")))
-for _ in tqdm(DataLoader(TESTSET, num_workers=8), total=len(TESTSET), desc="Caching test set..."):
-    pass
 
 
 @torch.no_grad()
@@ -340,7 +330,7 @@ def evaluate_trained_checkpoint_dirs(dirs, name, n_ckpts=1):
 
 
 @torch.no_grad()
-def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_samples=3):
+def compare_big_three(name, n_params=128, emphasize=False, seqckpts=[], n_samples=1, just_write=False):
     try:
         results = joblib.load(f"output/{name}.pkl")
         jobs_done = len(results)
@@ -348,11 +338,16 @@ def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_sample
         results = []
         jobs_done = 0
     j = 0
-    for model_name, model in [
-        ("ssopt", SelfSupervisedOptimization),
-        ("random", RandomGenerator),
-        *[lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt) for ckpt in seqckpts],
-    ]:
+    for model_name, model in tqdm(
+        [
+            ("ssopt", SelfSupervisedOptimization),
+            ("random", RandomGenerator),
+            *[
+                (Path(ckpt).stem[17:66], lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt))
+                for ckpt in seqckpts
+            ],
+        ]
+    ):
         for _ in range(n_samples):
             for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
                 if j < jobs_done:
@@ -360,20 +355,38 @@ def compare_big_three(name, n_params=512, emphasize=False, seqckpts=[], n_sample
                     print(model_name, filepath, "already done, skipping...")
                     continue
 
+                t = time()
+
                 if model_name == "random":
                     latents, noise_modules = model().predict(audio, sr.item())
                     inputs = {"latents": latents}
                     for j, noise_module in enumerate(noise_modules[:9]):
                         inputs[f"noise{j}"] = noise_module.forward(0, len(latents))[:, None]
-
-                else:
+                elif model_name == "ssopt":
                     latents, noise = model().predict(audio, sr.item(), n_params=n_params, emphasize_feature=emphasize)
+                    noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
+                    inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+                else:
+                    latents, noise = model().predict(audio, sr.item())
                     noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
                     inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
 
                 video = torch.cat(
-                    list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(128, 128))))
+                    list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(256, 256))))
                 )
+                if just_write:
+                    write_video(
+                        filepath.replace("maua", "density_eval").replace(".mp4", f"_{model_name}.mp4"),
+                        video.permute(0, 2, 3, 1).mul(255).cpu(),
+                        fps=24,
+                        audio_array=resample(audio, sr, 44100).unsqueeze(0).cpu(),
+                        audio_fps=44100,
+                        audio_codec="aac",
+                    )
+                    results.append({"name": model_name, "n": video.shape[0], "time": time() - t})
+                    print(results[-1])
+                    joblib.dump(results, f"output/{name}.pkl")
+                    continue
 
                 vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
 
@@ -459,6 +472,11 @@ def from_video_dir(directory):
 
 
 if __name__ == "__main__":
+    TESTSET = AudioDataset(glob("/home/hans/datasets/audiovisual/maua/*.mp4"))
+    TESTSET.cache(td.cachers.Pickle(Path("cache/")))
+    for _ in tqdm(DataLoader(TESTSET, num_workers=8), total=len(TESTSET), desc="Caching test set..."):
+        pass
+
     # evaluate_trained_checkpoint_dirs(
     #     [
     #         "runs/May23_17-01-54_ubuntu94025_gru_selfsupervised_fixed_decoder_residual:False_n_latent_split:3_hidden_size:3_num_layers:4_dropout:0.0_lr:0.0001",
@@ -491,4 +509,8 @@ if __name__ == "__main__":
     # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/May30*"), "more_n_layers", n_ckpts=3)
     # from_video_dir("/home/hans/datasets/audiovisual/maua")
     # from_video_dir("/home/hans/datasets/audiovisual/wzrd")
-    from_video_dir("/home/hans/datasets/audiovisual/lucid")
+    # from_video_dir("/home/hans/datasets/audiovisual/lucid")
+
+    compare_big_three(
+        name="inference_speed", seqckpts=sorted(glob("runs/May23*num_layers:4*/*steps00122880*.pt")), just_write=True
+    )

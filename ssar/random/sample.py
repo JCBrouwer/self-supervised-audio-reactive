@@ -12,9 +12,9 @@ from ..train import STYLEGAN_CKPT
 from . import DEVICE
 from .mir import retrieve_music_information
 
-sys.path.append("/home/hans/code/maua/maua/")
-from GAN.wrappers.stylegan2 import StyleGAN2
-from ops.video import VideoWriter
+sys.path.append("/home/hans/code/maua/")
+from maua.GAN.wrappers.stylegan2 import StyleGAN2
+from maua.ops.video import VideoWriter
 
 
 def load_audio(audio_file, offset, duration, fps):
