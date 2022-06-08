@@ -562,11 +562,14 @@ if __name__ == "__main__":
                 g.set_xlabel("Interpolation Type")
                 g.set_xticklabels(
                     [
-                        l.get_text().replace("Chromagram", "Chroma").replace("Test Set", "Manual")
+                        l.get_text()
+                        .replace("Chromagram", "C")
+                        .replace("Test Set", "M")
+                        .replace("Onset", "O")
+                        .replace("None", "N")
+                        .replace("Random", "R")
                         for l in g.get_xticklabels()
-                    ],
-                    rotation=20,
-                    ha="right",
+                    ]
                 )
                 g.set_ylabel("Audio-reactive Correlation")
                 plt.tight_layout()
@@ -585,11 +588,14 @@ if __name__ == "__main__":
             g.set_xlabel("Interpolation Type")
             g.set_xticklabels(
                 [
-                    l.get_text().replace("Chromagram", "Chroma").replace("Test Set", "Manual")
+                    l.get_text()
+                    .replace("Chromagram", "C")
+                    .replace("Test Set", "M")
+                    .replace("Onset", "O")
+                    .replace("None", "N")
+                    .replace("Random", "R")
                     for l in g.get_xticklabels()
-                ],
-                rotation=15,
-                ha="right",
+                ]
             )
             g.set_ylabel("Audio-reactive Correlation")
             plt.tight_layout()
@@ -602,5 +608,5 @@ if __name__ == "__main__":
         # heatmap()
         # grouphists()
         # full_comparison_barbox()
-        # barbox()
-        hists()
+        barbox()
+        # hists()
