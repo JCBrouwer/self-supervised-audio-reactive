@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torchdatasets as td
+from lucidsonicdreams import LucidSonicDream
 from resize_right import resize
 from torch.nn.functional import interpolate
 from torch.utils.data import DataLoader
@@ -329,8 +330,101 @@ def evaluate_trained_checkpoint_dirs(dirs, name, n_ckpts=1):
     return results
 
 
+def hallucinate(
+    self,
+    file_name: str,
+    fps: int = 43,
+    resolution: int = None,
+    start: float = 0,
+    duration: float = None,
+    batch_size: int = 1,
+    speed_fpm: int = 12,
+    pulse_percussive: bool = True,
+    pulse_harmonic: bool = False,
+    pulse_react: float = 0.5,
+    motion_percussive: bool = False,
+    motion_harmonic: bool = True,
+    motion_react: float = 0.5,
+    motion_randomness: float = 0.5,
+    truncation: float = 1,
+    classes: list = None,
+    dominant_classes_first: bool = False,
+    class_pitch_react: float = 0.5,
+    class_smooth_seconds: int = 1,
+    class_complexity: float = 1,
+    class_shuffle_seconds: float = None,
+    class_shuffle_strength: float = 0.5,
+    contrast_strength: float = None,
+    contrast_percussive: bool = None,
+    flash_strength: float = None,
+    flash_percussive: bool = None,
+    custom_effects: list = None,
+    truncation_psi: float = 1.0,
+    t=None,
+):
+    """Full pipeline of video generation"""
+    self.file_name = file_name if file_name[-4:] == ".mp4" else file_name + ".mp4"
+    self.resolution = resolution
+    self.batch_size = batch_size
+    self.speed_fpm = speed_fpm
+    self.pulse_react = pulse_react
+    self.motion_react = motion_react
+    self.motion_randomness = motion_randomness
+    self.truncation = truncation
+    self.classes = classes
+    self.dominant_classes_first = dominant_classes_first
+    self.class_pitch_react = class_pitch_react
+    self.class_smooth_seconds = class_smooth_seconds
+    self.class_complexity = class_complexity
+    self.class_shuffle_seconds = class_shuffle_seconds
+    self.class_shuffle_strength = class_shuffle_strength
+    self.contrast_strength = contrast_strength
+    self.contrast_percussive = contrast_percussive
+    self.flash_strength = flash_strength
+    self.flash_percussive = flash_percussive
+    self.custom_effects = custom_effects
+    self.truncation_psi = truncation_psi
+    if not self.style_exists:
+        print("Preparing style...")
+        if not callable(self.style):
+            self.stylegan_init()
+        self.style_exists = True
+    t = time()
+    cond_list = [
+        (not hasattr(self, "fps")) or (self.fps != fps),
+        (not hasattr(self, "start")) or (self.start != start),
+        (not hasattr(self, "duration")) or (self.duration != duration),
+        (not hasattr(self, "pulse_percussive")) or (self.pulse_percussive != pulse_percussive),
+        (not hasattr(self, "pulse_harmonic")) or (self.pulse_percussive != pulse_harmonic),
+        (not hasattr(self, "motion_percussive")) or (self.motion_percussive != motion_percussive),
+        (not hasattr(self, "motion_harmonic")) or (self.motion_percussive != motion_harmonic),
+    ]
+    if any(cond_list):
+        self.fps = fps
+        self.start = start
+        self.duration = duration
+        self.pulse_percussive = pulse_percussive
+        self.pulse_harmonic = pulse_harmonic
+        self.motion_percussive = motion_percussive
+        self.motion_harmonic = motion_harmonic
+        self.load_specs()
+    self.setup_effects()
+    self.transform_classes()
+    self.generate_vectors()
+    return t
+
+
 @torch.no_grad()
-def compare_big_three(name, n_params=128, emphasize=False, seqckpts=[], n_samples=1, just_write=False):
+def compare_big_three(
+    name,
+    n_params=8,
+    emphasize=False,
+    seqckpts=[],
+    n_samples=1,
+    just_write=False,
+    forward_only=False,
+    ssopt_only=False,
+):
     try:
         results = joblib.load(f"output/{name}.pkl")
         jobs_done = len(results)
@@ -346,8 +440,11 @@ def compare_big_three(name, n_params=128, emphasize=False, seqckpts=[], n_sample
                 (Path(ckpt).stem[17:66], lambda: SupervisedSequenceModel(ckpt, residual="residual:True" in ckpt))
                 for ckpt in seqckpts
             ],
+            ("lucid", None),
         ]
     ):
+        if ssopt_only and model_name != "ssopt":
+            continue
         for _ in range(n_samples):
             for (filepath,), ((audio,), sr) in tqdm(DataLoader(TESTSET, num_workers=8)):
                 if j < jobs_done:
@@ -366,13 +463,30 @@ def compare_big_three(name, n_params=128, emphasize=False, seqckpts=[], n_sample
                     latents, noise = model().predict(audio, sr.item(), n_params=n_params, emphasize_feature=emphasize)
                     noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
                     inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
+                elif model_name == "lucid":
+                    t = hallucinate(
+                        LucidSonicDream(song=filepath, style="modern art"),
+                        file_name="not actually rendering to file, just for inference speed comparison",
+                        fps=24,
+                        resolution=1024,
+                        batch_size=16,
+                        t=t,
+                    )
                 else:
                     latents, noise = model().predict(audio, sr.item())
                     noise = sum([[noise[0]]] + [[n, n] for n in noise[1:]], [])
                     inputs = {"latents": latents, **{f"noise{j}": n.unsqueeze(1) for j, n in enumerate(noise)}}
 
+                if forward_only:
+                    results.append(
+                        {"name": model_name, "n": round(audio.shape[0] / sr.item() * FPS), "time": time() - t}
+                    )
+                    print(results[-1])
+                    joblib.dump(results, f"output/{name}.pkl")
+                    continue
+
                 video = torch.cat(
-                    list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(256, 256))))
+                    list(SG2.render(inputs, batch_size=1, postprocess_fn=lambda x: resize(x, out_shape=(128, 128))))
                 )
                 if just_write:
                     write_video(
@@ -383,9 +497,6 @@ def compare_big_three(name, n_params=128, emphasize=False, seqckpts=[], n_sample
                         audio_fps=44100,
                         audio_codec="aac",
                     )
-                    results.append({"name": model_name, "n": video.shape[0], "time": time() - t})
-                    print(results[-1])
-                    joblib.dump(results, f"output/{name}.pkl")
                     continue
 
                 vfeats = {vf.__name__: vf(video).unsqueeze(0) for vf in VFNS}
@@ -492,16 +603,20 @@ if __name__ == "__main__":
     #     n_ckpts=5,
     # )
 
-    # compare_big_three(name="hippo64env2", n_params=64)
-    # compare_big_three(name="hippo128env2", n_params=128)
-    # compare_big_three(name="hippo256env2", n_params=256)
-    # compare_big_three(name="hippo724env2", n_params=724)
-    # compare_big_three(name="hippo1024env2", n_params=1024)
+    # compare_big_three(name="hippo4env", n_params=4, ssopt_only=True)
+    # compare_big_three(name="hippo8env", n_params=8, ssopt_only=True)
+    # compare_big_three(name="hippo16env", n_params=16, ssopt_only=True)
+    # compare_big_three(name="hippo32env", n_params=32, ssopt_only=True)
+    # compare_big_three(name="hippo64env2", n_params=64, ssopt_only=True)
+    # compare_big_three(name="hippo128env2", n_params=128, ssopt_only=True)
+    # compare_big_three(name="hippo256env2", n_params=256, ssopt_only=True)
+    # compare_big_three(name="hippo724env2", n_params=724, ssopt_only=True)
+    # compare_big_three(name="hippo1024env2", n_params=1024, ssopt_only=True)
 
-    # compare_big_three(name="hippo_onsets2", emphasize="onsets")
-    # compare_big_three(name="hippo_chromagram2", emphasize="chromagram")
-    # compare_big_three(name="hippo_drop_strength2", emphasize="drop_strength")
-    # compare_big_three(name="hippo_spectral_flatness2", emphasize="spectral_flatness")
+    # compare_big_three(name="hippo_onsets2", emphasize="onsets", ssopt_only=True)
+    # compare_big_three(name="hippo_chromagram2", emphasize="chromagram", ssopt_only=True)
+    # compare_big_three(name="hippo_drop_strength2", emphasize="drop_strength", ssopt_only=True)
+    # compare_big_three(name="hippo_spectral_flatness2", emphasize="spectral_flatness", ssopt_only=True)
 
     # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/May27*"), "backbones", n_ckpts=1)
     # evaluate_trained_checkpoint_dirs(glob("/home/hans/modelzoo/ssar/*num_layers:6*"), "6layer", n_ckpts=3)
@@ -511,6 +626,12 @@ if __name__ == "__main__":
     # from_video_dir("/home/hans/datasets/audiovisual/wzrd")
     # from_video_dir("/home/hans/datasets/audiovisual/lucid")
 
+    # compare_big_three(
+    #     name="inference_speed", seqckpts=sorted(glob("runs/May23*num_layers:4*/*steps00122880*.pt")), just_write=True
+    # )
+
     compare_big_three(
-        name="inference_speed", seqckpts=sorted(glob("runs/May23*num_layers:4*/*steps00122880*.pt")), just_write=True
+        name="actual_inference_speed2",
+        seqckpts=[sorted(glob("runs/May23*num_layers:4*/*steps00122880*.pt"))[0]],
+        forward_only=True,
     )

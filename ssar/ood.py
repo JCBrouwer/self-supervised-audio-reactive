@@ -40,11 +40,11 @@ class VideoFrameDataset(Dataset):
 
 
 class VideoFrameDataset(Dataset):
-    def __init__(self, mp4s) -> None:
+    def __init__(self, mp4s, downsample=1) -> None:
         super().__init__()
         videos = []
         for mp4 in mp4s:
-            video, _ = load_video(mp4, downsample=1)
+            video, _ = load_video(mp4, downsample=downsample)
             print(video.min(), video.mean(), video.max())
             videos.append(video)
         self.videos = torch.cat(videos)
@@ -108,28 +108,68 @@ def train_set_ood():
     ]
     joblib.dump(results, "output/oodtrainset.pkl")
     print(results[-1])
-    del fake_samples, fake_iter
+    exit()
+
+
+def lucidsonicdreams_ood():
+    global SG2
+    del SG2
+    model_file = "cache/modern art.pkl"
+    real_samples = DataLoader(
+        RandomGeneratedImages(
+            StyleGAN2(model_file=model_file, inference=False, output_size=(512, 512), strategy="stretch", layer=0)
+            .eval()
+            .to(DEVICE),
+            N,
+            B,
+        ),
+        batch_size=1,
+    )
+    real_samples.path = model_file
+
+    fake_samples = DataLoader(
+        VideoFrameDataset(glob(f"/home/hans/datasets/audiovisual/lucid/*.mp4"), downsample=4), batch_size=B
+    )
+    fake_iter = iter(fake_samples)
+    results = [
+        {
+            "name": "Baseline (LSD)",
+            **compute(
+                real_samples,
+                lambda: next(fake_iter),
+                n_samples=N,
+                extractor="SwAV",
+                metrics=["frechet", "kernel", "prdc"],
+                batch_size=B,
+                device=DEVICE,
+                ignore_cache=True,
+            ),
+        }
+    ]
+    joblib.dump(results, "output/oodlucid.pkl")
+    print(results[-1])
+    exit()
 
 
 if __name__ == "__main__":
     N = 30000
     B = 1
 
-    train_set_ood()
-    exit()
+    # train_set_ood()
+    lucidsonicdreams_ood()
 
     directory = "/home/hans/datasets/audiovisual/density_eval/"
     keys = [
-        # "random",
-        # "ssopt",
+        "random",
+        "ssopt",
         "_supervised_learned_decoder_residual:False",
         "_supervised_learned_decoder_residual:True",
         "_supervised_fixed_decoder_residual:False",
         "_supervised_fixed_decoder_residual:True",
-        # "selfsupervised_learned_decoder_residual:False",
-        # "selfsupervised_learned_decoder_residual:True",
-        # "selfsupervised_fixed_decoder_residual:False",
-        # "selfsupervised_fixed_decoder_residual:True",
+        "selfsupervised_learned_decoder_residual:False",
+        "selfsupervised_learned_decoder_residual:True",
+        "selfsupervised_fixed_decoder_residual:False",
+        "selfsupervised_fixed_decoder_residual:True",
     ]
 
     real_samples = DataLoader(RandomGeneratedImages(SG2, N, B), batch_size=1)
@@ -149,11 +189,11 @@ if __name__ == "__main__":
                     extractor="SwAV",
                     metrics=["frechet", "kernel", "prdc"],
                     batch_size=B,
-                    device=DEVICE,
+                    device="cpu",
                     ignore_cache=True,
                 ),
             }
         )
-        joblib.dump(results, "output/oodsupswav.pkl")
+        joblib.dump(results, "output/ood.pkl")
         print(results[-1])
         del fake_samples, fake_iter

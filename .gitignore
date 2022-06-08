@@ -10,3 +10,4 @@ runs/
 output/*
 !output/.gitkeep
 *.code-workspace
+*.pt

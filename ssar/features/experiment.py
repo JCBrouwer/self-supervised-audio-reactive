@@ -9,11 +9,13 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-import torch.multiprocessing as mp
 import torchdatasets as td
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
-from torch.nn.functional import interpolate
-from torch.utils.data import DataLoader, Dataset
+from resize_right import resize
+from ssar.features.processing import (clamp_lower_percentile,
+                                      clamp_upper_percentile, normalize)
+from torch.nn.functional import interpolate, one_hot
+from torch.utils.data import DataLoader
 from torchaudio.functional import resample
 from tqdm import tqdm
 
@@ -32,8 +34,10 @@ vfns = [rgb_hist, hsv_hist, video_spectrogram, directogram, low_freq_rms, mid_fr
 de.bridge.set_bridge("torch")
 
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 # fmt: on
 
 sns.set_theme(context="paper", style="white", palette="tab10")
@@ -72,6 +76,69 @@ def load_audio_video(path, downsample=4, resample_fps=24, enforce_shapes=True):
         video = video[: round(dur) * resample_fps, :, lh:uh, lw:uw]
 
     return audio, sr, video, fps
+
+
+from torchvision.transforms.functional import adjust_contrast
+
+
+def render_feature_visualizations():
+    from ssar.features.rosa.segment import laplacian_segmentation_rosa
+
+    audio, sr, video, fps = load_audio_video("/home/hans/datasets/audiovisual/maua/spiruen.mp4")
+
+    lapseg = laplacian_segmentation_rosa(audio.cpu().numpy(), sr, 524, ks=[5])
+    lapseg = one_hot(lapseg.squeeze()).float() @ torch.tensor(sns.palettes.color_palette("tab10"))[:5]
+    lapseg = lapseg.unsqueeze(1).tile(1, 128, 1)
+
+    for featfn in [
+        lambda: ("laplacian_segmentation", lapseg),
+        lambda: ("rgb_hist", rgb_hist(video)),
+        lambda: ("hsv_hist", hsv_hist(video)),
+        lambda: ("video_spectrogram", torch.log(torch.flip(video_spectrogram(video), dims=(1,)))),
+        lambda: ("directogram", directogram(video, bins=64)),
+        lambda: ("low_freq_rms", low_freq_rms(video)),
+        lambda: ("mid_freq_rms", mid_freq_rms(video)),
+        lambda: ("high_freq_rms", high_freq_rms(video)),
+        lambda: ("adaptive_freq_rms", adaptive_freq_rms(video)),
+        lambda: ("absdiff", absdiff(video)),
+        lambda: ("visual_variance", visual_variance(video)),
+        lambda: ("video_flow_onsets", video_flow_onsets(video)),
+        lambda: ("video_spectral_onsets", video_spectral_onsets(video)),
+        lambda: ("chromagram", chromagram(audio, sr)),
+        lambda: ("tonnetz", tonnetz(audio, sr)),
+        lambda: ("mfcc", adjust_contrast(normalize(mfcc(audio, sr))[None, None], 10).squeeze()),
+        lambda: ("spectral_contrast", spectral_contrast(audio, sr)),
+        lambda: ("spectral_flatness", spectral_flatness(audio, sr)),
+        lambda: ("rms", rms(audio, sr)),
+        lambda: ("drop_strength", drop_strength(audio, sr)),
+        lambda: ("onsets", onsets(audio, sr)),
+        lambda: ("pulse", pulse(audio, sr)),
+    ]:
+        name, feat = featfn()
+        print(name, feat.shape)
+        print(feat.min(), torch.quantile(feat, 0.25), torch.median(feat), torch.quantile(feat, 0.5), feat.max())
+        fig = plt.figure()
+        dpi = 100
+        fig.set_size_inches(524 / 406 * 524 / dpi, 128 / 98 * 128 / dpi)
+        if feat.shape[-1] == 1:
+            plt.plot(feat.squeeze(), linewidth=0.5, color="black")
+            plt.xlim(0, len(feat.squeeze()))
+            plt.ylim(feat.min(), feat.max())
+        else:
+            if feat.dim() == 2:
+                feat = resize(feat[None, None], out_shape=(524, 128))
+                feat = normalize(feat.squeeze())
+            else:
+                pass
+            plt.imshow(feat.transpose(1, 0), cmap="inferno")
+        plt.axis("off")
+        fig.savefig(f"output/{name}.png", bbox_inches="tight", pad_inches=0, dpi=dpi)
+        plt.close()
+
+    exit()
+
+
+# render_feature_visualizations()
 
 
 class AudioVisualDataset(td.Dataset):
@@ -319,6 +386,7 @@ if __name__ == "__main__":
                 plt.close()
 
         def hists():
+            sns.set_theme(context="talk", style="white", palette="tab10")
             for pdf, data_fn in [
                 ("Quadratic", lambda: cdf[[col for col in cdf.columns if "concat" not in col]]),
                 ("Concatenated", lambda: cdf[[col for col in cdf.columns if "concat" in col]]),
@@ -348,9 +416,8 @@ if __name__ == "__main__":
                         .replace("smi", "Matrix Similarity Index")
                         .replace("pwcca", "Projection-weighted CCA")
                     )
-                    ax[0].set_ylabel(args.titles[list(file_groups.keys()).index(group)])
                     ax[c].set_yticklabels([])
-                plt.suptitle(pdf)
+                # plt.suptitle(pdf)
                 plt.tight_layout()
                 sns.despine()
                 plt.savefig(f"output/{exp_name}_{pdf.lower()}_hist_comparison.pdf")
@@ -482,28 +549,30 @@ if __name__ == "__main__":
                 plt.close()
 
         def barbox():
-            g = sns.FacetGrid(
-                data=melted[
-                    (melted["correlation"] == "Orthogonal Procrustes")
-                    & (
-                        (melted["audio"] == "chromagram")
-                        | (melted["audio"] == "onsets")
-                        # | (melted["audio"] == "drop_strength")
-                        # | (melted["audio"] == "spectral_flatness")
-                    )
-                ],
-                col="audio",
-                sharey=False,
-            )
-            g.map_dataframe(sns.barplot, x="group", y="val", estimator=np.median, ci=99, palette=COLORS)
-            g.set_xlabels("Interpolation Type")
-            g.set_xticklabels(rotation=20, ha="right")
-            g.set_ylabels("Audio-reactive Correlation")
-            g.set_titles(template="{col_name}")
-            plt.tight_layout()
-            sns.despine()
-            plt.savefig(f"output/{exp_name}_audiofeat_comparison.pdf")
-            plt.close()
+            sns.set_theme(context="talk", style="white", palette="tab10")
+            for col in melted["audio"].unique():
+                g = sns.barplot(
+                    data=melted[(melted["correlation"] == "Orthogonal Procrustes") & (melted["audio"] == col)],
+                    x="group",
+                    y="val",
+                    estimator=np.median,
+                    ci=99,
+                    palette=COLORS,
+                )
+                g.set_xlabel("Interpolation Type")
+                g.set_xticklabels(
+                    [
+                        l.get_text().replace("Chromagram", "Chroma").replace("Test Set", "Manual")
+                        for l in g.get_xticklabels()
+                    ],
+                    rotation=20,
+                    ha="right",
+                )
+                g.set_ylabel("Audio-reactive Correlation")
+                plt.tight_layout()
+                sns.despine()
+                plt.savefig(f"output/{exp_name}_audiofeat_{col}.pdf")
+                plt.close()
 
             g = sns.barplot(
                 data=melted[(melted["correlation"] == "Orthogonal Procrustes") & ((melted["audio"] != "concat"))],
@@ -514,11 +583,18 @@ if __name__ == "__main__":
                 palette=COLORS,
             )
             g.set_xlabel("Interpolation Type")
-            g.set_xticklabels(g.get_xticklabels(), rotation=15, ha="right")
+            g.set_xticklabels(
+                [
+                    l.get_text().replace("Chromagram", "Chroma").replace("Test Set", "Manual")
+                    for l in g.get_xticklabels()
+                ],
+                rotation=15,
+                ha="right",
+            )
             g.set_ylabel("Audio-reactive Correlation")
             plt.tight_layout()
             sns.despine()
-            plt.savefig(f"output/{exp_name}_op_concat_comparison.pdf")
+            plt.savefig(f"output/{exp_name}_audiofeat_concat.pdf")
             plt.close()
 
         # grouphists()
@@ -526,5 +602,5 @@ if __name__ == "__main__":
         # heatmap()
         # grouphists()
         # full_comparison_barbox()
-        barbox()
+        # barbox()
         hists()

@@ -54,41 +54,56 @@ class Patch(torch.nn.Module):
         self.sigma_base_noise = 1 + 9 * torch.rand((), generator=rng, device=rng.device).item()
         self.loops_base_noise = random_choice(rng, [1, 2, 4, 8, 16, 32, 64])
 
-        ks = np.unique([k for (_, k) in segmentations]).tolist()
+        self.ks = np.unique([k for (_, k) in segmentations]).tolist()
 
         self.latent_patches = [
-            dict(
-                patch_type=random_choice(rng, ["segmentation", "feature", "loop"]),
-                segments=random_choice(rng, ks),
-                loop_bars=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
-                seq_feat=random_choice(rng, ALLFEATS),
-                seq_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
-                mod_feat=random_choice(rng, UNITFEATS),
-                mod_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
-                merge_type=random_choice(rng, ["average", "modulate"], weights=[1, 3]),
-                merge_depth=random_choice(
-                    rng, ["low", "mid", "high", "lowmid", "midhigh", "all"], weights=[3, 3, 3, 2, 2, 1]
-                ),
-            )
+            self.random_latent_patch()
             for _ in range(torch.randint(min_subpatches, max_subpatches, size=(), generator=rng, device=rng.device))
         ]
         self.noise_patches = [
-            dict(
-                patch_type=random_choice(rng, ["blend", "multiply", "loop"]),
-                loop_bars=random_choice(rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
-                seq_feat=random_choice(rng, ALLFEATS),
-                seq_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
-                mod_feat=random_choice(rng, UNITFEATS),
-                mod_feat_weight=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
-                merge_type=random_choice(rng, ["average", "modulate"], weights=[1, 3]),
-                merge_depth=random_choice(
-                    rng, ["low", "mid", "high", "lowmid", "midhigh", "all"], weights=[3, 3, 3, 2, 2, 1]
-                ),
-                noise_mean=torch.randn((), generator=rng, device=rng.device).item() * 0.5,
-                noise_std=skewnorm(rng, a=5, loc=0.666, scale=0.5).item(),
-            )
+            self.random_noise_patch()
             for _ in range(torch.randint(min_subpatches, max_subpatches, size=(), generator=rng, device=rng.device))
         ]
+
+    def update_intensity(self, val):
+        for p in range(len(self.latent_patches)):
+            self.latent_patches[p]["seq_feat_weight"] = skewnorm(self.rng, a=5, loc=val, scale=0.5).item()
+            self.latent_patches[p]["mod_feat_weight"] = skewnorm(self.rng, a=5, loc=val, scale=0.5).item()
+        for p in range(len(self.noise_patches)):
+            self.noise_patches[p]["seq_feat_weight"] = skewnorm(self.rng, a=5, loc=val, scale=0.5).item()
+            self.noise_patches[p]["mod_feat_weight"] = skewnorm(self.rng, a=5, loc=val, scale=0.5).item()
+            self.latent_patches[p]["noise_std"] = skewnorm(self.rng, a=5, loc=val, scale=0.5).item()
+
+    def random_latent_patch(self):
+        return dict(
+            patch_type=random_choice(self.rng, ["segmentation", "feature", "loop"]),
+            segments=random_choice(self.rng, self.ks),
+            loop_bars=random_choice(self.rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
+            seq_feat=random_choice(self.rng, ALLFEATS),
+            seq_feat_weight=skewnorm(self.rng, a=5, loc=0.666, scale=0.5).item(),
+            mod_feat=random_choice(self.rng, UNITFEATS),
+            mod_feat_weight=skewnorm(self.rng, a=5, loc=0.666, scale=0.5).item(),
+            merge_type=random_choice(self.rng, ["average", "modulate"], weights=[1, 3]),
+            merge_depth=random_choice(
+                self.rng, ["low", "mid", "high", "lowmid", "midhigh", "all"], weights=[3, 3, 3, 2, 2, 1]
+            ),
+        )
+
+    def random_noise_patch(self):
+        return dict(
+            patch_type=random_choice(self.rng, ["blend", "multiply", "loop"]),
+            loop_bars=random_choice(self.rng, [4, 8, 16, 32], weights=[2, 2, 2, 1]),
+            seq_feat=random_choice(self.rng, ALLFEATS),
+            seq_feat_weight=skewnorm(self.rng, a=5, loc=0.666, scale=0.5).item(),
+            mod_feat=random_choice(self.rng, UNITFEATS),
+            mod_feat_weight=skewnorm(self.rng, a=5, loc=0.666, scale=0.5).item(),
+            merge_type=random_choice(self.rng, ["average", "modulate"], weights=[1, 3]),
+            merge_depth=random_choice(
+                self.rng, ["low", "mid", "high", "lowmid", "midhigh", "all"], weights=[3, 3, 3, 2, 2, 1]
+            ),
+            noise_mean=torch.randn((), generator=self.rng, device=self.rng.device).item() * 0.5,
+            noise_std=skewnorm(self.rng, a=5, loc=0.666, scale=0.5).item(),
+        )
 
     def forward(self, latent_palette, downscale_factor=1, aspect_ratio=1):
         self.rng.manual_seed(self.seed)

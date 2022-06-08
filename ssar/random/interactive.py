@@ -169,7 +169,8 @@ def generate_interactive(
         segs = {k: seg[sf:ef] for k, seg in segmentations.items()}
 
         seed = torch.randint(0, 2 ** 32, size=(), device=device).item()
-        r, response, patch, prev_patches = 1, "start", None, []
+        r, response, patch, prev_patches, prev_palettes = 1, "start", None, [], []
+        intensity = 0.666
 
         while response != "next":
 
@@ -203,28 +204,32 @@ def generate_interactive(
             else:
                 for command, value in response:
                     if command == "more_intense":
-                        pass
+                        intensity += 0.111
+                        patch.update_intensity(intensity)
                     if command == "less_intense":
-                        pass
-                    if command == "feature_probabilities":
-                        pass
+                        intensity -= 0.111
+                        patch.update_intensity(intensity)
+
                     if command == "random_latent_vectors":
-                        pass
+                        latent_palette = G.mapper(torch.randn((180, 512), device=device))
                     if command == "permute_latent_vectors":
-                        pass
+                        latent_palette = latent_palette[np.random.permutation(latent_palette.shape[0])]
                     if command == "randomize_latent_patches":
-                        pass
-                    if command == "permute_noise_patches":
-                        pass
+                        patch.latent_patches = [patch.random_latent_patch() for _ in patch.latent_patches]
+                    if command == "permute_latent_patches":
+                        patch.latent_patches = np.random.permutation(patch.latent_patches)
                     if command == "randomize_noise_patches":
-                        pass
+                        patch.noise_patches = [patch.random_noise_patch() for _ in patch.noise_patches]
                     if command == "permute_noise_patches":
-                        pass
+                        patch.noise_patches = np.random.permutation(patch.noise_patches)
+
                     if command == "revert":
                         patch = prev_patches.pop()
+                        latent_palette = prev_palettes.pop()
 
                 print("Updated random patch:")
             prev_patches.append(patch)
+            prev_palettes.append(latent_palette)
             print(patch)
 
             latents, noise = patch.forward(latent_palette, downscale_factor=4)
