@@ -391,36 +391,89 @@ if __name__ == "__main__":
                 ("Quadratic", lambda: cdf[[col for col in cdf.columns if "concat" not in col]]),
                 ("Concatenated", lambda: cdf[[col for col in cdf.columns if "concat" in col]]),
             ]:
+                print("\n", pdf)
+                for g, group in enumerate(file_groups):
+                    fig, ax = plt.subplots(1, len(corr_fns) - 1, figsize=(16, 4), sharex=True)
+                    gdf = df[df["group"] == group]
+                    for c, corr in enumerate(corr_fns):
+                        if corr == "svcca":
+                            continue
+                        cdf = gdf[[col for col in gdf.columns if corr in col]]
+                        data = data_fn()
+                        print(group, corr)
+                        color = COLORS[g]
+                        yvals, _, _ = ax[c].hist(
+                            data.values.flatten(),
+                            bins=100,
+                            range=(stats["median"].min(), stats["median"].max()),
+                            color=color,
+                            density=True,
+                        )
+                        ax[c].vlines(np.median(data.values), 0, yvals.max(), ls="--", color=color)
+                        ax[c].set_xlabel(
+                            corr.replace("op", "Orthogonal Procrustes")
+                            .replace("rv2", "Adjusted RV Coefficient")
+                            .replace("smi", "Matrix Similarity Index")
+                            .replace("pwcca", "Projection-weighted CCA")
+                        )
+                        ax[c].set_yticklabels([])
+                    # plt.suptitle(pdf)
+                    plt.tight_layout()
+                    sns.despine()
+                    plt.savefig(f"output/{exp_name}_{group}_{pdf.lower()}_hist_comparison.pdf")
+                    plt.close()
 
+        def bihists():
+            sns.set_theme(context="talk", style="white", palette="tab10")
+            for pdf, data_fn in [
+                ("Quadratic", lambda: cdf[[col for col in cdf.columns if "concat" not in col]]),
+                ("Concatenated", lambda: cdf[[col for col in cdf.columns if "concat" in col]]),
+            ]:
                 print("\n", pdf)
                 fig, ax = plt.subplots(1, len(corr_fns) - 1, figsize=(16, 4), sharex=True)
-                gdf, g = df[df["group"] == "test"], -1
-                for c, corr in enumerate(corr_fns):
-                    if corr == "svcca":
+                max_vals = [0 for _ in corr_fns]
+                for g, group in enumerate(file_groups):
+                    if group not in ["noise", "high_both"]:
                         continue
-                    cdf = gdf[[col for col in gdf.columns if corr in col]]
-                    data = data_fn()
-                    print(group, corr)
-                    color = COLORS[g]
-                    yvals, _, _ = ax[c].hist(
-                        data.values.flatten(),
-                        bins=100,
-                        range=(stats["median"].min(), stats["median"].max()),
-                        color=color,
-                        density=True,
-                    )
-                    ax[c].vlines(np.median(data.values), 0, yvals.max(), ls="--", color=color)
-                    ax[c].set_xlabel(
-                        corr.replace("op", "Orthogonal Procrustes")
-                        .replace("rv2", "Adjusted RV Coefficient")
-                        .replace("smi", "Matrix Similarity Index")
-                        .replace("pwcca", "Projection-weighted CCA")
-                    )
-                    ax[c].set_yticklabels([])
-                # plt.suptitle(pdf)
+                    gdf = df[df["group"] == group]
+                    for c, corr in enumerate(corr_fns):
+                        if corr == "svcca":
+                            continue
+                        cdf = gdf[[col for col in gdf.columns if corr in col]]
+                        data = data_fn()
+                        color = COLORS[g]
+                        yvals, _, _ = ax[c].hist(
+                            data.values.flatten(),
+                            bins=100,
+                            range=(0, 1),
+                            color=color,
+                            density=True,
+                            alpha=0.5,
+                            label=group.replace("high_both", "Onset+Chromagram").replace("noise", "None"),
+                        )
+                        max_vals[c] = max(max_vals[c], yvals.max())
+                for g, group in enumerate(file_groups):
+                    if group not in ["noise", "high_both"]:
+                        continue
+                    gdf = df[df["group"] == group]
+                    for c, corr in enumerate(corr_fns):
+                        if corr == "svcca":
+                            continue
+                        cdf = gdf[[col for col in gdf.columns if corr in col]]
+                        data = data_fn()
+                        color = COLORS[g]
+                        ax[c].vlines(np.median(data.values), 0, max_vals[c], ls="--", color=color)
+                        ax[c].set_xlabel(
+                            corr.replace("op", "Orthogonal Procrustes")
+                            .replace("rv2", "Adjusted RV Coefficient")
+                            .replace("smi", "Matrix Similarity Index")
+                            .replace("pwcca", "Projection-weighted CCA")
+                        )
+                        ax[c].set_yticklabels([])
+                ax[2].legend(loc="upper left")
                 plt.tight_layout()
                 sns.despine()
-                plt.savefig(f"output/{exp_name}_{pdf.lower()}_hist_comparison.pdf")
+                plt.savefig(f"output/{exp_name}_bicomp_{pdf.lower()}_hist_comparison.pdf")
                 plt.close()
 
         def heatmap():
@@ -608,5 +661,6 @@ if __name__ == "__main__":
         # heatmap()
         # grouphists()
         # full_comparison_barbox()
-        barbox()
+        # barbox()
         # hists()
+        bihists()
