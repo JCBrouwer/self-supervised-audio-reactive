@@ -100,7 +100,7 @@ class LayerwiseLinear(Module):
         x = x.unsqueeze(3)  # B,T,NL,1,OC
         x = x.tile(1, 1, 1, self.NO // self.NL, 1)  # B,T,NL,NO//NL,OC
         x = x.reshape(B, T, self.NO, OC)  # B,T,NO,OC
-        return x
+        return x 
 
 
 class LayerwiseConv(Module):

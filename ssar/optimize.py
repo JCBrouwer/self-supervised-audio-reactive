@@ -109,7 +109,7 @@ class FixedLatentNoiseDecoder(torch.nn.Module):
         self.H = n_latent_per_group
         assert (
             len(latents) == self.S * self.G * self.H
-        ), f"Number of latent vectors supplied does not equal n_latent_split * n_latent_per_split ({self.S *self.G* self.H})"
+        ), f"Number of latent vectors supplied does not equal n_latent_split * n_latent_per_split ({self.S * self.G * self.H})"
         self.latents = latents
         self.W = self.latents.shape[1] // self.S
 
