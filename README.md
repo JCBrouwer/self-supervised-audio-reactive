@@ -1,1 +1,1 @@
-# Self-supervised Audio-reactive GANs
+# Self-supervised Audio-reactive Music Video Synthesis
