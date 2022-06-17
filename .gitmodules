@@ -1,3 +1,6 @@
 [submodule "SGW"]
 	path = SGW
 	url = https://github.com/tvayer/SGW.git
+[submodule "maua"]
+	path = maua
+	url = https://github.com/maua-maua-maua/maua
