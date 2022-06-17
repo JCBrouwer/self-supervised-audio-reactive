@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from resize_right import resize
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms.functional import to_pil_image
 
 from .comparison import DEVICE, SG2, load_video
 from .train import STYLEGAN_CKPT
@@ -68,7 +69,12 @@ class RandomGeneratedImages(Dataset):
         return self.n_samples // self.batch_size
 
     def __getitem__(self, idx):
-        return resize(self.G(torch.randn((self.batch_size, 512), device=DEVICE)), out_shape=(224, 224)).add(1).div(2)
+        return (
+            resize(self.G(torch.randn((self.batch_size, 512), device=DEVICE)), out_shape=(224, 224))
+            .add(1)
+            .div(2)
+            .clamp(0, 1)
+        )
 
 
 def train_set_ood():
@@ -108,7 +114,6 @@ def train_set_ood():
     ]
     joblib.dump(results, "output/oodtrainset.pkl")
     print(results[-1])
-    exit()
 
 
 def lucidsonicdreams_ood():
@@ -148,14 +153,15 @@ def lucidsonicdreams_ood():
     ]
     joblib.dump(results, "output/oodlucid.pkl")
     print(results[-1])
-    exit()
 
 
 if __name__ == "__main__":
     N = 30000
     B = 1
 
-    # train_set_ood()
+    [to_pil_image(im.squeeze()).save(f"output/r{i}.png") for i, im in zip(range(10), RandomGeneratedImages(SG2, 10, 1))]
+
+    train_set_ood()
     lucidsonicdreams_ood()
 
     directory = "/home/hans/datasets/audiovisual/density_eval/"
